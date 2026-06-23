@@ -1,0 +1,9 @@
+# Code owners for BlancosWay/crucible
+#
+# @BlancosWay is auto-requested as reviewer on every pull request. Combined with
+# the branch rules (a PR and passing checks are required for everyone) and the
+# fact that only the owner can merge, this makes @BlancosWay the de-facto
+# required reviewer for outside contributions. The owner's own PRs and
+# Dependabot's are auto-merged once checks pass (see
+# .github/workflows/auto-merge.yml) and do not need a review.
+* @BlancosWay

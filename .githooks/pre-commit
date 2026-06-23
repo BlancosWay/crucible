@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Crucible pre-commit guard — runs the unified deterministic checks.
+# Installed via: python3 scripts/check.py --install-hook
+set -u
+ROOT="$(git rev-parse --show-toplevel)"
+exec python3 "$ROOT/scripts/check.py"

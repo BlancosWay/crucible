@@ -1,27 +1,62 @@
 # Crucible
 
-> **Status: design phase (WIP).** This README is a placeholder concept sketch. The validated
-> design will live in `docs/superpowers/specs/` before any feature code is written.
-
 **Two-model adversarial planning and implementation, on top of [Superpowers](https://github.com/obra/superpowers).**
 
-Crucible runs software work through a crucible: one model proposes, a second model
-adversarially critiques — at the plan, at the dependency tree, and at every dependency as it's
-implemented — looping through configured stages until the critic signs off (consensus) or a
-round cap is hit.
+One model (**Builder**) plans and implements; a second model (**Critic**) adversarially reviews
+the plan, the dependency tree, and every dependency as it is built — looping each gate until the
+Critic signs off (**consensus**) or a configured round cap is hit.
 
-## The idea
+## How it works
 
-- **Model 1 (Builder)** — does the planning and the implementation.
-- **Model 2 (Critic)** — adversarially critiques the plan and each implementation step.
-- After planning, work is expressed as a **dependency tree (DAG)**; implementation walks it in
-  topological order.
-- **Each dependency** passes through an adversarial review loop: Builder implements → Critic
-  attacks → Builder revises → … until the Critic reaches **consensus** or the configured
-  **max rounds** is reached.
-- Built **on Superpowers** — it orchestrates `brainstorming → writing-plans →
-  subagent-driven-development`, injecting the two-model adversarial loop at each gate.
+1. **PLAN gate** — Builder uses Superpowers `writing-plans` to produce a plan **and** a dependency
+   tree (DAG). Critic reviews both; loop until consensus or `max_rounds_plan`.
+2. **IMPLEMENT gates** — for each dependency in topological order, Builder implements it
+   (`subagent-driven-development`, TDD) and the Critic reviews that diff; loop until consensus or
+   `max_rounds_dep`.
+3. **FINAL gate** — optional whole-implementation review, then a deterministic run report.
 
-Defaults (configurable): Builder = Opus 4.8, Critic = GPT-5.5 (xhigh), max rounds = 5.
+Consensus = Critic returns `APPROVE` (no open `blocker`/`major` findings). On a round cap without
+consensus, Crucible **halts and surfaces** the unresolved findings (configurable).
 
-**Research/engineering tool — see the spec for full design.**
+## Defaults
+
+| Setting | Default |
+|---------|---------|
+| Builder | `claude-opus-4.8` (effort `max`) |
+| Critic | `gpt-5.5` (effort `xhigh`) |
+| Rounds per gate | 5 |
+| On cap | `halt` |
+
+Override via a JSON config (see `config.example.json`).
+
+## Usage
+
+In an agent runtime with Superpowers installed, run the skill:
+
+- Slash command: `/crucible <goal>`
+- Or ask: "use crucible to add a rate limiter".
+
+The skill drives the loop and calls the deterministic CLI for every decision:
+
+```bash
+RUN=$(PYTHONPATH=scripts python -m crucible init-run --goal "add a rate limiter")
+PYTHONPATH=scripts python -m crucible load-dag --run "$RUN" --file dag.json
+PYTHONPATH=scripts python -m crucible next --run "$RUN"
+PYTHONPATH=scripts python -m crucible verdict --run "$RUN" --gate plan --round 1 --file verdict.json
+PYTHONPATH=scripts python -m crucible report --run "$RUN" --html
+```
+
+## Development
+
+```bash
+python -m pytest -q     # run the test suite (pytest.ini sets pythonpath=scripts)
+```
+
+## Layout
+
+- `skills/crucible/` — orchestrator skill + role prompts and rubric (`references/`).
+- `commands/crucible.md` — `/crucible` entry point.
+- `scripts/crucible/` — deterministic helpers: `config`, `dag`, `verdict`, `runlog`, `report`, `cli`.
+- `.claude-plugin/` — plugin + marketplace manifests.
+
+Engineering tool. Not affiliated with any model provider.

@@ -1,0 +1,68 @@
+name: Release
+
+# Publish a GitHub Release when a human pushes a 'vX.Y.Z' tag that matches the
+# manifest version. Nothing here creates tags or bumps versions — it only turns a
+# deliberate, already-pushed tag into a Release whose notes come from CHANGELOG.md.
+# The deterministic steps below (manifest agreement + notes building) are exercised
+# in CI on every PR/push by the "Release dry run" job in validate.yml; only the
+# final publish requires a real tag (you cannot publish a Release without one).
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Verify the tag is on main
+        # Refuse to publish a tag that points at a commit which never landed on
+        # main (e.g. a tag accidentally pushed from an unmerged branch).
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::tag ${GITHUB_REF_NAME} ($GITHUB_SHA) is not an ancestor of origin/main — refusing to release"
+            exit 1
+          fi
+          echo "tag commit is on main"
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.x"
+
+      - name: Verify the tag matches the manifest version
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          manifest="$(python3 -c "import json;print(json.load(open('.claude-plugin/plugin.json'))['version'])")"
+          if [ "$tag" != "$manifest" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} (=$tag) != plugin.json version $manifest"
+            exit 1
+          fi
+          echo "tag matches manifest version $manifest"
+
+      - name: Verify both manifests agree and the version is recorded
+        run: python3 -m unittest tests.test_version_consistency
+
+      - name: Build release notes from CHANGELOG
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          python3 scripts/changelog.py section "$version" > release-notes.md
+          test -s release-notes.md  # non-empty
+          echo "----- release notes -----"; cat release-notes.md
+
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file release-notes.md

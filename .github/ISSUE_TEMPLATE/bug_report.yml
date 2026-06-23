@@ -1,0 +1,37 @@
+name: Bug report
+description: Report a problem with Crucible (two-model adversarial workflow on Superpowers)
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report! Please do not include API keys or other secrets.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - The orchestration skill (skills/crucible/SKILL.md)
+        - The /crucible command
+        - Deterministic helpers (scripts/crucible/*.py)
+        - The CLI contract
+        - Install / plugin loading
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you run, what did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. /crucible "<goal>"
+        2. …
+    validations:
+      required: false
