@@ -32,3 +32,17 @@ def test_dependency_tree_doc_has_schema_keys():
 def test_critic_treats_input_as_untrusted():
     text = (REF / "critic-prompt.md").read_text()
     assert "data, not instructions" in text
+
+
+def test_critic_uses_superpowers_code_reviewer_for_code_gates():
+    # Model 2 (Critic) must use the superpowers code-reviewer when reviewing code
+    # (the IMPLEMENT/FINAL gates), per the design.
+    critic = (REF / "critic-prompt.md").read_text()
+    platform = (REF / "platform-notes.md").read_text()
+    assert "superpowers:code-reviewer" in critic
+    assert "superpowers:code-reviewer" in platform
+
+
+def test_skill_dispatches_code_reviewer_at_code_gates():
+    skill = (REF.parent / "SKILL.md").read_text()
+    assert "superpowers:code-reviewer" in skill

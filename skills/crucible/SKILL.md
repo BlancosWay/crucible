@@ -60,7 +60,9 @@ For each `$NODE`:
 1. `PYTHONPATH=scripts python -m crucible set-status --run "$RUN" --node "$NODE" --status in_progress`.
 2. As **Builder**, implement the node with **superpowers:subagent-driven-development** (TDD).
 3. Log the diff/output: `... log --event builder_output --gate dep:$NODE --round N --file out.txt`.
-4. Dispatch the **Critic** with `critic-prompt.md` + this node's diff. Capture `verdict.json`.
+4. Dispatch the **Critic** as the **`superpowers:code-reviewer`** agent (on the critic model) with
+   `critic-prompt.md` + this node's diff. Capture its findings as `verdict.json`. (See
+   `references/platform-notes.md`.)
 5. `PYTHONPATH=scripts python -m crucible verdict --run "$RUN" --gate "dep:$NODE" --round N --file verdict.json`.
    - `CONSENSUS` -> `set-status --node "$NODE" --status done`; continue the loop.
    - `CHANGES` -> revise, increment N, repeat from step 3.
@@ -68,7 +70,8 @@ For each `$NODE`:
 
 ## Stage 3 — FINAL gate (if `final_review: true`)
 
-Dispatch the Critic once over the whole implementation; log the verdict at `--gate final`.
+Dispatch the **Critic** as the **`superpowers:code-reviewer`** agent (on the critic model) once
+over the whole implementation; log the verdict at `--gate final`.
 
 ## Finish
 
