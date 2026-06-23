@@ -1687,7 +1687,7 @@ RUN=$(python -m crucible init-run --goal "<the user's goal>")   # add --config c
 3. Record your plan artifact: `python -m crucible log --run "$RUN" --event builder_output --gate plan --round N --file plan.md`.
 4. Dispatch the **Critic** with `critic-prompt.md` + the plan + the DAG. Capture its JSON verdict
    to `verdict.json`.
-5. Decide: `python -m crucible verdict --run "$RUN" --gate plan --round N --max-rounds 5 --file verdict.json`.
+5. Decide: `python -m crucible verdict --run "$RUN" --gate plan --round N --file verdict.json`.
    - `CONSENSUS` → go to Stage 2.
    - `CHANGES` → revise as Builder, increment N, repeat from step 3.
    - `CAPPED` → apply `on_cap` (default `halt`: stop and surface unresolved findings).
@@ -1706,7 +1706,7 @@ For each `$NODE`:
 2. As **Builder**, implement the node with **superpowers:subagent-driven-development** (TDD).
 3. Log the diff/output: `... log --event builder_output --gate dep:$NODE --round N --file out.txt`.
 4. Dispatch the **Critic** with `critic-prompt.md` + this node's diff. Capture `verdict.json`.
-5. `python -m crucible verdict --run "$RUN" --gate "dep:$NODE" --round N --max-rounds 5 --file verdict.json`.
+5. `python -m crucible verdict --run "$RUN" --gate "dep:$NODE" --round N --file verdict.json`.
    - `CONSENSUS` → `set-status --node "$NODE" --status done`; continue the loop.
    - `CHANGES` → revise, increment N, repeat from step 3.
    - `CAPPED` → apply `on_cap`.
@@ -1939,7 +1939,7 @@ The skill drives the loop and calls the deterministic CLI for every decision:
 RUN=$(python -m crucible init-run --goal "add a rate limiter")
 python -m crucible load-dag --run "$RUN" --file dag.json
 python -m crucible next --run "$RUN"
-python -m crucible verdict --run "$RUN" --gate plan --round 1 --max-rounds 5 --file verdict.json
+python -m crucible verdict --run "$RUN" --gate plan --round 1 --file verdict.json
 python -m crucible report --run "$RUN" --html
 ```
 
