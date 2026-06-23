@@ -1,0 +1,34 @@
+name: Auto-merge
+
+# Enable GitHub auto-merge (squash) so a pull request lands automatically once
+# the required status checks pass — but ONLY for PRs authored by the repo owner
+# (BlancosWay) or Dependabot. Every other contributor's PR is never auto-merged
+# and requires a manual merge after @BlancosWay's review.
+#
+# pull_request_target runs in the base-repo context (so it has a write token,
+# including for Dependabot PRs) and this job does NOT check out PR head code,
+# so it is safe. Auto-merge still respects branch rulesets: the merge only
+# happens once the required checks are green.
+
+on:
+  pull_request_target:
+    types: [opened, reopened, ready_for_review, synchronize]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    if: >-
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      (github.event.pull_request.user.login == 'BlancosWay' ||
+       github.event.pull_request.user.login == 'dependabot[bot]')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enable squash auto-merge
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: gh pr merge --auto --squash "$PR_URL"

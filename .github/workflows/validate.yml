@@ -1,0 +1,101 @@
+name: Validate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Structural validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.x"
+
+      - name: Validate plugin structure
+        run: python3 tests/validate_structure.py
+
+      - name: Validate JSON manifests
+        run: |
+          for f in .claude-plugin/plugin.json .claude-plugin/marketplace.json config.example.json; do
+            echo "checking $f"
+            python3 -c "import json,sys; json.load(open('$f'))"
+          done
+
+  links:
+    name: Markdown links
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.x"
+      - name: Check internal Markdown links
+        run: python3 tests/check_links.py
+
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Run ShellCheck on the git hooks
+        # ShellCheck is preinstalled on ubuntu-latest. Fail only on genuine errors
+        # (not style nits) so the gate stays meaningful but not noisy.
+        run: shellcheck --severity=error .githooks/*
+
+  tests:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.x"
+      - name: Install pytest
+        run: python3 -m pip install --quiet pytest
+      - name: Run the pytest suite
+        # pytest.ini sets pythonpath=scripts, so the crucible package imports cleanly.
+        run: python3 -m pytest -q
+
+  changelog:
+    name: Changelog entry
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+      - name: Require a CHANGELOG entry for shipped changes
+        run: python3 scripts/changelog.py check --base "origin/${{ github.base_ref }}"
+
+  release-dryrun:
+    name: Release dry run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.x"
+      - name: Dry-run the release packaging for the current version (no publish)
+        # Exercises the same deterministic steps release.yml runs at tag time —
+        # both manifests agree + the version's CHANGELOG notes are non-empty — so a
+        # broken release is caught on every PR/push instead of only at tag push.
+        run: |
+          set -euo pipefail
+          version="$(python3 -c "import json;print(json.load(open('.claude-plugin/plugin.json'))['version'])")"
+          python3 -m unittest tests.test_version_consistency
+          python3 scripts/changelog.py section "$version" > release-notes.md
+          test -s release-notes.md  # the notes release.yml would publish must be non-empty
+          echo "Release dry run OK for v$version:"; cat release-notes.md
