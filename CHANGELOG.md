@@ -15,8 +15,10 @@ Initial release: a two-model adversarial planning + implementation workflow on t
 ### Added
 - **Two-model adversarial loop.** A **Builder** model (default Opus 4.8) plans and implements; a
   **Critic** model (default GPT-5.5 xhigh) adversarially reviews the plan, the dependency tree, and
-  each dependency. At code-review gates (IMPLEMENT/FINAL) the Critic is realized as the
-  **superpowers code-reviewer** agent. Each gate loops until **consensus** (Critic `APPROVE`) or a
+  each dependency. The Critic is realized as a **superpowers reviewer** on the critic model at
+  every gate: the writing-plans **plan-document-reviewer** (+ brainstorming **spec-document-reviewer**)
+  at the PLAN gate, and the **code-reviewer** agent at the IMPLEMENT/FINAL gates. Each gate loops
+  until **consensus** (Critic `APPROVE`) or a
   configured per-gate round cap, after which an `on_cap` policy (`halt` / `proceed_with_flags`) applies.
 - **Deterministic Python core** (`scripts/crucible/`): `config` (models, caps, policies), `dag`
   (cycle-detection, topological order, ready-set, status), `verdict` (consensus decision +

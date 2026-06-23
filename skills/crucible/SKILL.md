@@ -40,8 +40,11 @@ resolutions are logged to the run for provenance.
 2. Emit the **dependency tree** JSON (see `references/dependency-tree.md`) and load it:
    `PYTHONPATH=scripts python -m crucible load-dag --run "$RUN" --file dag.json` (rejects cycles/unknown ids).
 3. Record your plan artifact: `PYTHONPATH=scripts python -m crucible log --run "$RUN" --event builder_output --gate plan --round N --file plan.md`.
-4. Dispatch the **Critic** with `critic-prompt.md` + the plan + the DAG. Capture its JSON verdict
-   to `verdict.json`.
+4. Dispatch the **Critic** as the superpowers **plan-document-reviewer** (from
+   `superpowers:writing-plans`) over the plan + DAG — and additionally the **spec-document-reviewer**
+   (from `superpowers:brainstorming`) if a design spec exists — run on the critic model. Map its
+   findings into the verdict JSON (`critic-prompt.md`). Capture to `verdict.json`. (See
+   `references/platform-notes.md`.)
 5. Decide: `PYTHONPATH=scripts python -m crucible verdict --run "$RUN" --gate plan --round N --file verdict.json`.
    - `CONSENSUS` -> go to Stage 2.
    - `CHANGES` -> revise as Builder, increment N, repeat from step 3.

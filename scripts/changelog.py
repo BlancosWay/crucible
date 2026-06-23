@@ -73,23 +73,25 @@ def _version_sections(text: str) -> set:
     return set(_VERSION_HEADING.findall(text))
 
 
+def _content_lines(body: str) -> set:
+    """Real entry content from a CHANGELOG section body: non-blank lines that are
+    not Markdown sub-headings ('#', '##', '###', ...)."""
+    return {
+        ln.strip()
+        for ln in body.splitlines()
+        if ln.strip() and not ln.lstrip().startswith("#")
+    }
+
+
 def added_changelog_entry(base_text: str, head_text: str) -> bool:
-    """True iff head adds, relative to base, EITHER a new '## [x.y.z]' release
-    section OR a new non-blank, non-heading content line under '## [Unreleased]'.
-    Heading-only additions (e.g. a bare '### Fixed') do NOT count — a shipped
-    change must record actual content. Accepts a release cut that empties
-    [Unreleased] while adding a dated section."""
-    if _version_sections(head_text) - _version_sections(base_text):
-        return True
-
-    def _content_lines(body: str) -> set:
-        # Ignore blank lines and Markdown sub-headings ('#', '##', '###', ...).
-        return {
-            ln.strip()
-            for ln in body.splitlines()
-            if ln.strip() and not ln.lstrip().startswith("#")
-        }
-
+    """True iff head adds, relative to base, EITHER a newly added dated
+    '## [x.y.z]' release section that has real content, OR a new non-blank,
+    non-heading content line under '## [Unreleased]'. Heading-only additions —
+    a bare '### Fixed', or a bare dated heading with no body — do NOT count; a
+    shipped change must record actual content."""
+    for version in _version_sections(head_text) - _version_sections(base_text):
+        if _content_lines(extract_section(head_text, version)):
+            return True
     base_lines = _content_lines(unreleased_body(base_text))
     return any(ln not in base_lines for ln in _content_lines(unreleased_body(head_text)))
 

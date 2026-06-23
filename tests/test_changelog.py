@@ -39,6 +39,19 @@ def test_new_dated_version_section_counts():
     assert added_changelog_entry(base, head) is True
 
 
+def test_bare_dated_heading_without_body_does_not_count():
+    # A new dated section with no content line must NOT satisfy the guard.
+    base = "# Changelog\n\n## [Unreleased]\n"
+    head = "# Changelog\n\n## [Unreleased]\n\n## [0.2.0] - 2026-07-01\n"
+    assert added_changelog_entry(base, head) is False
+
+
+def test_dated_heading_with_subheading_only_does_not_count():
+    base = "# Changelog\n\n## [Unreleased]\n"
+    head = "# Changelog\n\n## [Unreleased]\n\n## [0.2.0] - 2026-07-01\n### Added\n"
+    assert added_changelog_entry(base, head) is False
+
+
 def test_tolerates_empty_base():
     head = _with_unreleased("- first ever entry")
     assert added_changelog_entry("", head) is True

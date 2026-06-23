@@ -43,6 +43,18 @@ def test_critic_uses_superpowers_code_reviewer_for_code_gates():
     assert "superpowers:code-reviewer" in platform
 
 
+def test_critic_uses_superpowers_plan_reviewer_for_plan_gate():
+    # Model 2 (Critic) must use the superpowers plan/spec document reviewers when
+    # critiquing the plan + dependency tree (the PLAN gate), per the design.
+    critic = (REF / "critic-prompt.md").read_text()
+    platform = (REF / "platform-notes.md").read_text()
+    skill = (REF.parent / "SKILL.md").read_text()
+    for text in (critic, platform, skill):
+        assert "plan-document-reviewer" in text
+    # the spec reviewer is also referenced for the design spec
+    assert "spec-document-reviewer" in critic
+
+
 def test_skill_dispatches_code_reviewer_at_code_gates():
     skill = (REF.parent / "SKILL.md").read_text()
     assert "superpowers:code-reviewer" in skill
