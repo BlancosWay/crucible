@@ -1,0 +1,11 @@
+{
+  "name": "crucible-marketplace",
+  "owner": "BlancosWay",
+  "plugins": [
+    {
+      "name": "crucible",
+      "source": "./",
+      "description": "Two-model adversarial planning + implementation on Superpowers."
+    }
+  ]
+}
