@@ -42,7 +42,7 @@ The skill drives the loop and calls the deterministic CLI for every decision:
 RUN=$(PYTHONPATH=scripts python -m crucible init-run --goal "add a rate limiter")
 PYTHONPATH=scripts python -m crucible load-dag --run "$RUN" --file dag.json
 PYTHONPATH=scripts python -m crucible next --run "$RUN"
-PYTHONPATH=scripts python -m crucible verdict --run "$RUN" --gate plan --round 1 --max-rounds 5 --file verdict.json
+PYTHONPATH=scripts python -m crucible verdict --run "$RUN" --gate plan --round 1 --file verdict.json
 PYTHONPATH=scripts python -m crucible report --run "$RUN" --html
 ```
 

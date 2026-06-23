@@ -47,12 +47,17 @@ class Verdict:
         verdict = data["verdict"]
         if verdict not in VALID_VERDICTS:
             raise ValueError(f"invalid verdict: {verdict}")
+        findings = [Finding.from_dict(f) for f in data.get("findings", [])]
+        ids = [f.id for f in findings]
+        dupes = sorted({i for i in ids if ids.count(i) > 1})
+        if dupes:
+            raise ValueError(f"duplicate finding ids: {dupes}")
         return cls(
             gate=data["gate"],
             round=int(data["round"]),
             verdict=verdict,
             summary=data.get("summary", ""),
-            findings=[Finding.from_dict(f) for f in data.get("findings", [])],
+            findings=findings,
         )
 
     def open_blocking(self, cfg: Config) -> list[Finding]:

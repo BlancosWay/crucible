@@ -28,3 +28,9 @@ def test_skill_uses_cli_for_decisions():
     text = SKILL.read_text()
     for cmd in ["init-run", "load-dag", "next", "verdict", "set-status", "report"]:
         assert cmd in text, f"SKILL.md should reference `crucible {cmd}`"
+
+
+def test_skill_does_not_hardcode_round_cap_override():
+    # the cap must come from config; workflow examples should not pass --max-rounds
+    text = SKILL.read_text()
+    assert "--max-rounds 5" not in text

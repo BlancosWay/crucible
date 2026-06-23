@@ -115,3 +115,11 @@ def test_fixed_keeps_finding_open_for_another_round():
     ])
     d = decide(v, CFG, round_index=1, max_rounds=5, resolutions={"F1": "fixed"})
     assert d.outcome == "CHANGES"
+
+
+def test_duplicate_finding_ids_rejected():
+    with pytest.raises(ValueError, match="duplicate finding ids"):
+        _verdict("REQUEST_CHANGES", [
+            {"id": "F1", "severity": "major", "location": "x", "claim": "c", "suggestion": "s"},
+            {"id": "F1", "severity": "blocker", "location": "y", "claim": "c2", "suggestion": "s2"},
+        ])
