@@ -75,9 +75,13 @@ def run_all() -> int:
         if not ok:
             failed.append(name)
             sys.stdout.write(output if output.endswith("\n") else output + "\n")
+    # The pytest suite is a core gate, not optional: if no interpreter can import
+    # pytest, that is a FAILURE (don't silently pass with the suite unrun).
     if _pytest_python() is None:
-        print("note  pytest not available — suite skipped locally (CI always runs it). "
-              "Install with `pip install pytest` or create a .venv.")
+        print("FAIL  suite")
+        print("pytest is not available — install it (`pip install pytest`) or create a repo "
+              ".venv with pytest. The test suite is a required gate and was not run.")
+        failed.append("suite")
     if shutil.which("shellcheck") is None:
         print("note  shellcheck not installed — skipped (CI still runs it)")
     if failed:

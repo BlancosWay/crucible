@@ -64,6 +64,19 @@ class TestVersionConsistency(unittest.TestCase):
         text = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
         self.assertIn("## [Unreleased]", text, "CHANGELOG.md must keep an '## [Unreleased]' section")
 
+    def test_current_version_section_is_nonempty(self):
+        # The release workflow publishes the current version's section as the release
+        # notes; guard here (a REQUIRED check) that those notes are non-empty, so a
+        # version bump with an empty section can never reach a tag.
+        version = _plugin_version()
+        text = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        body = _changelog.extract_section(text, version)
+        self.assertTrue(
+            body.strip(),
+            f"CHANGELOG '## [{version}]' section is empty — add release notes "
+            f"(release.yml publishes this section as the GitHub Release body)",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

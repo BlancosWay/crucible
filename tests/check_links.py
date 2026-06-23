@@ -34,8 +34,10 @@ SKIP_DIRS = {".git", ".venv"}
 # illustrative example Markdown — example commands, file contents, and link
 # syntax inside nested code fences. Those aren't live repo links, and nested
 # same-length fences can't be reliably stripped, so skip the plans tree as a
-# source. Specs are still checked.
-SKIP_PREFIXES = ("docs/superpowers/plans/",)
+# source. `runs/` holds generated, git-ignored run reports (model output), which
+# may contain illustrative paths and are not part of the repo's doc surface.
+# Specs are still checked.
+SKIP_PREFIXES = ("docs/superpowers/plans/", "runs/")
 
 broken: list[str] = []
 checked = 0
