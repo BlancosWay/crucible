@@ -81,3 +81,37 @@ def test_strict_rebuttal_flag_does_not_break_decide():
     cfg = Config.from_dict({"strict_rebuttal": True})
     v = _verdict("APPROVE", [])
     assert decide(v, cfg, round_index=1, max_rounds=5).outcome == "CONSENSUS"
+
+
+def test_wontfix_clears_blocking_when_not_strict():
+    v = _verdict("REQUEST_CHANGES", [
+        {"id": "F1", "severity": "major", "location": "x", "claim": "c", "suggestion": "s"},
+    ])
+    d = decide(v, CFG, round_index=1, max_rounds=5, resolutions={"F1": "wontfix"})
+    assert d.outcome == "CONSENSUS"
+
+
+def test_wontfix_stays_blocking_when_strict():
+    cfg = Config.from_dict({"strict_rebuttal": True})
+    v = _verdict("REQUEST_CHANGES", [
+        {"id": "F1", "severity": "major", "location": "x", "claim": "c", "suggestion": "s"},
+    ])
+    d = decide(v, cfg, round_index=1, max_rounds=5, resolutions={"F1": "wontfix"})
+    assert d.outcome == "CHANGES"
+
+
+def test_deferred_does_not_clear_blocking_finding():
+    # deferring a major finding is invalid (major not in defer_severities) -> stays blocking
+    v = _verdict("REQUEST_CHANGES", [
+        {"id": "F1", "severity": "major", "location": "x", "claim": "c", "suggestion": "s"},
+    ])
+    d = decide(v, CFG, round_index=1, max_rounds=5, resolutions={"F1": "deferred"})
+    assert d.outcome == "CHANGES"
+
+
+def test_fixed_keeps_finding_open_for_another_round():
+    v = _verdict("REQUEST_CHANGES", [
+        {"id": "F1", "severity": "blocker", "location": "x", "claim": "c", "suggestion": "s"},
+    ])
+    d = decide(v, CFG, round_index=1, max_rounds=5, resolutions={"F1": "fixed"})
+    assert d.outcome == "CHANGES"

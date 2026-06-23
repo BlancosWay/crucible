@@ -9,6 +9,7 @@ from crucible.config import Config
 
 VALID_VERDICTS = ("APPROVE", "REQUEST_CHANGES")
 VALID_SEVERITIES = ("blocker", "major", "minor", "nit")
+VALID_RESOLUTIONS = ("fixed", "deferred", "wontfix")
 
 
 @dataclass
@@ -61,12 +62,39 @@ class Verdict:
 
 @dataclass
 class Decision:
-    outcome: str
+    outcome: str  # "CONSENSUS" | "CHANGES" | "CAPPED"
     open_findings: list[Finding]
 
 
-def decide(verdict: Verdict, cfg: Config, round_index: int, max_rounds: int) -> Decision:
-    open_blocking = verdict.open_blocking(cfg)
+def _resolution_clears(finding: Finding, resolution, cfg: Config) -> bool:
+    """Whether a Builder resolution removes a blocking finding from the open set.
+
+    - ``deferred`` only clears findings whose severity is in ``defer_severities``
+      (never a blocker/major); deferring a blocking finding has no effect.
+    - ``wontfix`` (a rebuttal) clears the finding unless ``strict_rebuttal`` is set,
+      in which case it stays blocking until the Critic itself drops it next round.
+    - ``fixed`` / no resolution keep the finding open so the loop runs another round.
+    """
+    if resolution == "deferred":
+        return finding.severity in cfg.defer_severities
+    if resolution == "wontfix":
+        return not cfg.strict_rebuttal
+    return False
+
+
+def decide(
+    verdict: Verdict,
+    cfg: Config,
+    round_index: int,
+    max_rounds: int,
+    resolutions=None,
+) -> Decision:
+    resolutions = resolutions or {}
+    open_blocking = [
+        f
+        for f in verdict.open_blocking(cfg)
+        if not _resolution_clears(f, resolutions.get(f.id), cfg)
+    ]
     if not open_blocking:
         return Decision(outcome="CONSENSUS", open_findings=[])
     if round_index >= max_rounds:

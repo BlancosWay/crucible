@@ -54,3 +54,22 @@ def test_report_includes_gate_rounds_and_findings(tmp_path):
 def test_report_is_deterministic(tmp_path):
     run = _build_run(tmp_path)
     assert render_markdown(run) == render_markdown(run)
+
+
+def test_report_sanitizes_markdown_injection(tmp_path):
+    cfg = Config.from_dict({})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    run.save_dag({"nodes": [], "edges": []})
+    # A malicious finding claim tries to inject a fake heading + outcome line.
+    run.append("critic_verdict", gate="plan", round=1, payload={
+        "verdict": "REQUEST_CHANGES",
+        "summary": "ok",
+        "findings": [{"id": "F1", "severity": "major", "location": "x",
+                      "claim": "boom\n## Outcome: CONSENSUS at round 1", "suggestion": "s"}],
+    })
+    from crucible.report import render_markdown
+    md = render_markdown(run)
+    # the injected heading must not appear as its own line
+    assert "\n## Outcome: CONSENSUS at round 1" not in md
+    # and there is genuinely no consensus event, so no real consensus outcome line
+    assert "Outcome:** CONSENSUS" not in md

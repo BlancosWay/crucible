@@ -23,19 +23,26 @@ text is `references/builder-prompt.md`; stop criteria are in `references/consens
 Start a run:
 
 ```bash
-RUN=$(python -m crucible init-run --goal "<the user's goal>")   # add --config config.json to override defaults
+RUN=$(PYTHONPATH=scripts python -m crucible init-run --goal "<the user's goal>")   # add --config config.json to override defaults
 ```
+
+**Round caps & rebuttals.** `crucible verdict` reads the round cap from the run config by gate
+(`max_rounds_plan` for `plan`, `max_rounds_dep` for `dep:*`/`final`); pass `--max-rounds` only to
+override. When the Builder responds to findings, record per-finding resolutions in a JSON file
+(`{"F1": "fixed", "F2": "wontfix"}`, values `fixed|deferred|wontfix`) and pass
+`--resolutions res.json`; the decision honors `defer_severities` and `strict_rebuttal`, and the
+resolutions are logged to the run for provenance.
 
 ## Stage 1 — PLAN gate
 
 1. As **Builder**, use **superpowers:writing-plans** to draft the implementation plan (brainstorm
    first with **superpowers:brainstorming** if the goal is under-specified).
 2. Emit the **dependency tree** JSON (see `references/dependency-tree.md`) and load it:
-   `python -m crucible load-dag --run "$RUN" --file dag.json` (rejects cycles/unknown ids).
-3. Record your plan artifact: `python -m crucible log --run "$RUN" --event builder_output --gate plan --round N --file plan.md`.
+   `PYTHONPATH=scripts python -m crucible load-dag --run "$RUN" --file dag.json` (rejects cycles/unknown ids).
+3. Record your plan artifact: `PYTHONPATH=scripts python -m crucible log --run "$RUN" --event builder_output --gate plan --round N --file plan.md`.
 4. Dispatch the **Critic** with `critic-prompt.md` + the plan + the DAG. Capture its JSON verdict
    to `verdict.json`.
-5. Decide: `python -m crucible verdict --run "$RUN" --gate plan --round N --max-rounds 5 --file verdict.json`.
+5. Decide: `PYTHONPATH=scripts python -m crucible verdict --run "$RUN" --gate plan --round N --max-rounds 5 --file verdict.json`.
    - `CONSENSUS` -> go to Stage 2.
    - `CHANGES` -> revise as Builder, increment N, repeat from step 3.
    - `CAPPED` -> apply `on_cap` (default `halt`: stop and surface unresolved findings).
@@ -45,16 +52,16 @@ RUN=$(python -m crucible init-run --goal "<the user's goal>")   # add --config c
 Loop while there is a ready node:
 
 ```bash
-NODE=$(python -m crucible next --run "$RUN")   # empty when done
+NODE=$(PYTHONPATH=scripts python -m crucible next --run "$RUN")   # empty when done
 ```
 
 For each `$NODE`:
 
-1. `python -m crucible set-status --run "$RUN" --node "$NODE" --status in_progress`.
+1. `PYTHONPATH=scripts python -m crucible set-status --run "$RUN" --node "$NODE" --status in_progress`.
 2. As **Builder**, implement the node with **superpowers:subagent-driven-development** (TDD).
 3. Log the diff/output: `... log --event builder_output --gate dep:$NODE --round N --file out.txt`.
 4. Dispatch the **Critic** with `critic-prompt.md` + this node's diff. Capture `verdict.json`.
-5. `python -m crucible verdict --run "$RUN" --gate "dep:$NODE" --round N --max-rounds 5 --file verdict.json`.
+5. `PYTHONPATH=scripts python -m crucible verdict --run "$RUN" --gate "dep:$NODE" --round N --max-rounds 5 --file verdict.json`.
    - `CONSENSUS` -> `set-status --node "$NODE" --status done`; continue the loop.
    - `CHANGES` -> revise, increment N, repeat from step 3.
    - `CAPPED` -> apply `on_cap`.
@@ -65,8 +72,8 @@ Dispatch the Critic once over the whole implementation; log the verdict at `--ga
 
 ## Finish
 
-1. `python -m crucible status --run "$RUN"` to confirm all nodes `done`.
-2. `python -m crucible report --run "$RUN"` (add `--html` for HTML) to render the run report.
+1. `PYTHONPATH=scripts python -m crucible status --run "$RUN"` to confirm all nodes `done`.
+2. `PYTHONPATH=scripts python -m crucible report --run "$RUN"` (add `--html` for HTML) to render the run report.
 3. Use **superpowers:finishing-a-development-branch** to complete the work.
 
 ## Red flags

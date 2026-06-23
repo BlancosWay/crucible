@@ -48,9 +48,21 @@ class RunLog:
 
 
 def init_run(goal: str, cfg: Config, base_dir: str | Path = "runs") -> RunLog:
-    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d-%H%M%S")
-    run_dir = Path(base_dir) / f"{stamp}-{slugify(goal)[:40] or 'run'}"
-    run_dir.mkdir(parents=True, exist_ok=True)
+    base = Path(base_dir)
+    slug = slugify(goal)[:40] or "run"
+    run_dir = None
+    for attempt in range(1000):
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d-%H%M%S-%f")
+        suffix = "" if attempt == 0 else f"-{attempt}"
+        candidate = base / f"{stamp}-{slug}{suffix}"
+        try:
+            candidate.mkdir(parents=True, exist_ok=False)
+            run_dir = candidate
+            break
+        except FileExistsError:
+            continue
+    if run_dir is None:  # pragma: no cover - 1000 same-microsecond collisions is implausible
+        raise RuntimeError("could not allocate a unique run directory")
     (run_dir / "config.json").write_text(json.dumps(cfg.to_dict(), indent=2))
     run = RunLog(run_dir)
     run.append("run_start", goal=goal, config=cfg.to_dict())

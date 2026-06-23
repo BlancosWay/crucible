@@ -54,3 +54,13 @@ def test_save_and_load_dag(tmp_path):
     run.save_dag(dag_data)
     assert (run.path / "dag.json").exists()
     assert run.load_dag()["nodes"][0]["id"] == "a"
+
+
+def test_two_runs_same_goal_same_second_do_not_collide(tmp_path):
+    cfg = Config.from_dict({})
+    a = init_run("Same Goal", cfg, base_dir=tmp_path)
+    b = init_run("Same Goal", cfg, base_dir=tmp_path)
+    assert a.path != b.path
+    # each keeps its own independent run_start
+    assert a.read_events()[0]["event"] == "run_start"
+    assert b.read_events()[0]["event"] == "run_start"
