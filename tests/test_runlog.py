@@ -142,3 +142,60 @@ def test_read_events_raises_on_complete_but_invalid_unterminated_final_records(t
         (run.path / "runlog.jsonl").write_bytes(payload)  # no trailing newline
         with pytest.raises(RunLogCorruptError):
             run.read_events()
+
+
+def test_save_dag_uses_atomic_replace_and_fsync(tmp_path, monkeypatch):
+    # S1: prove save_dag goes through fsync + os.replace (not a plain write_text), so the
+    # behavior is actually guarded — these counters would stay 0 if it reverted.
+    import os as _os
+    run = _run(tmp_path)
+    calls = {"replace": 0, "fsync": 0}
+    real_replace, real_fsync = _os.replace, _os.fsync
+
+    def spy_replace(src, dst, *a, **k):
+        calls["replace"] += 1
+        return real_replace(src, dst, *a, **k)
+
+    def spy_fsync(fd):
+        calls["fsync"] += 1
+        return real_fsync(fd)
+
+    monkeypatch.setattr(_os, "replace", spy_replace)
+    monkeypatch.setattr(_os, "fsync", spy_fsync)
+    run.save_dag({"nodes": [{"id": "a", "title": "A", "description": "", "files": [],
+                             "test_plan": "", "status": "pending"}], "edges": []})
+    assert calls["replace"] == 1
+    assert calls["fsync"] >= 1  # temp file (and best-effort parent dir)
+
+
+def test_append_fsyncs_each_record(tmp_path, monkeypatch):
+    import os as _os
+    run = _run(tmp_path)
+    real_fsync = _os.fsync
+    count = {"n": 0}
+    monkeypatch.setattr(_os, "fsync", lambda fd: (count.__setitem__("n", count["n"] + 1), real_fsync(fd))[1])
+    run.append("x")
+    assert count["n"] >= 1
+
+
+def test_atomic_writes_leave_no_temp_residue(tmp_path):
+    # S1: save_dag/config writes go through an atomic temp+rename; after the call only the
+    # final file remains (no leftover .tmp), and the content round-trips.
+    run = _run(tmp_path)
+    run.save_dag({"nodes": [{"id": "a", "title": "A", "description": "", "files": [],
+                             "test_plan": "", "status": "pending"}], "edges": []})
+    names = [p.name for p in run.path.iterdir()]
+    assert "dag.json" in names
+    assert not any(n.endswith(".tmp") for n in names), names
+    assert run.load_dag()["nodes"][0]["id"] == "a"
+
+
+def test_save_dag_overwrite_is_atomic_and_complete(tmp_path):
+    # Overwriting an existing dag.json replaces it wholesale (no torn merge) and leaves no temp.
+    run = _run(tmp_path)
+    run.save_dag({"nodes": [{"id": "a", "title": "A", "description": "", "files": [],
+                             "test_plan": "", "status": "pending"}], "edges": []})
+    run.save_dag({"nodes": [{"id": "b", "title": "B", "description": "", "files": [],
+                             "test_plan": "", "status": "done"}], "edges": []})
+    assert [n["id"] for n in run.load_dag()["nodes"]] == ["b"]
+    assert not any(p.name.endswith(".tmp") for p in run.path.iterdir())

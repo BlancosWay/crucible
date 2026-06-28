@@ -66,6 +66,43 @@ def _validate_gate(gate: str) -> None:
     raise ValueError(f"invalid --gate {gate!r}; must be 'plan', 'final', or 'dep:<node-id>'")
 
 
+# A gate concludes with exactly one of these terminal events; a second one would silently
+# rewrite the gate's apparent outcome in the report (C3).
+_TERMINAL_EVENTS = ("gate_consensus", "gate_proceeded_with_flags", "gate_capped")
+
+
+def _require_dep_node_in_dag(run: RunLog, gate: str) -> None:
+    """For a ``dep:<id>`` gate, require ``<id>`` to be a real node in the run's DAG (C1). A
+    typo'd/ghost dependency would otherwise record a verdict/log — and a terminal outcome —
+    under a node that does not exist. ``plan``/``final`` gates are unaffected. Assumes the
+    gate has already passed ``_validate_gate`` (so the id is non-empty)."""
+    if not gate.startswith("dep:"):
+        return
+    node_id = gate[len("dep:"):]
+    try:
+        dag = run.load_dag()
+    except FileNotFoundError:
+        raise ValueError(f"gate {gate!r} targets a dependency node, but this run has no "
+                         f"dependency tree yet; run load-dag first")
+    known = {n.get("id") for n in dag.get("nodes", [])}
+    if node_id not in known:
+        raise ValueError(f"gate {gate!r} targets unknown node {node_id!r}; known nodes: "
+                         f"{sorted(i for i in known if isinstance(i, str))}")
+
+
+def _require_gate_not_terminal(run: RunLog, gate: str) -> None:
+    """Reject a verdict for a gate that already logged a terminal outcome (C3), so an
+    accidental rerun cannot silently overwrite a concluded gate's decision. The gate loop's
+    non-terminal ``CHANGES`` rounds log no terminal event, so re-deciding within the loop
+    stays allowed."""
+    prior = [e for e in run.read_events()
+             if e.get("gate") == gate and e.get("event") in _TERMINAL_EVENTS]
+    if prior:
+        last = prior[-1]
+        raise SystemExit(f"gate {gate!r} already concluded ({last['event']} at round "
+                         f"{last.get('round', '?')}); refusing to re-decide a terminal gate")
+
+
 def _max_rounds_for_gate(cfg: Config, gate: str) -> int:
     return cfg.max_rounds_plan if gate == "plan" else cfg.max_rounds_dep
 
@@ -126,6 +163,16 @@ def cmd_next(args) -> int:
 def cmd_set_status(args) -> int:
     run = RunLog(args.run)
     dag = DAG.from_dict(run.load_dag())
+    if args.node not in dag.nodes:
+        raise ValueError(f"unknown node: {args.node}")
+    # C2: a node cannot begin or finish work (in_progress/in_review/done) while a dependency
+    # is unfinished — that would let `next` schedule its dependents and skip the dependency's
+    # work. `pending`/`blocked` are not work statuses and stay settable for recovery.
+    if args.status in ("in_progress", "in_review", "done"):
+        unmet = sorted(d for d in dag.deps[args.node] if dag.nodes[d].status != "done")
+        if unmet:
+            raise SystemExit(f"set-status: cannot set {args.node!r} to {args.status!r} while these "
+                             f"dependencies are not done: {unmet}")
     dag.set_status(args.node, args.status)
     run.save_dag(dag.to_dict())
     run.append("node_status_change", node=args.node, status=args.status)
@@ -139,6 +186,7 @@ def cmd_log(args) -> int:
                          f"by their own commands (verdict, set-status, load-dag)")
     _validate_gate(args.gate)
     run = RunLog(args.run)
+    _require_dep_node_in_dag(run, args.gate)
     run.append(args.event, gate=args.gate, round=args.round, payload=_read_payload(args.file))
     print("logged")
     return 0
@@ -162,6 +210,11 @@ def cmd_verdict(args) -> int:
     if verdict.round != args.round:
         raise SystemExit(f"verdict round {verdict.round} does not match --round {args.round}")
 
+    # C3/C1: refuse to re-decide a concluded gate, and require a dep:<id> gate to name a real
+    # node — both before anything is logged or decided.
+    _require_gate_not_terminal(run, args.gate)
+    _require_dep_node_in_dag(run, args.gate)
+
     # H1: reject a Critic verdict whose APPROVE/REQUEST_CHANGES label contradicts its
     # findings under the run's blocking_severities, before logging or deciding.
     inconsistency = verdict.consistency_error(cfg)
@@ -180,6 +233,15 @@ def cmd_verdict(args) -> int:
     if unknown:
         raise ValueError(f"resolutions reference unknown finding id(s): {sorted(unknown)}; "
                          f"valid ids: {sorted(finding_ids)}")
+    # O5-B: `deferred` only clears a finding whose severity is in defer_severities; deferring a
+    # blocking finding has no effect, so reject it (a typo/misuse) instead of logging a
+    # misleading no-op resolution.
+    severity_by_id = {f.id: f.severity for f in verdict.findings}
+    bad_defer = sorted(fid for fid, res in resolutions.items()
+                       if res == "deferred" and severity_by_id.get(fid) not in cfg.defer_severities)
+    if bad_defer:
+        raise ValueError(f"cannot defer finding(s) {bad_defer}: 'deferred' is only allowed for "
+                         f"severities in defer_severities {cfg.defer_severities}")
     if resolutions_raw:
         run.append("builder_resolution", gate=args.gate, round=args.round, payload=resolutions_raw)
 

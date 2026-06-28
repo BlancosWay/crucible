@@ -71,8 +71,8 @@ class Config:
                 merged[role] = {**DEFAULTS[role], **override}
         for role in ("builder", "critic"):
             for field in ("model", "effort"):
-                if not isinstance(merged[role].get(field), str):
-                    raise ValueError(f"{role}.{field} must be a string")
+                if not isinstance(merged[role].get(field), str) or not merged[role][field].strip():
+                    raise ValueError(f"{role}.{field} must be a non-empty string")
         for name in ("defer_severities", "blocking_severities"):
             val = merged[name]
             if not isinstance(val, list) or not all(isinstance(s, str) for s in val):

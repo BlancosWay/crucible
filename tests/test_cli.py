@@ -125,7 +125,7 @@ def test_log_critic_output_is_allowed(tmp_path):
     run_dir = _init(tmp_path)
     f = Path(tmp_path) / "critic.txt"
     f.write_text("the critic said things")
-    r = _run(["log", "--run", run_dir, "--event", "critic_output", "--gate", "dep:a", "--round", "1", "--file", str(f)])
+    r = _run(["log", "--run", run_dir, "--event", "critic_output", "--gate", "plan", "--round", "1", "--file", str(f)])
     assert r.returncode == 0, r.stderr
     assert _events(run_dir)[-1]["payload"] == "the critic said things"
 
@@ -655,3 +655,147 @@ def test_init_run_list_config_is_clean(tmp_path):
     assert r.returncode != 0
     assert "Traceback" not in r.stderr
     assert "crucible:" in r.stderr and "object" in r.stderr.lower()
+
+
+# --- C1: dep:<id> gate must reference a real node in the run's DAG --------------
+
+def test_verdict_rejects_ghost_dep_node(tmp_path):
+    # C1: dep:<id> for a node that isn't in the DAG is a typo'd/ghost gate; reject it so a
+    # verdict isn't recorded (and a terminal outcome rendered) under a non-existent node.
+    run_dir = _init(tmp_path)
+    _load(run_dir, tmp_path, {"a": "pending"})
+    vfile = Path(tmp_path) / "v.json"
+    vfile.write_text(json.dumps({"gate": "dep:ghost", "round": 1, "verdict": "APPROVE",
+                                 "summary": "", "findings": []}))
+    r = _run(["verdict", "--run", run_dir, "--gate", "dep:ghost", "--round", "1", "--file", str(vfile)])
+    assert r.returncode != 0
+    assert "ghost" in r.stderr and ("unknown node" in r.stderr or "unknown" in r.stderr)
+    assert "CONSENSUS" not in r.stdout
+    assert "critic_verdict" not in [e["event"] for e in _events(run_dir)]
+
+
+def test_log_rejects_ghost_dep_node(tmp_path):
+    run_dir = _init(tmp_path)
+    _load(run_dir, tmp_path, {"a": "pending"})
+    f = Path(tmp_path) / "o.txt"
+    f.write_text("x")
+    r = _run(["log", "--run", run_dir, "--event", "builder_output", "--gate", "dep:ghost",
+              "--round", "1", "--file", str(f)])
+    assert r.returncode != 0
+    assert "ghost" in r.stderr
+
+
+def test_verdict_dep_gate_requires_loaded_dag(tmp_path):
+    # A dep:<id> gate before any DAG is loaded cannot be validated -> clean error.
+    run_dir = _init(tmp_path)
+    vfile = Path(tmp_path) / "v.json"
+    vfile.write_text(json.dumps({"gate": "dep:a", "round": 1, "verdict": "APPROVE",
+                                 "summary": "", "findings": []}))
+    r = _run(["verdict", "--run", run_dir, "--gate", "dep:a", "--round", "1", "--file", str(vfile)])
+    assert r.returncode != 0
+    assert "crucible:" in r.stderr
+
+
+def test_verdict_valid_dep_node_still_works(tmp_path):
+    run_dir = _init(tmp_path)
+    _load(run_dir, tmp_path, {"a": "pending"})
+    vfile = Path(tmp_path) / "v.json"
+    vfile.write_text(json.dumps({"gate": "dep:a", "round": 1, "verdict": "APPROVE",
+                                 "summary": "ok", "findings": []}))
+    r = _run(["verdict", "--run", run_dir, "--gate", "dep:a", "--round", "1", "--file", str(vfile)])
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "CONSENSUS"
+
+
+# --- C2: set-status enforces dependency completion for work statuses -----------
+
+def test_set_status_done_requires_deps_done(tmp_path):
+    # C2: a node cannot be marked done while a dependency is unfinished (it would let `next`
+    # schedule dependents and skip the dependency's work).
+    run_dir = _init(tmp_path)
+    _load(run_dir, tmp_path, {"a": "pending", "b": "pending"},
+          edges=[{"from": "b", "depends_on": "a"}])
+    r = _run(["set-status", "--run", run_dir, "--node", "b", "--status", "done"])
+    assert r.returncode != 0
+    assert "a" in r.stderr and ("dependenc" in r.stderr.lower())
+
+
+def test_set_status_in_progress_requires_deps_done(tmp_path):
+    run_dir = _init(tmp_path)
+    _load(run_dir, tmp_path, {"a": "pending", "b": "pending"},
+          edges=[{"from": "b", "depends_on": "a"}])
+    r = _run(["set-status", "--run", run_dir, "--node", "b", "--status", "in_progress"])
+    assert r.returncode != 0
+    assert "dependenc" in r.stderr.lower()
+
+
+def test_set_status_done_allowed_when_deps_done(tmp_path):
+    run_dir = _init(tmp_path)
+    _load(run_dir, tmp_path, {"a": "pending", "b": "pending"},
+          edges=[{"from": "b", "depends_on": "a"}])
+    assert _run(["set-status", "--run", run_dir, "--node", "a", "--status", "done"]).returncode == 0
+    r = _run(["set-status", "--run", run_dir, "--node", "b", "--status", "done"])
+    assert r.returncode == 0, r.stderr
+
+
+def test_set_status_blocked_not_gated_by_deps(tmp_path):
+    # `blocked`/`pending` are not work statuses; they can be set regardless of deps.
+    run_dir = _init(tmp_path)
+    _load(run_dir, tmp_path, {"a": "pending", "b": "pending"},
+          edges=[{"from": "b", "depends_on": "a"}])
+    r = _run(["set-status", "--run", run_dir, "--node", "b", "--status", "blocked"])
+    assert r.returncode == 0, r.stderr
+
+
+# --- C3: a concluded gate cannot be re-decided --------------------------------
+
+def test_verdict_rejects_already_concluded_gate(tmp_path):
+    # C3: once a gate logs a terminal outcome, a second verdict must not silently rewrite it.
+    run_dir = _init(tmp_path)
+    vfile = Path(tmp_path) / "v.json"
+    vfile.write_text(json.dumps({"gate": "plan", "round": 1, "verdict": "APPROVE",
+                                 "summary": "first", "findings": []}))
+    assert _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1",
+                 "--file", str(vfile)]).stdout.strip() == "CONSENSUS"
+    v2 = Path(tmp_path) / "v2.json"
+    v2.write_text(json.dumps({"gate": "plan", "round": 2, "verdict": "APPROVE",
+                              "summary": "second", "findings": []}))
+    r = _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "2", "--file", str(v2)])
+    assert r.returncode != 0
+    assert "concluded" in r.stderr.lower() or "terminal" in r.stderr.lower()
+    # only the original terminal event remains
+    assert [e["event"] for e in _events(run_dir)].count("gate_consensus") == 1
+
+
+# --- O5-B: deferring a blocking finding is rejected ---------------------------
+
+def test_verdict_rejects_defer_of_blocking_finding(tmp_path):
+    # O5-B: `deferred` is only valid for a deferrable severity; deferring a blocker is a
+    # misuse that would otherwise be logged as a no-op resolution.
+    run_dir = _init(tmp_path)
+    vfile = Path(tmp_path) / "v.json"
+    vfile.write_text(json.dumps({
+        "gate": "plan", "round": 1, "verdict": "REQUEST_CHANGES", "summary": "x",
+        "findings": [{"id": "F1", "severity": "major", "location": "x", "claim": "c", "suggestion": "s"}]}))
+    res = Path(tmp_path) / "res.json"
+    res.write_text(json.dumps({"F1": "deferred"}))
+    r = _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1",
+              "--file", str(vfile), "--resolutions", str(res)])
+    assert r.returncode != 0
+    assert "defer" in r.stderr.lower() and "F1" in r.stderr
+    assert "builder_resolution" not in [e["event"] for e in _events(run_dir)]
+
+
+def test_verdict_defer_of_minor_finding_is_allowed(tmp_path):
+    # The legitimate case: a minor (deferrable) finding can be deferred and clears the gate.
+    run_dir = _init(tmp_path)
+    vfile = Path(tmp_path) / "v.json"
+    vfile.write_text(json.dumps({
+        "gate": "plan", "round": 1, "verdict": "APPROVE", "summary": "x",
+        "findings": [{"id": "F1", "severity": "minor", "location": "x", "claim": "c", "suggestion": "s"}]}))
+    res = Path(tmp_path) / "res.json"
+    res.write_text(json.dumps({"F1": "deferred"}))
+    r = _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1",
+              "--file", str(vfile), "--resolutions", str(res)])
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "CONSENSUS"

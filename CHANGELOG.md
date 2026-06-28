@@ -21,6 +21,28 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
   `on_cap: halt` is unchanged.
 
 ### Fixed
+- **Round-5 orchestration-invariant & durability hardening.**
+  - `crucible verdict` / `log` now reject a `dep:<id>` gate whose `<id>` is not a node in the
+    run's dependency tree; a typo'd/ghost dependency previously recorded a verdict (and a
+    terminal outcome) under a non-existent node (C1).
+  - `crucible set-status` now refuses to set a node `in_progress`/`in_review`/`done` while any of
+    its dependencies is unfinished; a node could previously be marked done out of order, letting
+    `next` schedule and skip dependent work (C2).
+  - `crucible verdict` now refuses to re-decide a gate that already logged a terminal outcome
+    (`gate_consensus`/`gate_proceeded_with_flags`/`gate_capped`); an accidental rerun could
+    otherwise silently rewrite the gate's apparent decision in the report (C3).
+  - `crucible verdict --resolutions` now rejects a `deferred` resolution on a finding whose
+    severity is not in `defer_severities` (deferring a blocker was a silent no-op logged as if
+    meaningful) (O5-B).
+  - Config `builder`/`critic` `model` and `effort` must now be **non-empty** strings; an empty
+    string previously validated into an unusable dispatch config (C6).
+  - Run-log writes are now crash-durable (S1): each appended record is `fsync`-ed, and
+    `dag.json`/`config.json` are written via an atomic temp-file + `os.replace`, so a crash
+    mid-write can never leave a torn file.
+  - Docs: the dependency-tree schema now states imported nodes must be `pending` (matching the
+    round-4 importer) (O5-A); the no-subagent fallback `log` command shows the required `--run`
+    and `--file` (C5); a Copilot agent-type packaging caveat + fallback is noted (C4); and the
+    consensus definition now reflects the rebuttal path, not just a Critic `APPROVE` (O5-C).
 - **Round-4 orchestration & validation hardening.**
   - SKILL.md PLAN loop now reloads a Critic-corrected dependency tree on `CHANGES`: it repeats
     from the DAG emit/`load-dag` step (was "repeat from step 3", which skipped the reload), so a

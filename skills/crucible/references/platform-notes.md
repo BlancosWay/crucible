@@ -16,7 +16,10 @@ the **IMPLEMENT** and **FINAL** gates.
 - **Code-review gates (IMPLEMENT / FINAL):** dispatch the **`superpowers:code-reviewer`** agent
   via the `task` tool with `agent_type: "superpowers:code-reviewer"`, the same `model` /
   `reasoning_effort`. Give it the node's diff (or the whole implementation) plus the task/plan
-  context, and require its findings as the `critic-prompt.md` verdict JSON.
+  context, and require its findings as the `critic-prompt.md` verdict JSON. If this build's
+  Superpowers packaging does not expose that `agent_type`, fall back to the platform's built-in
+  code-review agent on the critic model (or the **No-subagent fallback** below) and note the
+  substitution in the run-log.
 
 ## Claude Code / Codex
 
@@ -30,4 +33,6 @@ model id, fall back to the most capable available model and note it in the run-l
 If no subagent mechanism is available, run the Critic prompt as a separate, clearly delimited
 pass in the same session (state "Acting as Critic now"), capture its JSON verdict, and feed it to
 `crucible verdict`. Record the full text via
-`crucible log --event critic_output --gate "$GATE" --round N` (both required).
+`crucible log --run "$RUN" --event critic_output --gate "$GATE" --round N --file critic-output.txt`
+(`--run`, `--gate`, `--round`, and `--file` are all required; without `--file` the payload is
+empty and the raw Critic provenance is lost).

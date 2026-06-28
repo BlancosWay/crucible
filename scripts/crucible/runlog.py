@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 from datetime import datetime, timezone
@@ -10,6 +11,39 @@ from pathlib import Path
 from typing import Any
 
 from crucible.config import Config
+
+
+def _fsync_dir(dirpath: Path) -> None:
+    """Best-effort durable fsync of a directory entry (e.g. after ``os.replace`` or first
+    creating a file), so the rename/creation survives a crash on POSIX. Directory fsync is
+    not supported everywhere (e.g. Windows), so any failure is ignored."""
+    try:
+        fd = os.open(dirpath, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:  # pragma: no cover - platform/filesystem without directory fsync
+        pass
+    finally:
+        os.close(fd)
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` atomically and durably (S1): write a sibling temp file,
+    fsync it, ``os.replace`` it into place (an atomic rename on POSIX and Windows), then fsync
+    the parent directory so the rename itself is durable. A crash mid-write can never leave a
+    half-written ``dag.json``/``config.json`` — readers see either the old or the new file."""
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        with tmp.open("w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        _fsync_dir(path.parent)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 class RunLogCorruptError(Exception):
@@ -33,8 +67,13 @@ class RunLog:
 
     def append(self, event: str, **fields: Any) -> dict[str, Any]:
         record = {"ts": datetime.now(timezone.utc).isoformat(), "event": event, **fields}
+        first_create = not self._events_file.exists()
         with self._events_file.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())  # S1: durably persist each appended record
+        if first_create:  # persist the new file's directory entry too
+            _fsync_dir(self.path)
         return record
 
     def read_events(self) -> list[dict[str, Any]]:
@@ -73,8 +112,8 @@ class RunLog:
         return out
 
     def save_dag(self, dag_data: dict[str, Any]) -> None:
-        (self.path / "dag.json").write_text(
-            json.dumps(dag_data, indent=2, ensure_ascii=False), encoding="utf-8")
+        _atomic_write_text(self.path / "dag.json",
+                           json.dumps(dag_data, indent=2, ensure_ascii=False))
 
     def load_dag(self) -> dict[str, Any]:
         return json.loads((self.path / "dag.json").read_text(encoding="utf-8"))
@@ -96,8 +135,8 @@ def init_run(goal: str, cfg: Config, base_dir: str | Path = "runs") -> RunLog:
             continue
     if run_dir is None:  # pragma: no cover - 1000 same-microsecond collisions is implausible
         raise RuntimeError("could not allocate a unique run directory")
-    (run_dir / "config.json").write_text(
-        json.dumps(cfg.to_dict(), indent=2, ensure_ascii=False), encoding="utf-8")
+    _atomic_write_text(run_dir / "config.json",
+                       json.dumps(cfg.to_dict(), indent=2, ensure_ascii=False))
     run = RunLog(run_dir)
     run.append("run_start", goal=goal, config=cfg.to_dict())
     return run

@@ -3,8 +3,10 @@
 A gate **loops**: Builder produces -> Critic reviews -> Builder revises -> ... The loop ends on
 the **first** of these:
 
-1. **Consensus** — the Critic returns `APPROVE`, i.e. there are **no open findings** whose
-   severity is in `blocking_severities` (default `["blocker", "major"]`). Findings of severity in
+1. **Consensus** — there are **no open findings** whose severity is in `blocking_severities`
+   (default `["blocker", "major"]`). The Critic reaches this by returning `APPROVE`; the Builder
+   can also reach it from a `REQUEST_CHANGES` verdict by clearing every blocking finding via a
+   `wontfix` rebuttal or (for `defer_severities`) a deferral. Findings of severity in
    `defer_severities` (default `["minor", "nit"]`) may be deferred and do not block.
 2. **Round cap** — the round index reaches `max_rounds_plan` (PLAN gate) or `max_rounds_dep`
    (each IMPLEMENT gate). Default 5 each.
