@@ -55,3 +55,16 @@ def test_dated_heading_with_subheading_only_does_not_count():
 def test_tolerates_empty_base():
     head = _with_unreleased("- first ever entry")
     assert added_changelog_entry("", head) is True
+
+
+def test_re_added_identical_line_counts(tmp_path=None):
+    # O3: a shipped change whose new line duplicates an existing line must still count.
+    base = _with_unreleased("- alpha")
+    head = _with_unreleased("- alpha", "- alpha")
+    assert added_changelog_entry(base, head) is True
+
+
+def test_removing_a_line_is_not_an_entry():
+    base = _with_unreleased("- alpha", "- beta")
+    head = _with_unreleased("- alpha")
+    assert added_changelog_entry(base, head) is False

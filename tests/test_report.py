@@ -172,6 +172,15 @@ def test_report_renders_critic_output(tmp_path):
     assert "the critic's full raw review NOTED" in md
 
 
+def test_report_empty_builder_output_renders_placeholder(tmp_path):
+    # O4: an empty payload renders a placeholder, not an empty fenced code block.
+    run = _provenance_run(tmp_path)
+    run.append("builder_output", gate="plan", round=1, payload="")
+    md = render_markdown(run)
+    assert "_(empty)_" in md
+    assert "```\n```" not in md  # no empty fence pair
+
+
 def test_report_escapes_backticks_in_untrusted_text(tmp_path):
     # N6: a backtick in untrusted Critic text must be escaped (not start an inline code span).
     run = _provenance_run(tmp_path)
