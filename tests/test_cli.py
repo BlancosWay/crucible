@@ -98,6 +98,49 @@ def test_log_appends_full_payload(tmp_path):
     assert events[-1]["payload"] == "B" * 3000
 
 
+def _events(run_dir):
+    return [json.loads(l) for l in (Path(run_dir) / "runlog.jsonl").read_text().splitlines() if l.strip()]
+
+
+def test_log_rejects_reserved_event(tmp_path):
+    # N1: `log` must not be able to forge a CLI-managed terminal/verdict event.
+    run_dir = _init(tmp_path)
+    before = len(_events(run_dir))
+    r = _run(["log", "--run", run_dir, "--event", "gate_consensus", "--gate", "plan", "--round", "1"])
+    assert r.returncode != 0
+    assert "crucible:" in r.stderr and "builder_output" in r.stderr
+    # nothing was appended
+    assert not any(e["event"] == "gate_consensus" for e in _events(run_dir))
+    assert len(_events(run_dir)) == before
+
+
+def test_log_rejects_arbitrary_event(tmp_path):
+    run_dir = _init(tmp_path)
+    r = _run(["log", "--run", run_dir, "--event", "note", "--gate", "plan", "--round", "1"])
+    assert r.returncode != 0
+    assert "crucible:" in r.stderr
+
+
+def test_log_critic_output_is_allowed(tmp_path):
+    run_dir = _init(tmp_path)
+    f = Path(tmp_path) / "critic.txt"
+    f.write_text("the critic said things")
+    r = _run(["log", "--run", run_dir, "--event", "critic_output", "--gate", "dep:a", "--round", "1", "--file", str(f)])
+    assert r.returncode == 0, r.stderr
+    assert _events(run_dir)[-1]["payload"] == "the critic said things"
+
+
+def test_log_stores_json_file_as_raw_text(tmp_path):
+    # N2: a JSON-shaped builder_output must be kept verbatim, not parsed + re-serialized.
+    run_dir = _init(tmp_path)
+    f = Path(tmp_path) / "out.json"
+    raw = '{"b": 2,   "a": 1}\n'  # deliberate spacing/key-order
+    f.write_text(raw)
+    r = _run(["log", "--run", run_dir, "--event", "builder_output", "--gate", "plan", "--round", "1", "--file", str(f)])
+    assert r.returncode == 0, r.stderr
+    assert _events(run_dir)[-1]["payload"] == raw
+
+
 def test_verdict_cap_from_config_when_max_rounds_omitted(tmp_path):
     cfg = Path(tmp_path) / "c.json"
     cfg.write_text(json.dumps({"max_rounds_plan": 1}))
@@ -426,3 +469,33 @@ def test_verdict_rejects_round_below_one(tmp_path):
     r = _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "0", "--file", str(vfile)])
     assert r.returncode != 0
     assert "must be >= 1" in r.stderr
+
+
+def test_init_run_bad_scalar_config_is_clean(tmp_path):
+    # N3: a wrong-typed scalar config field is a clean 'crucible:' error, not a raw TypeError.
+    cfg = Path(tmp_path) / "c.json"
+    cfg.write_text(json.dumps({"max_rounds_plan": []}))
+    r = _run(["init-run", "--goal", "g", "--base-dir", str(tmp_path), "--config", str(cfg)])
+    assert r.returncode != 0
+    assert "Traceback" not in r.stderr
+    assert "crucible:" in r.stderr and "max_rounds_plan must be an integer" in r.stderr
+
+
+def test_verdict_rejects_max_rounds_below_one(tmp_path):
+    run_dir = _init(tmp_path)
+    vfile = Path(tmp_path) / "v.json"
+    vfile.write_text(json.dumps({"gate": "plan", "round": 1, "verdict": "APPROVE",
+                                 "summary": "", "findings": []}))
+    r = _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1",
+              "--max-rounds", "0", "--file", str(vfile)])
+    assert r.returncode != 0
+    assert "--max-rounds must be >= 1" in r.stderr
+
+
+def test_report_html_cli_writes_file(tmp_path):
+    run_dir = _init(tmp_path)
+    _load(run_dir, tmp_path, {"a": "done"})
+    r = _run(["report", "--run", run_dir, "--html"])
+    assert r.returncode == 0, r.stderr
+    assert "<!doctype html>" in r.stdout
+    assert (Path(run_dir) / "report.html").exists()

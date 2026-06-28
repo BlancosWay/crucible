@@ -15,7 +15,7 @@ def _san(value: Any) -> str:
     ``|`` could otherwise inject fake headings, rows, or outcome lines into the report.
     """
     text = str(value).replace("\r", " ").replace("\n", " ")
-    text = text.replace("|", "\\|")
+    text = text.replace("|", "\\|").replace("`", "\\`")
     return " ".join(text.split()).strip()
 
 
@@ -91,6 +91,11 @@ def render_markdown(run: RunLog) -> str:
             rnd = _san(e.get("round", "?"))
             if ev == "builder_output":
                 lines.append(f"**Builder output (round {rnd}):**")
+                lines.append("")
+                lines.extend(_fenced(_payload_text(e.get("payload"))))
+                lines.append("")
+            elif ev == "critic_output":
+                lines.append(f"**Critic output (round {rnd}):**")
                 lines.append("")
                 lines.extend(_fenced(_payload_text(e.get("payload"))))
                 lines.append("")

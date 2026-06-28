@@ -176,6 +176,23 @@ def test_finding_from_dict_rejects_non_dict():
                            "findings": ["oops"]})
 
 
+def test_verdict_round_must_be_int():
+    for bad in ([], {}, "1", 1.5, True):
+        with pytest.raises(ValueError, match="round must be an integer"):
+            Verdict.from_dict({"gate": "plan", "round": bad, "verdict": "APPROVE", "findings": []})
+
+
+def test_verdict_gate_must_be_non_empty_string():
+    with pytest.raises(ValueError, match="gate must be a non-empty string"):
+        Verdict.from_dict({"gate": 1, "round": 1, "verdict": "APPROVE", "findings": []})
+
+
+def test_finding_id_must_be_non_empty_string():
+    with pytest.raises(ValueError, match="id must be a non-empty string"):
+        Verdict.from_dict({"gate": "plan", "round": 1, "verdict": "REQUEST_CHANGES",
+                           "findings": [{"id": 1, "severity": "blocker"}]})
+
+
 def _finding(sev, fid="F1"):
     return {"id": fid, "severity": sev, "location": "x", "claim": "c", "suggestion": "s"}
 

@@ -162,9 +162,11 @@ runs/2026-06-22-2150-add-rate-limiter/
 ```
 
 `runlog.jsonl` is **append-only**, one JSON event per line. Event types: `run_start`,
-`gate_start`, `builder_output`, `critic_verdict`, `builder_resolution`, `gate_consensus`,
-`gate_proceeded_with_flags`, `gate_capped`, `node_status_change`, `run_complete`. Each
-`builder_output` and `critic_verdict`
+`gate_start`, `builder_output`, `critic_output`, `critic_verdict`, `builder_resolution`,
+`gate_consensus`, `gate_proceeded_with_flags`, `gate_capped`, `node_status_change`,
+`run_complete`. Of these, the generic `crucible log` command may only append `builder_output`
+and `critic_output` (full raw text); every other event is written by its own command so it
+cannot be forged. Each `builder_output`, `critic_output`, and `critic_verdict`
 event stores the agent's **full raw text** (not a condensed summary) — so the final report and
 any audit read directly from the log, never from hand-reconstructed text. (This directly honors
 the lesson that condensed-only logs force error-prone manual reconstruction.)

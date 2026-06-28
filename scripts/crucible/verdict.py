@@ -27,8 +27,11 @@ class Finding:
         sev = data["severity"]
         if sev not in VALID_SEVERITIES:
             raise ValueError(f"invalid severity: {sev}")
+        fid = data["id"]
+        if not isinstance(fid, str) or not fid:
+            raise ValueError("finding.id must be a non-empty string")
         return cls(
-            id=data["id"],
+            id=fid,
             severity=sev,
             location=data.get("location", ""),
             claim=data.get("claim", ""),
@@ -59,9 +62,15 @@ class Verdict:
         dupes = sorted({i for i in ids if ids.count(i) > 1})
         if dupes:
             raise ValueError(f"duplicate finding ids: {dupes}")
+        gate = data["gate"]
+        if not isinstance(gate, str) or not gate:
+            raise ValueError("verdict.gate must be a non-empty string")
+        rnd = data["round"]
+        if isinstance(rnd, bool) or not isinstance(rnd, int):
+            raise ValueError("verdict.round must be an integer")
         return cls(
-            gate=data["gate"],
-            round=int(data["round"]),
+            gate=gate,
+            round=rnd,
             verdict=verdict,
             summary=data.get("summary", ""),
             findings=findings,

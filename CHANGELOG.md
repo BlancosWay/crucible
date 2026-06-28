@@ -21,11 +21,29 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
   `on_cap: halt` is unchanged.
 
 ### Fixed
+- **Report renders `critic_output` (N4).** The no-subagent-fallback Critic's full raw review
+  (logged as `critic_output`) is now rendered in the report (in an injection-safe fenced block),
+  matching `builder_output`; previously it was logged but silently omitted.
+- **Scalar/field type validation (N3).** The config, DAG, and verdict parsers now reject
+  wrong-typed scalar fields with a clear `crucible: …` error instead of a raw `TypeError` or a
+  silent mis-load: `max_rounds_*` / verdict `round` must be real integers; `defer`/`blocking`
+  severities must be lists (no char-explosion); `builder`/`critic` `model`/`effort` must be
+  strings; and node ids, edge endpoints, and finding ids must be non-empty strings.
+- **`log` command hardening (N1, N2).** `crucible log --event` is now restricted to
+  `builder_output`/`critic_output`; it can no longer append a CLI-managed event (e.g.
+  `gate_consensus`, `critic_verdict`) and forge a report outcome/verdict. Logged payloads are now
+  stored as **raw text** (no JSON parse + re-serialize), preserving exact whitespace/key order for
+  full-fidelity provenance.
 - **Smaller robustness & portability fixes.**
   - `defer_severities` and `blocking_severities` must now be **disjoint** — a severity in both
     previously let a `deferred` resolution clear a blocking finding (L1).
   - `crucible verdict --round` now requires `>= 1` (rounds are 1-based) instead of silently
     accepting 0/negative (L4).
+  - `crucible verdict --max-rounds` override now also requires `>= 1` (N5).
+  - The Markdown report now escapes backticks in untrusted Critic text, so a stray backtick can
+    no longer break the surrounding inline formatting (N6).
+  - The internal Markdown link checker now rejects links that resolve outside the repo, and is
+    refactored into testable functions (N7).
   - The run-directory slug no longer keeps a trailing hyphen after truncation (L3).
   - Workflow examples in the README and skill now use `python3` (matching CI/CONTRIBUTING), and
     `scripts/check.py` also finds a Windows (`.venv/Scripts/python.exe`) interpreter (L2).

@@ -163,6 +163,27 @@ def test_report_renders_critic_verdict_raw(tmp_path):
     assert "RAW_PROVENANCE" in md
 
 
+def test_report_renders_critic_output(tmp_path):
+    # N4: the no-subagent-fallback `critic_output` (full raw review text) must appear in the report.
+    run = _provenance_run(tmp_path)
+    run.append("critic_output", gate="dep:a", round=1, payload="the critic's full raw review NOTED")
+    md = render_markdown(run)
+    assert "Critic output" in md
+    assert "the critic's full raw review NOTED" in md
+
+
+def test_report_escapes_backticks_in_untrusted_text(tmp_path):
+    # N6: a backtick in untrusted Critic text must be escaped (not start an inline code span).
+    run = _provenance_run(tmp_path)
+    run.append("critic_verdict", gate="plan", round=1, payload={
+        "verdict": "REQUEST_CHANGES", "summary": "s",
+        "findings": [{"id": "F1", "severity": "major", "location": "x",
+                      "claim": "use `git rebase`", "suggestion": "s"}]})
+    md = render_markdown(run)
+    assert "\\`" in md  # backticks escaped
+    assert "use `git rebase`" not in md  # the raw (unescaped) code-span form is gone
+
+
 def test_report_builder_output_fence_is_injection_safe(tmp_path):
     run = _provenance_run(tmp_path)
     run.append("builder_output", gate="plan", round=1,

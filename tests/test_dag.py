@@ -196,3 +196,18 @@ def test_from_dict_rejects_non_list_edges():
 def test_from_dict_rejects_non_dict_edge():
     with pytest.raises(ValueError, match="edge at index 0"):
         DAG.from_dict({"nodes": [{"id": "a"}], "edges": ["oops"]})
+
+
+def test_from_dict_rejects_non_string_node_id():
+    with pytest.raises(ValueError, match="must be a non-empty string"):
+        DAG.from_dict({"nodes": [{"id": 1}], "edges": []})
+
+
+def test_from_dict_rejects_empty_node_id():
+    with pytest.raises(ValueError, match="must be a non-empty string"):
+        DAG.from_dict({"nodes": [{"id": ""}], "edges": []})
+
+
+def test_from_dict_rejects_non_string_edge_endpoint():
+    with pytest.raises(ValueError, match="must be a non-empty string"):
+        DAG.from_dict({"nodes": [{"id": "a"}], "edges": [{"from": 1, "depends_on": "a"}]})
