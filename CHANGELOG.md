@@ -21,6 +21,25 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
   `on_cap: halt` is unchanged.
 
 ### Fixed
+- **Round-4 orchestration & validation hardening.**
+  - SKILL.md PLAN loop now reloads a Critic-corrected dependency tree on `CHANGES`: it repeats
+    from the DAG emit/`load-dag` step (was "repeat from step 3", which skipped the reload), so a
+    revised DAG is never ignored while Stage 2 walks a stale one (G1).
+  - `crucible load-dag` now rejects a freshly imported plan whose nodes are not all `pending`; a
+    node baked as `done`/`in_progress` previously let `next` schedule its dependents and silently
+    skip its work. Statuses change only via `set-status` (G2).
+  - `crucible verdict` and `crucible log` now validate `--gate` (`plan` | `final` | `dep:<id>`); a
+    typo like `finale` was previously logged under a bogus gate using the dependency round cap (G3).
+  - SKILL.md Stage 3 `should-final` snippet now sets a `RUN_FINAL` flag and guards the FINAL
+    dispatch with `if [ "$RUN_FINAL" = 1 ]`; the prior `case` arms were no-ops and the dispatch ran
+    unconditionally, so `no` did not actually skip the final gate (G4).
+  - `Config.from_dict` now rejects a non-object (top-level list/string/number/null) config with a
+    clean `crucible: config must be a JSON object` error instead of a raw `AttributeError` (G5).
+  - `crucible verdict --resolutions` now rejects a `null` resolution value as malformed instead of
+    logging it and treating the finding as unresolved (G6).
+  - Added in-process CLI unit tests (the rest of the CLI suite runs via subprocess), documented the
+    reserved `in_review` status and the intentional verdict digest-plus-raw provenance, clarified
+    that rounds are 1-based and per-gate in SKILL.md, and gitignored `.coverage` (P1–P4).
 - **Round-3 robustness fixes.**
   - `crucible verdict --resolutions` now rejects a resolution that targets an unknown finding id
     (e.g. a typo) with a clear error, instead of silently ignoring the intended rebuttal (O1).

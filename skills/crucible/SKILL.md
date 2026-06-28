@@ -35,6 +35,10 @@ resolutions are logged to the run for provenance.
 
 ## Stage 1 — PLAN gate
 
+Rounds are 1-based and per-gate: start each gate at `N=1` and increment `N` on every
+revision (`crucible verdict --round` rejects `N < 1`). The round counter resets to 1 when a
+new gate begins.
+
 1. As **Builder**, use **superpowers:writing-plans** to draft the implementation plan (brainstorm
    first with **superpowers:brainstorming** if the goal is under-specified).
 2. Emit the **dependency tree** JSON (see `references/dependency-tree.md`) and load it:
@@ -47,7 +51,10 @@ resolutions are logged to the run for provenance.
    `references/platform-notes.md`.)
 5. Decide: `PYTHONPATH=scripts python3 -m crucible verdict --run "$RUN" --gate plan --round N --file verdict.json`.
    - `CONSENSUS` -> go to Stage 2.
-   - `CHANGES` -> revise as Builder, increment N, repeat from step 3.
+   - `CHANGES` -> revise as Builder, increment N, then **repeat from step 2** — re-emit the
+     dependency tree (the Critic reviews DAG edges/order too) and re-run `load-dag` so a
+     corrected DAG is reloaded before re-logging and re-deciding. (`load-dag` is idempotent
+     when the tree is unchanged; the plan is still all-`pending` at this stage.)
    - `CAPPED` (`on_cap: halt`) -> stop and surface the unresolved findings; do not proceed.
    - `PROCEED_WITH_FLAGS` (`on_cap: proceed_with_flags`) -> go to Stage 2; the unresolved
      findings are recorded (`gate_proceeded_with_flags`) and shown in the report.
@@ -91,16 +98,24 @@ token so a config-load error halts rather than being mistaken for "disabled":
 
 ```bash
 case "$(PYTHONPATH=scripts python3 -m crucible should-final --run "$RUN")" in
-  yes) : ;;                                   # final_review enabled — run the FINAL gate below
-  no)  : ;;                                   # disabled — skip to Finish
+  yes) RUN_FINAL=1 ;;                          # final_review enabled — run the FINAL gate below
+  no)  RUN_FINAL=0 ;;                          # disabled — skip straight to Finish
   *)   echo "crucible: cannot determine final-gate policy; halting" >&2; exit 1 ;;
 esac
 ```
 
-When enabled, dispatch the **Critic** as the **`superpowers:code-reviewer`** agent (on the critic
-model) once over the whole implementation; loop at `--gate final` (round cap is `max_rounds_dep`)
-exactly like a dependency gate: `CONSENSUS` -> finish; `CHANGES` -> revise and repeat; `CAPPED` ->
-halt and surface; `PROCEED_WITH_FLAGS` -> finish with the unresolved findings flagged in the report.
+The two arms only *record* the decision; they must not run the gate themselves. Guard the
+actual FINAL dispatch on the flag so `no` genuinely skips it:
+
+```bash
+if [ "$RUN_FINAL" = 1 ]; then
+  # Dispatch the Critic as the superpowers:code-reviewer agent (on the critic model) once
+  # over the whole implementation; loop at --gate final (round cap is max_rounds_dep) exactly
+  # like a dependency gate: CONSENSUS -> finish; CHANGES -> revise and repeat; CAPPED -> halt
+  # and surface; PROCEED_WITH_FLAGS -> finish with the unresolved findings flagged in the report.
+  :
+fi
+```
 
 ## Finish
 

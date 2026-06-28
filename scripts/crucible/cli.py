@@ -44,10 +44,26 @@ def _load_resolutions(path):
         else:
             res = val
             raw[fid] = {"resolution": val}
-        if res is not None and res not in VALID_RESOLUTIONS:
-            raise ValueError(f"invalid resolution {res!r} for {fid}; must be one of {VALID_RESOLUTIONS}")
+        if res not in VALID_RESOLUTIONS:
+            raise ValueError(f"invalid resolution {res!r} for {fid}; must be one of "
+                             f"{VALID_RESOLUTIONS} (omit the id to leave a finding unresolved)")
         norm[fid] = res
     return norm, raw
+
+
+def _validate_gate(gate: str) -> None:
+    """A gate is ``plan``, ``final``, or ``dep:<node-id>``. Reject anything else (e.g. a
+    typo like ``finale``) so a verdict/log is never recorded under a bogus, off-convention
+    gate — which would otherwise silently use the dependency round cap and render as a
+    spurious report section. The ``dep:`` id must be non-empty and free of surrounding
+    whitespace (``dep:`` / ``dep:  `` are blank ids, not real nodes)."""
+    if gate in ("plan", "final"):
+        return
+    if gate.startswith("dep:"):
+        node_id = gate[len("dep:"):]
+        if node_id and node_id == node_id.strip():
+            return
+    raise ValueError(f"invalid --gate {gate!r}; must be 'plan', 'final', or 'dep:<node-id>'")
 
 
 def _max_rounds_for_gate(cfg: Config, gate: str) -> int:
@@ -68,6 +84,13 @@ def cmd_load_dag(args) -> int:
     if not dag.nodes:
         raise SystemExit("load-dag: dependency tree is empty (0 nodes); a plan must decompose "
                          "into at least one node")
+    # G2: load-dag imports a *fresh* plan, so every node must start `pending`. A node baked
+    # as `done`/`in_progress`/`blocked` would let `next` schedule its dependents and silently
+    # skip its work. Statuses change only through set-status, never via the imported plan.
+    non_pending = [nid for nid in dag.order if dag.nodes[nid].status != "pending"]
+    if non_pending:
+        raise SystemExit(f"load-dag: a freshly imported plan must have every node 'pending'; "
+                         f"these are not: {non_pending}. Node statuses change only via set-status.")
     run.save_dag(dag.to_dict())
     run.append("dag_loaded", gate="plan", nodes=len(dag.nodes))
     print(f"loaded {len(dag.nodes)} nodes")
@@ -114,6 +137,7 @@ def cmd_log(args) -> int:
     if args.event not in LOG_EVENTS:
         raise ValueError(f"log --event must be one of {LOG_EVENTS}; other events are written "
                          f"by their own commands (verdict, set-status, load-dag)")
+    _validate_gate(args.gate)
     run = RunLog(args.run)
     run.append(args.event, gate=args.gate, round=args.round, payload=_read_payload(args.file))
     print("logged")
@@ -125,6 +149,7 @@ def cmd_verdict(args) -> int:
         raise SystemExit("--round must be >= 1 (rounds are 1-based)")
     if args.max_rounds is not None and args.max_rounds < 1:
         raise SystemExit("--max-rounds must be >= 1")
+    _validate_gate(args.gate)
     run = RunLog(args.run)
     cfg = load_config(run.path / "config.json")
     raw_text = Path(args.file).read_text(encoding="utf-8")
@@ -160,7 +185,10 @@ def cmd_verdict(args) -> int:
 
     decision = decide(verdict, cfg, round_index=args.round, max_rounds=max_rounds, resolutions=resolutions)
 
-    # F6: persist both the parsed verdict and the Critic's full raw output.
+    # F6: persist both the parsed verdict and the Critic's full raw output. These are not
+    # redundant: the report renders the parsed payload as a readable digest (verdict + summary
+    # + per-finding bullets) and the `raw` text as a full-fidelity provenance block (exact
+    # bytes/formatting/extra keys). Keeping both is intentional (digest for humans, raw for audit).
     run.append("critic_verdict", gate=args.gate, round=args.round, payload=data, raw=raw_text)
     if decision.outcome == "CONSENSUS":
         run.append("gate_consensus", gate=args.gate, round=args.round)

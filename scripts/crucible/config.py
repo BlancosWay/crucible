@@ -53,6 +53,8 @@ class Config:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Config":
+        if not isinstance(data, dict):
+            raise ValueError("config must be a JSON object")
         unknown = set(data) - set(DEFAULTS)
         if unknown:
             raise ValueError(f"unknown config keys: {sorted(unknown)}")

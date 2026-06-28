@@ -249,12 +249,21 @@ def _init(tmp_path):
 
 
 def _load(run_dir, tmp_path, nodes, edges=None):
-    dag = {"nodes": [{"id": nid, "title": nid, "description": "", "files": [], "test_plan": "", "status": st}
-                     for nid, st in nodes.items()],
+    # load-dag imports a *fresh* plan: every node must be `pending` (G2). To exercise next/
+    # report against mixed statuses, load all-pending then transition via set-status — this
+    # mirrors production, where statuses only ever change through set-status, never baked
+    # into the imported plan.
+    dag = {"nodes": [{"id": nid, "title": nid, "description": "", "files": [], "test_plan": "",
+                      "status": "pending"} for nid in nodes],
            "edges": edges or []}
     f = Path(tmp_path) / "dag.json"
     f.write_text(json.dumps(dag))
-    return _run(["load-dag", "--run", run_dir, "--file", str(f)])
+    r = _run(["load-dag", "--run", run_dir, "--file", str(f)])
+    if r.returncode == 0:
+        for nid, st in nodes.items():
+            if st != "pending":
+                _run(["set-status", "--run", run_dir, "--node", nid, "--status", st])
+    return r
 
 
 def test_load_dag_rejects_empty(tmp_path):
@@ -550,3 +559,99 @@ def test_log_requires_round(tmp_path):
     r = _run(["log", "--run", run_dir, "--event", "builder_output", "--gate", "plan", "--file", str(f)])
     assert r.returncode != 0
     assert "round" in r.stderr.lower()
+
+# --- G2: load-dag imports a fresh (all-pending) plan -------------------------
+
+def test_load_dag_rejects_non_pending_initial_status(tmp_path):
+    # G2: a freshly imported plan must have every node `pending`. A node pre-marked
+    # `done` (or any non-pending status) would let `next` schedule its dependents and
+    # silently skip its work. Reject it at import.
+    run_dir = _init(tmp_path)
+    dagf = Path(tmp_path) / "dag.json"
+    dagf.write_text(json.dumps({"nodes": [
+        {"id": "a", "title": "A", "description": "", "files": [], "test_plan": "", "status": "done"},
+        {"id": "b", "title": "B", "description": "", "files": [], "test_plan": "", "status": "pending"}],
+        "edges": [{"from": "b", "depends_on": "a"}]}))
+    r = _run(["load-dag", "--run", run_dir, "--file", str(dagf)])
+    assert r.returncode != 0
+    assert "pending" in r.stderr.lower() and "a" in r.stderr
+    # nothing was saved/logged for the rejected import
+    assert "dag_loaded" not in [e["event"] for e in _events(run_dir)]
+
+
+def test_load_dag_accepts_all_pending(tmp_path):
+    # The normal case still works: an all-pending fresh plan imports fine.
+    run_dir = _init(tmp_path)
+    r = _load(run_dir, tmp_path, {"a": "pending", "b": "pending"},
+              edges=[{"from": "b", "depends_on": "a"}])
+    assert r.returncode == 0, r.stderr
+
+
+# --- G3: gate names must be plan | final | dep:<id> --------------------------
+
+def test_verdict_rejects_invalid_gate_name(tmp_path):
+    # G3: a typo'd gate (e.g. "finale") must be rejected, not silently logged under a
+    # bogus gate section using the dependency round cap.
+    run_dir = _init(tmp_path)
+    vfile = Path(tmp_path) / "v.json"
+    vfile.write_text(json.dumps({"gate": "finale", "round": 1, "verdict": "APPROVE",
+                                 "summary": "", "findings": []}))
+    r = _run(["verdict", "--run", run_dir, "--gate", "finale", "--round", "1", "--file", str(vfile)])
+    assert r.returncode != 0
+    assert "gate" in r.stderr.lower()
+    assert "CONSENSUS" not in r.stdout
+    assert "critic_verdict" not in [e["event"] for e in _events(run_dir)]
+
+
+def test_verdict_accepts_final_gate(tmp_path):
+    # `final` is a valid gate (round cap = max_rounds_dep).
+    run_dir = _init(tmp_path)
+    vfile = Path(tmp_path) / "v.json"
+    vfile.write_text(json.dumps({"gate": "final", "round": 1, "verdict": "APPROVE",
+                                 "summary": "ok", "findings": []}))
+    r = _run(["verdict", "--run", run_dir, "--gate", "final", "--round", "1", "--file", str(vfile)])
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "CONSENSUS"
+
+
+def test_log_rejects_invalid_gate_name(tmp_path):
+    # G3 also applies to `log`: an off-convention gate would create a bogus report section.
+    run_dir = _init(tmp_path)
+    f = Path(tmp_path) / "o.txt"
+    f.write_text("x")
+    r = _run(["log", "--run", run_dir, "--event", "builder_output", "--gate", "finale",
+              "--round", "1", "--file", str(f)])
+    assert r.returncode != 0
+    assert "gate" in r.stderr.lower()
+
+
+# --- G6: a null resolution is malformed --------------------------------------
+
+def test_verdict_rejects_null_resolution(tmp_path):
+    # G6: {"F1": null} is a malformed resolution (no fixed|deferred|wontfix). It was
+    # previously logged but treated as unresolved; reject it as a shape error instead.
+    run_dir = _init(tmp_path)
+    vfile = Path(tmp_path) / "v.json"
+    vfile.write_text(json.dumps({
+        "gate": "plan", "round": 1, "verdict": "REQUEST_CHANGES", "summary": "x",
+        "findings": [{"id": "F1", "severity": "major", "location": "x", "claim": "c", "suggestion": "s"}]}))
+    res = Path(tmp_path) / "res.json"
+    res.write_text(json.dumps({"F1": None}))
+    r = _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1",
+              "--file", str(vfile), "--resolutions", str(res)])
+    assert r.returncode != 0
+    assert "crucible:" in r.stderr and "F1" in r.stderr
+    assert "builder_resolution" not in [e["event"] for e in _events(run_dir)]
+
+
+# --- G5: a non-object config is a clean error --------------------------------
+
+def test_init_run_list_config_is_clean(tmp_path):
+    # G5: a top-level JSON list (not an object) config must be a clean 'crucible:' error,
+    # not a raw AttributeError traceback.
+    cfg = Path(tmp_path) / "c.json"
+    cfg.write_text(json.dumps(["max_rounds_plan", 3]))
+    r = _run(["init-run", "--goal", "g", "--base-dir", str(tmp_path), "--config", str(cfg)])
+    assert r.returncode != 0
+    assert "Traceback" not in r.stderr
+    assert "crucible:" in r.stderr and "object" in r.stderr.lower()

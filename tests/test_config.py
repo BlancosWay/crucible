@@ -30,6 +30,14 @@ def test_invalid_on_cap_raises():
         Config.from_dict({"on_cap": "yolo"})
 
 
+def test_from_dict_rejects_non_dict():
+    # G5: a top-level non-object (list/str/number/None) must raise a clean ValueError, not
+    # a raw AttributeError when from_dict reaches into `.items()` / `set(data)`.
+    for bad in ([], ["a"], "x", 3, None):
+        with pytest.raises(ValueError, match="object"):
+            Config.from_dict(bad)
+
+
 def test_invalid_round_cap_raises():
     with pytest.raises(ValueError, match="max_rounds_plan"):
         Config.from_dict({"max_rounds_plan": 0})
