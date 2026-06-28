@@ -5,6 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+# `in_review` is a reserved status: it is detected as in-flight (see `in_flight`) and may be
+# set manually/externally, but the standard orchestration flow only transitions
+# pending -> in_progress -> done. It is intentionally part of the vocabulary, not dead.
 VALID_STATUSES = ("pending", "in_progress", "in_review", "done", "blocked")
 
 
