@@ -3,18 +3,33 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from crucible.runlog import RunLog
 
 
-def _san(value: Any) -> str:
-    """Flatten untrusted text to a single line and neutralize table/markdown breakers.
+# A fenced code block delimiter as emitted by ``_fenced`` (a column-0 run of >= 3 backticks).
+_FENCE_LINE = re.compile(r"^`{3,}$")
 
-    Critic verdicts, goals, and DAG fields are untrusted data; a newline or a stray
-    ``|`` could otherwise inject fake headings, rows, or outcome lines into the report.
+
+def _html_escape(text: str) -> str:
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _san(value: Any) -> str:
+    """Flatten untrusted text to a single line and neutralize Markdown table/heading AND
+    HTML breakers.
+
+    Critic verdicts, goals, and DAG fields are untrusted data: a newline or a stray ``|``
+    could inject a fake heading/row/outcome line, and raw HTML (``<script>``,
+    ``<img onerror=…>``) would execute when ``report.md`` is opened in an HTML-permitting
+    Markdown renderer. So escape ``&``/``<``/``>`` (``&`` first) in addition to ``|`` and
+    backticks. The fenced raw provenance is handled separately — kept verbatim in Markdown
+    (code-fence content renders literally) and escaped by ``render_html``.
     """
     text = str(value).replace("\r", " ").replace("\n", " ")
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     text = text.replace("|", "\\|").replace("`", "\\`")
     return " ".join(text.split()).strip()
 
@@ -150,11 +165,27 @@ def render_markdown(run: RunLog) -> str:
 
 
 def render_html(run: RunLog) -> str:
+    # Inline fields are already HTML-escaped by `_san`; only the raw provenance inside code
+    # fences remains unescaped. Escape exactly those fence bodies — escaping the whole
+    # document would double-escape the inline fields (`&lt;` -> `&amp;lt;`). Fence delimiter
+    # lines are pure backticks (no `&<>`), so they pass through unchanged.
     md = render_markdown(run)
-    escaped = md.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    out: list[str] = []
+    fence: str | None = None
+    for line in md.split("\n"):
+        if fence is None and _FENCE_LINE.match(line):
+            fence = line
+            out.append(line)
+        elif fence is not None and line == fence:
+            fence = None
+            out.append(line)
+        elif fence is not None:
+            out.append(_html_escape(line))
+        else:
+            out.append(line)
     return (
         "<!doctype html><html><head><meta charset='utf-8'>"
         "<title>Crucible Run Report</title></head><body><pre>"
-        f"{escaped}"
+        f"{chr(10).join(out)}"
         "</pre></body></html>"
     )

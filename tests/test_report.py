@@ -210,3 +210,52 @@ def test_report_html_escapes_builder_output(tmp_path):
     html = render_html(run)
     assert "&lt;script&gt;" in html
     assert "<script>" not in html
+
+
+# --- RPT-001: untrusted inline fields are HTML-safe in the markdown report -----
+
+def test_report_markdown_escapes_html_in_inline_fields(tmp_path):
+    # RPT-001: a Critic finding (untrusted model output) with raw HTML must not render as
+    # live HTML when report.md is viewed in an HTML-permitting Markdown renderer.
+    from crucible.report import render_markdown
+    run = init_run("pwn <img src=x onerror=alert(1)>", Config.from_dict({}), base_dir=tmp_path)
+    run.save_dag({"nodes": [], "edges": []})
+    run.append("critic_verdict", gate="plan", round=1, payload={
+        "verdict": "REQUEST_CHANGES", "summary": "<script>alert(1)</script>",
+        "findings": [{"id": "F1", "severity": "major", "location": "<b>x</b>",
+                      "claim": "<img src=x onerror=alert(1)>", "suggestion": "s"}]})
+    md = render_markdown(run)
+    # raw tags from inline fields must be neutralized
+    assert "<script>" not in md
+    assert "<img" not in md
+    assert "<b>x</b>" not in md
+    # and present in escaped form
+    assert "&lt;script&gt;" in md
+    assert "&lt;img" in md
+
+
+def test_report_html_escapes_inline_html_fields_without_double_escaping(tmp_path):
+    from crucible.report import render_html
+    run = init_run("g", Config.from_dict({}), base_dir=tmp_path)
+    run.save_dag({"nodes": [], "edges": []})
+    run.append("critic_verdict", gate="plan", round=1, payload={
+        "verdict": "REQUEST_CHANGES", "summary": "ok",
+        "findings": [{"id": "F1", "severity": "major", "location": "loc",
+                      "claim": "<script>alert(1)</script>", "suggestion": "s"}]})
+    html = render_html(run)
+    assert "<script>" not in html
+    assert "&lt;script&gt;" in html
+    # the inline field was escaped exactly once (no &amp;lt; double-escaping)
+    assert "&amp;lt;" not in html
+
+
+def test_report_markdown_keeps_provenance_fence_raw(tmp_path):
+    # Fidelity: the fenced raw provenance (Builder/Critic output) stays verbatim in the
+    # markdown — code-fence content is rendered literally by Markdown processors, so raw
+    # HTML there is safe without escaping (and the HTML path still escapes it).
+    from crucible.report import render_markdown, render_html
+    run = _provenance_run(tmp_path)
+    run.append("builder_output", gate="plan", round=1, payload="raw <tag> kept <as-is>")
+    md = render_markdown(run)
+    assert "raw <tag> kept <as-is>" in md          # markdown fence: full fidelity
+    assert "raw &lt;tag&gt;" in render_html(run)    # html: escaped

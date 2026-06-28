@@ -21,6 +21,13 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
   `on_cap: halt` is unchanged.
 
 ### Fixed
+- **Markdown report neutralizes raw HTML in untrusted fields (RPT-001).** `_san` now escapes
+  `&`/`<`/`>` (in addition to `|` and backticks), so untrusted model output (the goal and the
+  Critic's verdict/summary/finding fields) can no longer render as live HTML — e.g. a finding
+  claim `<img src=x onerror=…>` — when `report.md` is opened in an HTML-permitting Markdown
+  renderer. The raw provenance code fences stay verbatim in Markdown (code-fence content renders
+  literally), and `render_html` now escapes only those fence bodies, so the HTML report stays
+  fully escaped without double-escaping the already-escaped inline fields.
 - **Round-5 orchestration-invariant & durability hardening.**
   - `crucible verdict` / `log` now reject a `dep:<id>` gate whose `<id>` is not a node in the
     run's dependency tree; a typo'd/ghost dependency previously recorded a verdict (and a
