@@ -70,9 +70,9 @@ class Config:
             else:
                 merged[role] = {**DEFAULTS[role], **override}
         for role in ("builder", "critic"):
-            for field in ("model", "effort"):
-                if not isinstance(merged[role].get(field), str) or not merged[role][field].strip():
-                    raise ValueError(f"{role}.{field} must be a non-empty string")
+            for key in ("model", "effort"):
+                if not isinstance(merged[role].get(key), str) or not merged[role][key].strip():
+                    raise ValueError(f"{role}.{key} must be a non-empty string")
         for name in ("defer_severities", "blocking_severities"):
             val = merged[name]
             if not isinstance(val, list) or not all(isinstance(s, str) for s in val):
@@ -102,6 +102,12 @@ class Config:
             bad = set(getattr(self, name)) - set(VALID_SEVERITIES)
             if bad:
                 raise ValueError(f"{name} has invalid severities: {sorted(bad)}")
+        # blocking_severities must be non-empty: with no blocking severity, no finding can ever
+        # block, so APPROVE/REQUEST_CHANGES diverge — every REQUEST_CHANGES fails consistency
+        # (verdict.consistency_error) and a gate could never legitimately request changes.
+        if not self.blocking_severities:
+            raise ValueError("blocking_severities must be non-empty (a REQUEST_CHANGES needs at "
+                             "least one blocking severity)")
         overlap = set(self.defer_severities) & set(self.blocking_severities)
         if overlap:
             raise ValueError("defer_severities and blocking_severities must be disjoint; "
