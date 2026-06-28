@@ -12,8 +12,10 @@ the **first** of these:
 ## On reaching the cap without consensus — `on_cap`
 
 - `halt` (default): stop the gate, persist the unresolved findings, and surface them to the
-  human. Do **not** proceed.
-- `proceed_with_flags`: continue, but tag the node/run with the unresolved findings in the report.
+  human. Do **not** proceed. `crucible verdict` returns `CAPPED`.
+- `proceed_with_flags`: continue past the gate, but tag the node/run with the unresolved findings
+  in the report. `crucible verdict` returns `PROCEED_WITH_FLAGS` and records a
+  `gate_proceeded_with_flags` event carrying the open finding ids.
 
 ## Rebuttals (`wontfix`)
 
@@ -24,7 +26,7 @@ When the Builder rebuts a finding with `wontfix` + rationale:
 - `strict_rebuttal: true`: the finding stays blocking until the Critic **explicitly accepts** the
   rebuttal in a later round.
 
-The deterministic decision (`CONSENSUS` / `CHANGES` / `CAPPED`) is computed by
-`crucible verdict` — the skill never eyeballs it. Pass the Builder's per-finding resolutions via
+The deterministic decision (`CONSENSUS` / `CHANGES` / `CAPPED` / `PROCEED_WITH_FLAGS`) is computed
+by `crucible verdict` — the skill never eyeballs it. Pass the Builder's per-finding resolutions via
 `crucible verdict --resolutions res.json` (`{"F1": "wontfix"}`); `decide()` then applies
 `defer_severities` and `strict_rebuttal` and records a `builder_resolution` event.

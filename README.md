@@ -15,7 +15,8 @@ Critic signs off (**consensus**) or a configured round cap is hit.
    `max_rounds_dep`.
 3. **FINAL gate** — optional whole-implementation review, then a deterministic run report.
 
-Consensus = Critic returns `APPROVE` (no open `blocker`/`major` findings). On a round cap without
+Consensus = Critic returns `APPROVE` (no open findings whose severity is in the configured
+`blocking_severities`, default `blocker`/`major`). On a round cap without
 consensus, Crucible **halts and surfaces** the unresolved findings (configurable).
 
 ## Defaults
@@ -39,11 +40,11 @@ In an agent runtime with Superpowers installed, run the skill:
 The skill drives the loop and calls the deterministic CLI for every decision:
 
 ```bash
-RUN=$(PYTHONPATH=scripts python -m crucible init-run --goal "add a rate limiter")
-PYTHONPATH=scripts python -m crucible load-dag --run "$RUN" --file dag.json
-PYTHONPATH=scripts python -m crucible next --run "$RUN"
-PYTHONPATH=scripts python -m crucible verdict --run "$RUN" --gate plan --round 1 --file verdict.json
-PYTHONPATH=scripts python -m crucible report --run "$RUN" --html
+RUN=$(PYTHONPATH=scripts python3 -m crucible init-run --goal "add a rate limiter")
+PYTHONPATH=scripts python3 -m crucible load-dag --run "$RUN" --file dag.json
+PYTHONPATH=scripts python3 -m crucible next --run "$RUN"
+PYTHONPATH=scripts python3 -m crucible verdict --run "$RUN" --gate plan --round 1 --file verdict.json
+PYTHONPATH=scripts python3 -m crucible report --run "$RUN" --html
 ```
 
 ## Development

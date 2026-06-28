@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from crucible.runlog import RunLog
@@ -16,6 +17,27 @@ def _san(value: Any) -> str:
     text = str(value).replace("\r", " ").replace("\n", " ")
     text = text.replace("|", "\\|")
     return " ".join(text.split()).strip()
+
+
+def _payload_text(payload: Any) -> str:
+    """Full-fidelity text for a raw provenance payload (Builder output / Critic raw)."""
+    if isinstance(payload, str):
+        return payload
+    if payload is None:
+        return ""
+    return json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False)
+
+
+def _fenced(text: str) -> list[str]:
+    """Render ``text`` as a Markdown code block whose fence is longer than any backtick
+    run inside it, so untrusted content can never close the fence early. Returned as
+    column-0 lines (the fence must not be indented under a list item)."""
+    longest = run = 0
+    for ch in text:
+        run = run + 1 if ch == "`" else 0
+        longest = max(longest, run)
+    fence = "`" * max(3, longest + 1)
+    return [fence, *text.splitlines(), fence]
 
 
 def _events_by_gate(events: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
@@ -64,23 +86,57 @@ def render_markdown(run: RunLog) -> str:
     for gate, gate_events in gates.items():
         lines.append(f"### Gate: `{_san(gate)}`")
         lines.append("")
-        consensus = [e for e in gate_events if e["event"] == "gate_consensus"]
-        capped = [e for e in gate_events if e["event"] == "gate_capped"]
         for e in gate_events:
-            if e["event"] != "critic_verdict":
-                continue
-            payload = e.get("payload", {})
-            rnd = e.get("round", "?")
-            lines.append(f"- **Round {_san(rnd)}:** {_san(payload.get('verdict', '?'))} - {_san(payload.get('summary', ''))}")
-            for f in payload.get("findings", []):
-                lines.append(
-                    f"  - `{_san(f.get('id'))}` [{_san(f.get('severity'))}] {_san(f.get('location'))}: "
-                    f"{_san(f.get('claim'))} -> {_san(f.get('suggestion'))}"
-                )
-        if consensus:
-            lines.append(f"- **Outcome:** CONSENSUS at round {_san(consensus[-1].get('round', '?'))}")
-        elif capped:
-            lines.append(f"- **Outcome:** CAPPED at round {_san(capped[-1].get('round', '?'))} (unresolved)")
+            ev = e.get("event")
+            rnd = _san(e.get("round", "?"))
+            if ev == "builder_output":
+                lines.append(f"**Builder output (round {rnd}):**")
+                lines.append("")
+                lines.extend(_fenced(_payload_text(e.get("payload"))))
+                lines.append("")
+            elif ev == "critic_verdict":
+                payload = e.get("payload", {})
+                lines.append(f"- **Round {rnd}:** {_san(payload.get('verdict', '?'))} - {_san(payload.get('summary', ''))}")
+                for f in payload.get("findings", []):
+                    lines.append(
+                        f"  - `{_san(f.get('id'))}` [{_san(f.get('severity'))}] {_san(f.get('location'))}: "
+                        f"{_san(f.get('claim'))} -> {_san(f.get('suggestion'))}"
+                    )
+                raw = e.get("raw")
+                if raw:
+                    lines.append("")
+                    lines.append(f"**Critic verdict raw (round {rnd}):**")
+                    lines.append("")
+                    lines.extend(_fenced(_payload_text(raw)))
+                    lines.append("")
+            elif ev == "builder_resolution":
+                payload = e.get("payload") or {}
+                if isinstance(payload, dict) and payload:
+                    lines.append(f"- **Builder resolutions (round {rnd}):**")
+                    for fid, info in payload.items():
+                        if isinstance(info, dict):
+                            res, rationale = info.get("resolution", "?"), info.get("rationale", "")
+                        else:
+                            res, rationale = info, ""
+                        tail = f" — {_san(rationale)}" if rationale else ""
+                        lines.append(f"  - `{_san(fid)}` -> {_san(res)}{tail}")
+        # A gate ends in exactly one terminal event; if several were ever logged, the LAST in
+        # log order is authoritative. Each interpolated value is sanitized individually.
+        terminal = [e for e in gate_events
+                    if e["event"] in ("gate_consensus", "gate_proceeded_with_flags", "gate_capped")]
+        if terminal:
+            last = terminal[-1]
+            rnd = _san(last.get("round", "?"))
+            if last["event"] == "gate_consensus":
+                lines.append(f"- **Outcome:** CONSENSUS at round {rnd}")
+            elif last["event"] == "gate_proceeded_with_flags":
+                flags = last.get("open_findings", [])
+                ids = ", ".join(_san(i) for i in flags)
+                carried = f": {ids}" if ids else ""
+                lines.append(f"- **Outcome:** PROCEEDED WITH FLAGS at round {rnd} — "
+                             f"{len(flags)} unresolved finding(s) carried{carried}")
+            else:  # gate_capped
+                lines.append(f"- **Outcome:** CAPPED at round {rnd} (unresolved)")
         lines.append("")
 
     return "\n".join(lines)

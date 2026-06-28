@@ -19,8 +19,8 @@ def test_no_hardcoded_round_cap_override_in_workflow_examples():
 
 
 def test_workflow_commands_are_runnable_with_pythonpath():
-    # Every bare 'python -m crucible' in SKILL/README must be prefixed with PYTHONPATH=scripts.
+    # Every bare 'python3 -m crucible' in SKILL/README must be prefixed with PYTHONPATH=scripts.
     for p in [ROOT / "skills" / "crucible" / "SKILL.md", ROOT / "README.md"]:
         for line in p.read_text().splitlines():
-            if "python -m crucible" in line:
-                assert "PYTHONPATH=scripts python -m crucible" in line, f"unprefixed command in {p}: {line}"
+            if "python3 -m crucible" in line:
+                assert "PYTHONPATH=scripts python3 -m crucible" in line, f"unprefixed command in {p}: {line}"

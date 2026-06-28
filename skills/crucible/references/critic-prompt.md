@@ -54,7 +54,8 @@ blocking issues, else `REQUEST_CHANGES` with a finding per real issue.
 }
 ```
 
-- `verdict`: `APPROVE` only when there are **no** `blocker` or `major` findings open.
+- `verdict`: `APPROVE` only when there are **no** open findings whose severity is in the run's
+  `blocking_severities` (default `blocker`/`major`); otherwise `REQUEST_CHANGES`.
 - `severity`: one of `blocker | major | minor | nit`.
 - Give every finding a stable `id` (`F1`, `F2`, ...) so the Builder can respond to each.
 - Be concrete: cite the exact location and a fix. Vague findings are not actionable.

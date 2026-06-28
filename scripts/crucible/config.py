@@ -23,6 +23,14 @@ VALID_ON_CAP = ("halt", "proceed_with_flags")
 VALID_SEVERITIES = ("blocker", "major", "minor", "nit")
 
 
+def _require_bool(name: str, value: Any) -> bool:
+    # bool(...) would silently turn the JSON string "false" into True, inverting intent;
+    # require a real boolean instead.
+    if not isinstance(value, bool):
+        raise ValueError(f"{name} must be a boolean (true/false), got {value!r}")
+    return value
+
+
 @dataclass
 class Config:
     builder: dict[str, str]
@@ -41,6 +49,16 @@ class Config:
         if unknown:
             raise ValueError(f"unknown config keys: {sorted(unknown)}")
         merged = {**DEFAULTS, **{k: v for k, v in data.items() if v is not None}}
+        # builder/critic are nested dicts: deep-merge so a partial override (e.g. just `model`)
+        # keeps the sibling defaults (e.g. `effort`) instead of dropping them.
+        for role in ("builder", "critic"):
+            override = data.get(role)
+            if override is None:
+                merged[role] = dict(DEFAULTS[role])
+            elif not isinstance(override, dict):
+                raise ValueError(f"{role} must be an object")
+            else:
+                merged[role] = {**DEFAULTS[role], **override}
         cfg = cls(
             builder=dict(merged["builder"]),
             critic=dict(merged["critic"]),
@@ -49,8 +67,8 @@ class Config:
             on_cap=str(merged["on_cap"]),
             defer_severities=list(merged["defer_severities"]),
             blocking_severities=list(merged["blocking_severities"]),
-            strict_rebuttal=bool(merged["strict_rebuttal"]),
-            final_review=bool(merged["final_review"]),
+            strict_rebuttal=_require_bool("strict_rebuttal", merged["strict_rebuttal"]),
+            final_review=_require_bool("final_review", merged["final_review"]),
         )
         cfg._validate()
         return cfg
@@ -66,6 +84,10 @@ class Config:
             bad = set(getattr(self, name)) - set(VALID_SEVERITIES)
             if bad:
                 raise ValueError(f"{name} has invalid severities: {sorted(bad)}")
+        overlap = set(self.defer_severities) & set(self.blocking_severities)
+        if overlap:
+            raise ValueError("defer_severities and blocking_severities must be disjoint; "
+                             f"both contain: {sorted(overlap)}")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -82,5 +104,5 @@ class Config:
 
 
 def load_config(path: str | Path) -> Config:
-    data = json.loads(Path(path).read_text())
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
     return Config.from_dict(data)

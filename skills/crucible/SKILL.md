@@ -23,7 +23,7 @@ text is `references/builder-prompt.md`; stop criteria are in `references/consens
 Start a run:
 
 ```bash
-RUN=$(PYTHONPATH=scripts python -m crucible init-run --goal "<the user's goal>")   # add --config config.json to override defaults
+RUN=$(PYTHONPATH=scripts python3 -m crucible init-run --goal "<the user's goal>")   # add --config config.json to override defaults
 ```
 
 **Round caps & rebuttals.** `crucible verdict` reads the round cap from the run config by gate
@@ -38,48 +38,74 @@ resolutions are logged to the run for provenance.
 1. As **Builder**, use **superpowers:writing-plans** to draft the implementation plan (brainstorm
    first with **superpowers:brainstorming** if the goal is under-specified).
 2. Emit the **dependency tree** JSON (see `references/dependency-tree.md`) and load it:
-   `PYTHONPATH=scripts python -m crucible load-dag --run "$RUN" --file dag.json` (rejects cycles/unknown ids).
-3. Record your plan artifact: `PYTHONPATH=scripts python -m crucible log --run "$RUN" --event builder_output --gate plan --round N --file plan.md`.
+   `PYTHONPATH=scripts python3 -m crucible load-dag --run "$RUN" --file dag.json` (rejects cycles/unknown ids).
+3. Record your plan artifact: `PYTHONPATH=scripts python3 -m crucible log --run "$RUN" --event builder_output --gate plan --round N --file plan.md`.
 4. Dispatch the **Critic** as the superpowers **plan-document-reviewer** (from
    `superpowers:writing-plans`) over the plan + DAG — and additionally the **spec-document-reviewer**
    (from `superpowers:brainstorming`) if a design spec exists — run on the critic model. Map its
    findings into the verdict JSON (`critic-prompt.md`). Capture to `verdict.json`. (See
    `references/platform-notes.md`.)
-5. Decide: `PYTHONPATH=scripts python -m crucible verdict --run "$RUN" --gate plan --round N --file verdict.json`.
+5. Decide: `PYTHONPATH=scripts python3 -m crucible verdict --run "$RUN" --gate plan --round N --file verdict.json`.
    - `CONSENSUS` -> go to Stage 2.
    - `CHANGES` -> revise as Builder, increment N, repeat from step 3.
-   - `CAPPED` -> apply `on_cap` (default `halt`: stop and surface unresolved findings).
+   - `CAPPED` (`on_cap: halt`) -> stop and surface the unresolved findings; do not proceed.
+   - `PROCEED_WITH_FLAGS` (`on_cap: proceed_with_flags`) -> go to Stage 2; the unresolved
+     findings are recorded (`gate_proceeded_with_flags`) and shown in the report.
 
 ## Stage 2 — IMPLEMENT gates (one per dependency)
 
-Loop while there is a ready node:
+Loop while `crucible next` yields a ready node. `next` exits **0** with the node id (or an empty
+line when every node is `done`), and exits **non-zero** when no node can be scheduled but the run
+is not finished — **3** if the run is *stuck* (a node is `blocked`, or waits on an unfinished
+dependency) and **4** if work is still *in flight* (`in_progress`/`in_review`). It lists the
+offending nodes on stderr. Never treat a non-zero `next` as "done":
 
 ```bash
-NODE=$(PYTHONPATH=scripts python -m crucible next --run "$RUN")   # empty when done
+if ! NODE=$(PYTHONPATH=scripts python3 -m crucible next --run "$RUN"); then
+  # next printed the stuck/in-flight nodes to stderr — halt and surface to the human
+  # (this is the same posture as on_cap: halt); do not advance.
+  exit 1
+fi
+[ -z "$NODE" ] && break   # empty + exit 0 => every node is done
 ```
 
 For each `$NODE`:
 
-1. `PYTHONPATH=scripts python -m crucible set-status --run "$RUN" --node "$NODE" --status in_progress`.
+1. `PYTHONPATH=scripts python3 -m crucible set-status --run "$RUN" --node "$NODE" --status in_progress`.
 2. As **Builder**, implement the node with **superpowers:subagent-driven-development** (TDD).
 3. Log the diff/output: `... log --event builder_output --gate dep:$NODE --round N --file out.txt`.
 4. Dispatch the **Critic** as the **`superpowers:code-reviewer`** agent (on the critic model) with
    `critic-prompt.md` + this node's diff. Capture its findings as `verdict.json`. (See
    `references/platform-notes.md`.)
-5. `PYTHONPATH=scripts python -m crucible verdict --run "$RUN" --gate "dep:$NODE" --round N --file verdict.json`.
+5. `PYTHONPATH=scripts python3 -m crucible verdict --run "$RUN" --gate "dep:$NODE" --round N --file verdict.json`.
    - `CONSENSUS` -> `set-status --node "$NODE" --status done`; continue the loop.
    - `CHANGES` -> revise, increment N, repeat from step 3.
-   - `CAPPED` -> apply `on_cap`.
+   - `CAPPED` (`on_cap: halt`) -> stop and surface the unresolved findings; do not proceed.
+   - `PROCEED_WITH_FLAGS` (`on_cap: proceed_with_flags`) -> `set-status --node "$NODE" --status done`
+     and continue; the unresolved findings are carried as flags in the report.
 
-## Stage 3 — FINAL gate (if `final_review: true`)
+## Stage 3 — FINAL gate (when enabled)
 
-Dispatch the **Critic** as the **`superpowers:code-reviewer`** agent (on the critic model) once
-over the whole implementation; log the verdict at `--gate final`.
+Gate this stage on the config flag deterministically — do not eyeball it. Key off the printed
+token so a config-load error halts rather than being mistaken for "disabled":
+
+```bash
+case "$(PYTHONPATH=scripts python3 -m crucible should-final --run "$RUN")" in
+  yes) : ;;                                   # final_review enabled — run the FINAL gate below
+  no)  : ;;                                   # disabled — skip to Finish
+  *)   echo "crucible: cannot determine final-gate policy; halting" >&2; exit 1 ;;
+esac
+```
+
+When enabled, dispatch the **Critic** as the **`superpowers:code-reviewer`** agent (on the critic
+model) once over the whole implementation; loop at `--gate final` (round cap is `max_rounds_dep`)
+exactly like a dependency gate: `CONSENSUS` -> finish; `CHANGES` -> revise and repeat; `CAPPED` ->
+halt and surface; `PROCEED_WITH_FLAGS` -> finish with the unresolved findings flagged in the report.
 
 ## Finish
 
-1. `PYTHONPATH=scripts python -m crucible status --run "$RUN"` to confirm all nodes `done`.
-2. `PYTHONPATH=scripts python -m crucible report --run "$RUN"` (add `--html` for HTML) to render the run report.
+1. `PYTHONPATH=scripts python3 -m crucible status --run "$RUN"` to confirm all nodes `done`.
+2. `PYTHONPATH=scripts python3 -m crucible report --run "$RUN"` (add `--html` for HTML) to render the run report.
 3. Use **superpowers:finishing-a-development-branch** to complete the work.
 
 ## Red flags

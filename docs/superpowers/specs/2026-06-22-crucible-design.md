@@ -163,7 +163,8 @@ runs/2026-06-22-2150-add-rate-limiter/
 
 `runlog.jsonl` is **append-only**, one JSON event per line. Event types: `run_start`,
 `gate_start`, `builder_output`, `critic_verdict`, `builder_resolution`, `gate_consensus`,
-`gate_capped`, `node_status_change`, `run_complete`. Each `builder_output` and `critic_verdict`
+`gate_proceeded_with_flags`, `gate_capped`, `node_status_change`, `run_complete`. Each
+`builder_output` and `critic_verdict`
 event stores the agent's **full raw text** (not a condensed summary) — so the final report and
 any audit read directly from the log, never from hand-reconstructed text. (This directly honors
 the lesson that condensed-only logs force error-prone manual reconstruction.)
@@ -222,7 +223,7 @@ reasoning; everything else is auditable and testable.
 | `next --run <dir>` | Print the next ready node id (deps all `done`), or empty if none. |
 | `set-status --run <dir> --node <id> --status <s>` | Transition a node; append `node_status_change`. |
 | `log --run <dir> --event <type> --gate <g> --round <n> [--file payload]` | Append a raw event (e.g. `builder_output`). |
-| `verdict --run <dir> --gate <g> --round <n> --file verdict.json` | Validate + record a Critic verdict; print `CONSENSUS` / `CHANGES` / `CAPPED`. |
+| `verdict --run <dir> --gate <g> --round <n> --file verdict.json` | Validate + record a Critic verdict; print `CONSENSUS` / `CHANGES` / `CAPPED` / `PROCEED_WITH_FLAGS`. |
 | `status --run <dir>` | Print DAG progress + open findings summary. |
 | `report --run <dir> [--html] [--open]` | Render the deterministic report from `runlog.jsonl`. |
 
@@ -231,7 +232,7 @@ reasoning; everything else is auditable and testable.
 1. `/crucible "<goal>"` → skill: `init-run` creates the run dir + config snapshot + `run_start`.
 2. **PLAN gate:** Builder (brainstorming + writing-plans) emits plan + `dag.json`; `load-dag`
    validates/stores it. Critic subagent reviews → `verdict`. Loop (each round logged) until
-   `CONSENSUS` or `CAPPED`.
+   `CONSENSUS`, or until the cap yields `CAPPED` (halt) / `PROCEED_WITH_FLAGS` (proceed flagged).
 3. **Walk DAG:** `next` returns a ready node → Builder implements (subagent-driven-development) →
    Critic reviews the node diff → `verdict` loop → `set-status done`. Repeat until `next` is
    empty.

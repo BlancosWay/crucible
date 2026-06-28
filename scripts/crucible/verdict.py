@@ -22,6 +22,8 @@ class Finding:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Finding":
+        if not isinstance(data, dict):
+            raise ValueError("finding must be a JSON object")
         sev = data["severity"]
         if sev not in VALID_SEVERITIES:
             raise ValueError(f"invalid severity: {sev}")
@@ -44,10 +46,15 @@ class Verdict:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Verdict":
+        if not isinstance(data, dict):
+            raise ValueError("verdict must be a JSON object")
         verdict = data["verdict"]
         if verdict not in VALID_VERDICTS:
             raise ValueError(f"invalid verdict: {verdict}")
-        findings = [Finding.from_dict(f) for f in data.get("findings", [])]
+        findings_raw = data.get("findings", [])
+        if not isinstance(findings_raw, list):
+            raise ValueError('verdict "findings" must be a list')
+        findings = [Finding.from_dict(f) for f in findings_raw]
         ids = [f.id for f in findings]
         dupes = sorted({i for i in ids if ids.count(i) > 1})
         if dupes:
@@ -64,10 +71,32 @@ class Verdict:
         blocking = set(cfg.blocking_severities)
         return [f for f in self.findings if f.severity in blocking]
 
+    def consistency_error(self, cfg: Config) -> str | None:
+        """Reject a Critic verdict whose APPROVE/REQUEST_CHANGES label contradicts
+        its findings, relative to the run's ``blocking_severities`` (consensus-rubric.md):
+
+        - ``APPROVE`` requires **no** blocking finding present.
+        - ``REQUEST_CHANGES`` requires **at least one** blocking finding present.
+
+        Returns a human-readable error string when contradictory, else ``None``. This
+        is checked against the raw Critic verdict, before any Builder resolutions, so a
+        rebuttal flow (REQUEST_CHANGES + a real blocker later cleared by ``wontfix``)
+        stays valid.
+        """
+        blocking_ids = [f.id for f in self.open_blocking(cfg)]
+        sev = sorted(cfg.blocking_severities)
+        if self.verdict == "APPROVE" and blocking_ids:
+            return (f"inconsistent verdict: APPROVE but {blocking_ids} have a blocking "
+                    f"severity {sev}; APPROVE requires no open blocking findings")
+        if self.verdict == "REQUEST_CHANGES" and not blocking_ids:
+            return (f"inconsistent verdict: REQUEST_CHANGES but no finding has a blocking "
+                    f"severity {sev}; REQUEST_CHANGES requires at least one blocking finding")
+        return None
+
 
 @dataclass
 class Decision:
-    outcome: str  # "CONSENSUS" | "CHANGES" | "CAPPED"
+    outcome: str  # "CONSENSUS" | "CHANGES" | "CAPPED" | "PROCEED_WITH_FLAGS"
     open_findings: list[Finding]
 
 
@@ -103,5 +132,9 @@ def decide(
     if not open_blocking:
         return Decision(outcome="CONSENSUS", open_findings=[])
     if round_index >= max_rounds:
+        # At the cap with unresolved blockers, on_cap decides whether to halt (CAPPED) or
+        # advance past the gate carrying the unresolved findings as flags.
+        if cfg.on_cap == "proceed_with_flags":
+            return Decision(outcome="PROCEED_WITH_FLAGS", open_findings=open_blocking)
         return Decision(outcome="CAPPED", open_findings=open_blocking)
     return Decision(outcome="CHANGES", open_findings=open_blocking)
