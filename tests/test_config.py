@@ -38,6 +38,16 @@ def test_from_dict_rejects_non_dict():
             Config.from_dict(bad)
 
 
+def test_empty_model_or_effort_rejected():
+    # C6: an empty/blank model or effort string validates structurally but yields an unusable
+    # dispatch config; require a non-empty (non-whitespace) string.
+    for role in ("builder", "critic"):
+        with pytest.raises(ValueError, match=f"{role}.model"):
+            Config.from_dict({role: {"model": ""}})
+        with pytest.raises(ValueError, match=f"{role}.effort"):
+            Config.from_dict({role: {"effort": "  "}})
+
+
 def test_invalid_round_cap_raises():
     with pytest.raises(ValueError, match="max_rounds_plan"):
         Config.from_dict({"max_rounds_plan": 0})
@@ -121,9 +131,9 @@ def test_severity_list_elements_must_be_strings():
 
 
 def test_builder_critic_fields_must_be_strings():
-    with pytest.raises(ValueError, match="builder.model must be a string"):
+    with pytest.raises(ValueError, match="builder.model must be a non-empty string"):
         Config.from_dict({"builder": {"model": 1, "effort": "max"}})
-    with pytest.raises(ValueError, match="critic.effort must be a string"):
+    with pytest.raises(ValueError, match="critic.effort must be a non-empty string"):
         Config.from_dict({"critic": {"model": "x", "effort": []}})
 
 

@@ -21,7 +21,9 @@ The Builder emits the dependency tree as a single JSON object the `crucible` CLI
 ```
 
 - `id` — unique, kebab-case.
-- `status` is one of `pending | in_progress | in_review | done | blocked` (start `pending`).
+- `status` must be `pending` for every node in the emitted plan — `crucible load-dag` rejects a
+  freshly imported tree with any non-`pending` node. The other lifecycle states
+  (`in_progress | in_review | done | blocked`) are set only later, via `crucible set-status`.
 - `edges[].from` depends on `edges[].depends_on`; both must be existing node ids.
 - The graph must be **acyclic**. `crucible load-dag` rejects cycles and unknown ids.
 - Implementation walks the graph in **topological** order; `crucible next` returns the next node
