@@ -148,6 +148,13 @@ def cmd_verdict(args) -> int:
 
     # F2: optional Builder resolutions feed the deterministic decision.
     resolutions, resolutions_raw = _load_resolutions(args.resolutions)
+    # O1: a resolution must target a real finding; an unknown id (e.g. a typo) would be
+    # silently ignored, so reject it before logging or deciding.
+    finding_ids = {f.id for f in verdict.findings}
+    unknown = set(resolutions) - finding_ids
+    if unknown:
+        raise ValueError(f"resolutions reference unknown finding id(s): {sorted(unknown)}; "
+                         f"valid ids: {sorted(finding_ids)}")
     if resolutions_raw:
         run.append("builder_resolution", gate=args.gate, round=args.round, payload=resolutions_raw)
 
@@ -224,7 +231,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_set_status)
 
     s = sub.add_parser("log"); s.add_argument("--run", required=True); s.add_argument("--event", required=True)
-    s.add_argument("--gate", default=None); s.add_argument("--round", type=int, default=None); s.add_argument("--file")
+    s.add_argument("--gate", required=True); s.add_argument("--round", type=int, required=True); s.add_argument("--file")
     s.set_defaults(func=cmd_log)
 
     s = sub.add_parser("verdict"); s.add_argument("--run", required=True); s.add_argument("--gate", required=True)

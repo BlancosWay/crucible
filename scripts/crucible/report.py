@@ -40,6 +40,14 @@ def _fenced(text: str) -> list[str]:
     return [fence, *text.splitlines(), fence]
 
 
+def _provenance_block(label: str, payload: Any) -> list[str]:
+    """A labelled raw-text provenance block (Builder/Critic output): a fenced code block,
+    or an ``_(empty)_`` placeholder when there is nothing to show (avoids an empty fence)."""
+    text = _payload_text(payload)
+    body = _fenced(text) if text else ["_(empty)_"]
+    return [label, "", *body, ""]
+
+
 def _events_by_gate(events: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
     gates: dict[str, list[dict[str, Any]]] = {}
     for e in events:
@@ -90,15 +98,9 @@ def render_markdown(run: RunLog) -> str:
             ev = e.get("event")
             rnd = _san(e.get("round", "?"))
             if ev == "builder_output":
-                lines.append(f"**Builder output (round {rnd}):**")
-                lines.append("")
-                lines.extend(_fenced(_payload_text(e.get("payload"))))
-                lines.append("")
+                lines.extend(_provenance_block(f"**Builder output (round {rnd}):**", e.get("payload")))
             elif ev == "critic_output":
-                lines.append(f"**Critic output (round {rnd}):**")
-                lines.append("")
-                lines.extend(_fenced(_payload_text(e.get("payload"))))
-                lines.append("")
+                lines.extend(_provenance_block(f"**Critic output (round {rnd}):**", e.get("payload")))
             elif ev == "critic_verdict":
                 payload = e.get("payload", {})
                 lines.append(f"- **Round {rnd}:** {_san(payload.get('verdict', '?'))} - {_san(payload.get('summary', ''))}")

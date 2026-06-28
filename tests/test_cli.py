@@ -499,3 +499,54 @@ def test_report_html_cli_writes_file(tmp_path):
     assert r.returncode == 0, r.stderr
     assert "<!doctype html>" in r.stdout
     assert (Path(run_dir) / "report.html").exists()
+
+
+def test_verdict_rejects_resolution_for_unknown_finding_id(tmp_path):
+    # O1: a resolution id that is not a finding (e.g. a typo) must error, not be silently ignored.
+    run_dir = _init(tmp_path)
+    vfile = Path(tmp_path) / "v.json"
+    vfile.write_text(json.dumps({
+        "gate": "plan", "round": 1, "verdict": "REQUEST_CHANGES", "summary": "x",
+        "findings": [{"id": "F1", "severity": "major", "location": "x", "claim": "c", "suggestion": "s"}]}))
+    res = Path(tmp_path) / "res.json"
+    res.write_text(json.dumps({"F2": "wontfix"}))  # F2 is not a finding
+    r = _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1",
+              "--file", str(vfile), "--resolutions", str(res)])
+    assert r.returncode != 0
+    assert "crucible:" in r.stderr and "unknown finding id" in r.stderr and "F2" in r.stderr
+    # nothing was logged for this rejected verdict
+    kinds = [e["event"] for e in _events(run_dir)]
+    assert "builder_resolution" not in kinds and "critic_verdict" not in kinds
+
+
+def test_verdict_rejects_unknown_finding_id_dict_form(tmp_path):
+    run_dir = _init(tmp_path)
+    vfile = Path(tmp_path) / "v.json"
+    vfile.write_text(json.dumps({
+        "gate": "plan", "round": 1, "verdict": "REQUEST_CHANGES", "summary": "x",
+        "findings": [{"id": "F1", "severity": "major", "location": "x", "claim": "c", "suggestion": "s"}]}))
+    res = Path(tmp_path) / "res.json"
+    res.write_text(json.dumps({"F2": {"resolution": "wontfix", "rationale": "r"}}))
+    r = _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1",
+              "--file", str(vfile), "--resolutions", str(res)])
+    assert r.returncode != 0
+    assert "unknown finding id" in r.stderr
+
+
+def test_log_requires_gate(tmp_path):
+    # O2: a gateless log entry would be dropped from the report -> reject it at the CLI.
+    run_dir = _init(tmp_path)
+    f = Path(tmp_path) / "o.txt"
+    f.write_text("x")
+    r = _run(["log", "--run", run_dir, "--event", "builder_output", "--round", "1", "--file", str(f)])
+    assert r.returncode != 0
+    assert "gate" in r.stderr.lower()
+
+
+def test_log_requires_round(tmp_path):
+    run_dir = _init(tmp_path)
+    f = Path(tmp_path) / "o.txt"
+    f.write_text("x")
+    r = _run(["log", "--run", run_dir, "--event", "builder_output", "--gate", "plan", "--file", str(f)])
+    assert r.returncode != 0
+    assert "round" in r.stderr.lower()

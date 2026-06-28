@@ -29,4 +29,5 @@ model id, fall back to the most capable available model and note it in the run-l
 
 If no subagent mechanism is available, run the Critic prompt as a separate, clearly delimited
 pass in the same session (state "Acting as Critic now"), capture its JSON verdict, and feed it to
-`crucible verdict`. Record the full text via `crucible log --event critic_output`.
+`crucible verdict`. Record the full text via
+`crucible log --event critic_output --gate "$GATE" --round N` (both required).

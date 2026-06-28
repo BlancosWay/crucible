@@ -21,6 +21,15 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
   `on_cap: halt` is unchanged.
 
 ### Fixed
+- **Round-3 robustness fixes.**
+  - `crucible verdict --resolutions` now rejects a resolution that targets an unknown finding id
+    (e.g. a typo) with a clear error, instead of silently ignoring the intended rebuttal (O1).
+  - `crucible log` now requires `--gate` and `--round`; a gateless provenance entry was silently
+    dropped from the report (O2).
+  - The CHANGELOG CI guard now detects an added line even when it is textually identical to an
+    existing one (line multiplicity, not set membership) (O3).
+  - The report renders `_(empty)_` for an empty Builder/Critic output instead of an empty code
+    fence (O4).
 - **Report renders `critic_output` (N4).** The no-subagent-fallback Critic's full raw review
   (logged as `critic_output`) is now rendered in the report (in an injection-safe fenced block),
   matching `builder_output`; previously it was logged but silently omitted.
