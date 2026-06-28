@@ -91,6 +91,39 @@ def test_non_dict_builder_raises():
         Config.from_dict({"builder": "oops"})
 
 
+# --- scalar/field type validation (N3) ---------------------------------------
+
+def test_max_rounds_non_int_raises():
+    for bad in ([], {}, "5", 1.5, True):
+        with pytest.raises(ValueError, match="max_rounds_plan must be an integer"):
+            Config.from_dict({"max_rounds_plan": bad})
+
+
+def test_severities_must_be_a_list():
+    with pytest.raises(ValueError, match="defer_severities must be a list"):
+        Config.from_dict({"defer_severities": "major"})  # would otherwise char-explode
+    with pytest.raises(ValueError, match="blocking_severities must be a list"):
+        Config.from_dict({"blocking_severities": 5})
+
+
+def test_severity_list_elements_must_be_strings():
+    for bad in ([[]], ["bad", 1], [None]):
+        with pytest.raises(ValueError, match="must be a list of severity strings"):
+            Config.from_dict({"defer_severities": bad})
+
+
+def test_builder_critic_fields_must_be_strings():
+    with pytest.raises(ValueError, match="builder.model must be a string"):
+        Config.from_dict({"builder": {"model": 1, "effort": "max"}})
+    with pytest.raises(ValueError, match="critic.effort must be a string"):
+        Config.from_dict({"critic": {"model": "x", "effort": []}})
+
+
+def test_valid_scalars_still_parse():
+    cfg = Config.from_dict({"max_rounds_plan": 3, "defer_severities": ["minor"]})
+    assert cfg.max_rounds_plan == 3 and cfg.defer_severities == ["minor"]
+
+
 def test_overlapping_defer_and_blocking_severities_raises():
     with pytest.raises(ValueError, match="disjoint"):
         Config.from_dict({"defer_severities": ["major", "minor", "nit"],

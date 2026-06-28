@@ -14,15 +14,18 @@ from crucible.report import render_html, render_markdown
 from crucible.runlog import RunLog, RunLogCorruptError, init_run
 from crucible.verdict import VALID_RESOLUTIONS, Verdict, decide
 
+# Events that `crucible log` may append. All other events are emitted by their own
+# commands (verdict, set-status, load-dag, init-run); allowing `log` to write them would
+# let a caller forge decisions/verdicts the report renders as authoritative.
+LOG_EVENTS = ("builder_output", "critic_output")
+
 
 def _read_payload(path):
+    # Store the file's raw text verbatim (full-fidelity provenance) — do NOT parse JSON,
+    # which would drop exact whitespace/key order when the report re-serializes it.
     if not path:
         return None
-    text = Path(path).read_text(encoding="utf-8")
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        return text
+    return Path(path).read_text(encoding="utf-8")
 
 
 def _load_resolutions(path):
@@ -108,6 +111,9 @@ def cmd_set_status(args) -> int:
 
 
 def cmd_log(args) -> int:
+    if args.event not in LOG_EVENTS:
+        raise ValueError(f"log --event must be one of {LOG_EVENTS}; other events are written "
+                         f"by their own commands (verdict, set-status, load-dag)")
     run = RunLog(args.run)
     run.append(args.event, gate=args.gate, round=args.round, payload=_read_payload(args.file))
     print("logged")
@@ -117,6 +123,8 @@ def cmd_log(args) -> int:
 def cmd_verdict(args) -> int:
     if args.round < 1:
         raise SystemExit("--round must be >= 1 (rounds are 1-based)")
+    if args.max_rounds is not None and args.max_rounds < 1:
+        raise SystemExit("--max-rounds must be >= 1")
     run = RunLog(args.run)
     cfg = load_config(run.path / "config.json")
     raw_text = Path(args.file).read_text(encoding="utf-8")

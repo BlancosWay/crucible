@@ -31,6 +31,14 @@ def _require_bool(name: str, value: Any) -> bool:
     return value
 
 
+def _require_int(name: str, value: Any) -> int:
+    # int(...) would crash on a list/dict (raw TypeError) and silently coerce bools/floats/
+    # numeric strings; require a real integer.
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be an integer, got {value!r}")
+    return value
+
+
 @dataclass
 class Config:
     builder: dict[str, str]
@@ -59,11 +67,19 @@ class Config:
                 raise ValueError(f"{role} must be an object")
             else:
                 merged[role] = {**DEFAULTS[role], **override}
+        for role in ("builder", "critic"):
+            for field in ("model", "effort"):
+                if not isinstance(merged[role].get(field), str):
+                    raise ValueError(f"{role}.{field} must be a string")
+        for name in ("defer_severities", "blocking_severities"):
+            val = merged[name]
+            if not isinstance(val, list) or not all(isinstance(s, str) for s in val):
+                raise ValueError(f"{name} must be a list of severity strings")
         cfg = cls(
             builder=dict(merged["builder"]),
             critic=dict(merged["critic"]),
-            max_rounds_plan=int(merged["max_rounds_plan"]),
-            max_rounds_dep=int(merged["max_rounds_dep"]),
+            max_rounds_plan=_require_int("max_rounds_plan", merged["max_rounds_plan"]),
+            max_rounds_dep=_require_int("max_rounds_dep", merged["max_rounds_dep"]),
             on_cap=str(merged["on_cap"]),
             defer_severities=list(merged["defer_severities"]),
             blocking_severities=list(merged["blocking_severities"]),
