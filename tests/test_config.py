@@ -148,6 +148,20 @@ def test_overlapping_defer_and_blocking_severities_raises():
                           "blocking_severities": ["blocker", "major"]})
 
 
+def test_empty_blocking_severities_rejected():
+    # An empty blocking set makes every REQUEST_CHANGES fail verdict.consistency_error
+    # (no finding can be blocking), so a gate could never legitimately request changes.
+    with pytest.raises(ValueError, match="blocking_severities must be non-empty"):
+        Config.from_dict({"blocking_severities": []})
+
+
+def test_empty_defer_severities_allowed():
+    # Empty defer is legitimate (nothing is deferrable); only blocking must be non-empty.
+    cfg = Config.from_dict({"defer_severities": []})
+    assert cfg.defer_severities == []
+    assert cfg.blocking_severities == ["blocker", "major"]
+
+
 def test_example_config_file_is_valid():
     import pathlib
     root = pathlib.Path(__file__).resolve().parents[1]

@@ -81,9 +81,9 @@ class DAG:
             if not isinstance(edge, dict):
                 raise ValueError(f"edge at index {i} must be a JSON object")
             frm, dep = edge["from"], edge["depends_on"]
-            for field, val in (("from", frm), ("depends_on", dep)):
+            for key, val in (("from", frm), ("depends_on", dep)):
                 if not isinstance(val, str) or not val:
-                    raise ValueError(f'edge at index {i} "{field}" must be a non-empty string')
+                    raise ValueError(f'edge at index {i} "{key}" must be a non-empty string')
             if frm not in nodes:
                 raise ValueError(f"edge 'from' references unknown node: {frm}")
             if dep not in nodes:

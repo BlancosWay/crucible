@@ -21,6 +21,10 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
   `on_cap: halt` is unchanged.
 
 ### Fixed
+- **Reject empty `blocking_severities` (CFG-002).** A config with `blocking_severities: []` made
+  every `REQUEST_CHANGES` verdict fail consistency (no finding can ever block), so a gate could
+  never legitimately request changes; `Config._validate` now requires at least one blocking
+  severity. Empty `defer_severities` stays allowed (nothing is deferrable).
 - **Markdown report neutralizes raw HTML in untrusted fields (RPT-001).** `_san` now escapes
   `&`/`<`/`>` (in addition to `|` and backticks), so untrusted model output (the goal and the
   Critic's verdict/summary/finding fields) can no longer render as live HTML — e.g. a finding
