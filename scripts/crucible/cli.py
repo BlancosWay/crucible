@@ -11,7 +11,7 @@ from pathlib import Path
 from crucible.config import Config, load_config
 from crucible.dag import DAG
 from crucible.report import render_html, render_markdown
-from crucible.runlog import RunLog, init_run
+from crucible.runlog import RunLog, RunLogCorruptError, init_run
 from crucible.verdict import VALID_RESOLUTIONS, Verdict, decide
 
 
@@ -30,6 +30,8 @@ def _load_resolutions(path):
     if not path:
         return {}, {}
     data = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("resolutions file must be a JSON object mapping finding ids to resolutions")
     norm: dict[str, str] = {}
     raw: dict[str, dict] = {}
     for fid, val in data.items():
@@ -60,6 +62,9 @@ def cmd_load_dag(args) -> int:
     run = RunLog(args.run)
     data = json.loads(Path(args.file).read_text(encoding="utf-8"))
     dag = DAG.from_dict(data)
+    if not dag.nodes:
+        raise SystemExit("load-dag: dependency tree is empty (0 nodes); a plan must decompose "
+                         "into at least one node")
     run.save_dag(dag.to_dict())
     run.append("dag_loaded", gate="plan", nodes=len(dag.nodes))
     print(f"loaded {len(dag.nodes)} nodes")
@@ -69,9 +74,27 @@ def cmd_load_dag(args) -> int:
 def cmd_next(args) -> int:
     run = RunLog(args.run)
     dag = DAG.from_dict(run.load_dag())
-    ready = dag.ready_nodes()
-    print(ready[0] if ready else "")
-    return 0
+    state, node = dag.next_state()
+    if state == "ready":
+        print(node)
+        return 0
+    if state == "complete":
+        print("")
+        return 0
+    # No node can be scheduled and the run is not done: surface every unfinished node
+    # (with its status and unmet deps) to STDERR and exit non-zero so the orchestrator
+    # halts instead of mistaking "stuck" for "done". stdout stays empty.
+    detail = "; ".join(
+        f"{d['id']}[{d['status']}]" + (f" waiting on {d['waiting_on']}" if d["waiting_on"] else "")
+        for d in dag.unfinished_detail()
+    )
+    if state == "in_flight":
+        print(f"crucible next: no ready node; work is in flight — finish or reset it before "
+              f"scheduling more. Unfinished: {detail}", file=sys.stderr)
+        return 4
+    print(f"crucible next: run is STUCK — no node can proceed and none is in flight. "
+          f"Unfinished: {detail}", file=sys.stderr)
+    return 3
 
 
 def cmd_set_status(args) -> int:
@@ -92,6 +115,8 @@ def cmd_log(args) -> int:
 
 
 def cmd_verdict(args) -> int:
+    if args.round < 1:
+        raise SystemExit("--round must be >= 1 (rounds are 1-based)")
     run = RunLog(args.run)
     cfg = load_config(run.path / "config.json")
     raw_text = Path(args.file).read_text(encoding="utf-8")
@@ -103,6 +128,12 @@ def cmd_verdict(args) -> int:
         raise SystemExit(f"verdict gate {verdict.gate!r} does not match --gate {args.gate!r}")
     if verdict.round != args.round:
         raise SystemExit(f"verdict round {verdict.round} does not match --round {args.round}")
+
+    # H1: reject a Critic verdict whose APPROVE/REQUEST_CHANGES label contradicts its
+    # findings under the run's blocking_severities, before logging or deciding.
+    inconsistency = verdict.consistency_error(cfg)
+    if inconsistency:
+        raise SystemExit(inconsistency)
 
     # F1: round cap comes from config (by gate) unless explicitly overridden.
     max_rounds = args.max_rounds if args.max_rounds is not None else _max_rounds_for_gate(cfg, args.gate)
@@ -118,9 +149,14 @@ def cmd_verdict(args) -> int:
     run.append("critic_verdict", gate=args.gate, round=args.round, payload=data, raw=raw_text)
     if decision.outcome == "CONSENSUS":
         run.append("gate_consensus", gate=args.gate, round=args.round)
+    elif decision.outcome == "PROCEED_WITH_FLAGS":
+        run.append("gate_proceeded_with_flags", gate=args.gate, round=args.round,
+                   open_findings=[f.id for f in decision.open_findings])
     elif decision.outcome == "CAPPED":
         run.append("gate_capped", gate=args.gate, round=args.round,
                    open_findings=[f.id for f in decision.open_findings])
+    elif decision.outcome != "CHANGES":  # CHANGES intentionally logs no terminal event
+        raise SystemExit(f"unexpected decision outcome: {decision.outcome!r}")
     print(decision.outcome)
     return 0
 
@@ -130,6 +166,17 @@ def cmd_status(args) -> int:
     dag = DAG.from_dict(run.load_dag())
     print(json.dumps(dag.progress()))
     return 0
+
+
+def cmd_should_final(args) -> int:
+    """Deterministically answer whether the FINAL gate should run for this run.
+
+    Prints ``yes``/``no`` and exits 0/1 so the orchestrator gates Stage 3 on the config
+    flag instead of eyeballing it.
+    """
+    cfg = load_config(RunLog(args.run).path / "config.json")
+    print("yes" if cfg.final_review else "no")
+    return 0 if cfg.final_review else 1
 
 
 def cmd_report(args) -> int:
@@ -183,6 +230,9 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("status"); s.add_argument("--run", required=True)
     s.set_defaults(func=cmd_status)
 
+    s = sub.add_parser("should-final"); s.add_argument("--run", required=True)
+    s.set_defaults(func=cmd_should_final)
+
     s = sub.add_parser("report"); s.add_argument("--run", required=True); s.add_argument("--html", action="store_true")
     s.add_argument("--open", action="store_true")
     s.set_defaults(func=cmd_report)
@@ -193,7 +243,20 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    return args.func(args)
+    # Surface expected input/IO failures as a clean message instead of a raw traceback.
+    # SystemExit (the explicit gate/round/consistency/empty-DAG exits) is a BaseException and
+    # passes straight through. TypeError/AttributeError are NOT caught — they indicate a bug
+    # (or a malformed input shape that the per-command validators should reject explicitly).
+    try:
+        return args.func(args)
+    except json.JSONDecodeError as e:
+        msg = f"invalid JSON: {e}"
+    except KeyError as e:
+        msg = f"missing required field: {e}"
+    except (ValueError, RunLogCorruptError, OSError) as e:
+        msg = str(e)
+    print(f"crucible: {msg}", file=sys.stderr)
+    return 1
 
 
 if __name__ == "__main__":

@@ -7,6 +7,76 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
 
 ## [Unreleased]
 
+### Added
+- **`should-final` command (M6).** `crucible should-final --run <dir>` deterministically reports
+  whether the FINAL gate should run (prints `yes`/`no`, exits 0/1) from the `final_review` config
+  flag, so the orchestrator gates Stage 3 on it instead of eyeballing the flag (it was previously
+  parsed and documented but consumed by no code path).
+- **`on_cap: proceed_with_flags` is now functional (H2).** Reaching a gate's round cap with
+  unresolved blocking findings under `on_cap: proceed_with_flags` now yields a distinct
+  `PROCEED_WITH_FLAGS` outcome (instead of silently behaving like `halt`/`CAPPED`): `crucible
+  verdict` prints it, records a `gate_proceeded_with_flags` event with the carried finding ids,
+  and the report renders a "PROCEEDED WITH FLAGS … N unresolved finding(s) carried" line. The
+  report now also resolves a gate's outcome from the latest terminal event in log order. Default
+  `on_cap: halt` is unchanged.
+
+### Fixed
+- **Smaller robustness & portability fixes.**
+  - `defer_severities` and `blocking_severities` must now be **disjoint** — a severity in both
+    previously let a `deferred` resolution clear a blocking finding (L1).
+  - `crucible verdict --round` now requires `>= 1` (rounds are 1-based) instead of silently
+    accepting 0/negative (L4).
+  - The run-directory slug no longer keeps a trailing hyphen after truncation (L3).
+  - Workflow examples in the README and skill now use `python3` (matching CI/CONTRIBUTING), and
+    `scripts/check.py` also finds a Windows (`.venv/Scripts/python.exe`) interpreter (L2).
+- **Input type validation (M7).** The DAG, verdict, and resolutions parsers now reject
+  wrong-typed JSON with a clear error instead of silently corrupting data or raising a cryptic
+  `AttributeError`/`TypeError`. In particular a node `files` given as a string (previously
+  char-exploded into `['s','r','c',…]`) now requires a list of strings; a non-object dependency
+  tree / verdict / resolutions file, a non-list `nodes`/`edges`/`findings`, and a non-object
+  node/edge/finding are all rejected (surfaced cleanly via the M5 handler).
+- **Clean CLI errors (M5).** The CLI now reports malformed JSON, a missing required field, an
+  invalid value, a dependency cycle, an unknown `set-status` node, a missing file, and a corrupt
+  run-log as a concise `crucible: …` message on stderr with exit code 1, instead of a raw Python
+  traceback. `dag.set_status` now raises a descriptive `ValueError("unknown node: …")`. The
+  existing explicit exits (gate/round mismatch, verdict consistency, empty DAG, invalid
+  resolution) are unchanged.
+- **Deep-merge nested config (M4).** A partial `builder`/`critic` override (e.g. only `model`)
+  now keeps the default sibling keys (e.g. `effort`) instead of replacing the whole nested dict
+  and silently dropping them. A non-object `builder`/`critic` now raises a clear `ValueError`.
+- **Strict boolean config (M3).** `strict_rebuttal` and `final_review` now require a real JSON
+  boolean. Previously they were coerced with `bool(...)`, so a quoted `"false"` silently became
+  `True` (inverting intent); an invalid value now raises a clear `ValueError`.
+- **Report provenance (M2).** The run report now renders the full Builder output, the
+  Critic's raw verdict text, and the Builder's per-finding resolutions (rebuttals) — not just
+  the structured Critic findings. Builder output and raw verdicts are emitted in
+  injection-safe fenced code blocks (the fence is always longer than any backtick run in the
+  content; the HTML path still escapes `&<>`), honoring the design's "report and audit read
+  the full raw text directly from the log" and consensus-rubric's "rebuttals are shown in the
+  report."
+- **Resilient run-log reads (M1).** `RunLog.read_events()` no longer lets a single bad line
+  brick `crucible report` for an otherwise-complete run. A torn/partial final record (the
+  realistic crash artifact — `append` writes one record per `write`) is now skipped with a
+  stderr warning, while interior corruption, a complete-but-invalid record, or a non-object /
+  missing-`event` line raises a clear, line-numbered `RunLogCorruptError` instead of a raw
+  `JSONDecodeError`. Reads are byte-based so a torn multi-byte UTF-8 tail no longer crashes.
+- **UTF-8 read/write symmetry (H4).** `save_dag` (`dag.json`), the run config snapshot
+  (`config.json`), and `load_config` now read/write text as explicit UTF-8 (the writes also
+  use `ensure_ascii=False`). Previously these used the platform default encoding, so under a
+  non-UTF-8 locale (`LC_ALL=C`, or a typical Windows code page) a non-ASCII DAG node title or
+  config value raised `UnicodeEncodeError`/`UnicodeDecodeError` while every read forced UTF-8.
+- **Verdict/severity consistency (H1).** `crucible verdict` now rejects an internally
+  contradictory Critic verdict — `APPROVE` with an open blocking finding, or
+  `REQUEST_CHANGES` with no blocking finding — checked against the run's configured
+  `blocking_severities` before anything is logged or decided. The severity-authoritative
+  consensus decision (and the Builder rebuttal flow) is unchanged.
+- **`next` distinguishes "done" from "stuck" (H3).** `crucible next` used to print an empty
+  line and exit `0` both when every node was `done` and when the run was stuck (a `blocked`
+  node, or a node waiting on an unfinished dependency), so the IMPLEMENT loop could terminate
+  silently with work undone. It now exits `0` only on a ready node or genuine completion, and
+  exits non-zero with a stderr report otherwise — `3` (stuck) or `4` (work in flight). `load-dag`
+  now also rejects an empty (0-node) dependency tree. SKILL.md Stage 2 checks the exit code.
+
 ## [0.1.0] - 2026-06-22
 
 Initial release: a two-model adversarial planning + implementation workflow on top of

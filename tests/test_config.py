@@ -50,6 +50,53 @@ def test_to_dict_round_trips():
     assert again.final_review is False
 
 
+def test_string_boolean_strict_rebuttal_raises():
+    with pytest.raises(ValueError, match="strict_rebuttal must be a boolean"):
+        Config.from_dict({"strict_rebuttal": "false"})
+
+
+def test_string_boolean_final_review_raises():
+    with pytest.raises(ValueError, match="final_review must be a boolean"):
+        Config.from_dict({"final_review": "false"})
+
+
+def test_numeric_boolean_raises():
+    with pytest.raises(ValueError, match="strict_rebuttal must be a boolean"):
+        Config.from_dict({"strict_rebuttal": 1})
+
+
+def test_real_booleans_are_accepted():
+    cfg = Config.from_dict({"strict_rebuttal": True, "final_review": False})
+    assert cfg.strict_rebuttal is True
+    assert cfg.final_review is False
+
+
+def test_partial_builder_override_keeps_default_effort():
+    cfg = Config.from_dict({"builder": {"model": "claude-x"}})
+    assert cfg.builder == {"model": "claude-x", "effort": "max"}
+
+
+def test_partial_critic_override_keeps_default_effort():
+    cfg = Config.from_dict({"critic": {"model": "gpt-x"}})
+    assert cfg.critic == {"model": "gpt-x", "effort": "xhigh"}
+
+
+def test_critic_effort_only_override_keeps_default_model():
+    cfg = Config.from_dict({"critic": {"effort": "high"}})
+    assert cfg.critic == {"model": "gpt-5.5", "effort": "high"}
+
+
+def test_non_dict_builder_raises():
+    with pytest.raises(ValueError, match="builder must be an object"):
+        Config.from_dict({"builder": "oops"})
+
+
+def test_overlapping_defer_and_blocking_severities_raises():
+    with pytest.raises(ValueError, match="disjoint"):
+        Config.from_dict({"defer_severities": ["major", "minor", "nit"],
+                          "blocking_severities": ["blocker", "major"]})
+
+
 def test_example_config_file_is_valid():
     import pathlib
     root = pathlib.Path(__file__).resolve().parents[1]

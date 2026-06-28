@@ -34,7 +34,11 @@ CHECKS: List[Tuple[str, List[str]]] = [
 
 def _pytest_python() -> Optional[str]:
     """Return a python interpreter that can import pytest, preferring a repo .venv."""
-    candidates = [ROOT / ".venv" / "bin" / "python", Path(sys.executable)]
+    candidates = [
+        ROOT / ".venv" / "bin" / "python",          # POSIX venv
+        ROOT / ".venv" / "Scripts" / "python.exe",  # Windows venv
+        Path(sys.executable),
+    ]
     for c in candidates:
         if Path(c).exists():
             probe = subprocess.run([str(c), "-c", "import pytest"], capture_output=True)

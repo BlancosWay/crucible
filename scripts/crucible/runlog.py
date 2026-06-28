@@ -4,11 +4,18 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from crucible.config import Config
+
+
+class RunLogCorruptError(Exception):
+    """Raised when runlog.jsonl contains a corrupt record that is not just a torn final
+    write (e.g. an interior malformed line, a complete but invalid record, or a non-object
+    line) — real corruption the human must see, never silently dropped."""
 
 
 def slugify(text: str) -> str:
@@ -33,15 +40,41 @@ class RunLog:
     def read_events(self) -> list[dict[str, Any]]:
         if not self._events_file.exists():
             return []
-        out = []
-        for line in self._events_file.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if line:
-                out.append(json.loads(line))
+        data = self._events_file.read_bytes()
+        if not data:
+            return []
+        ends_clean = data.endswith(b"\n")
+        lines = data.splitlines()
+        last = len(lines) - 1
+        out: list[dict[str, Any]] = []
+        for i, raw in enumerate(lines):
+            if not raw.strip():
+                continue
+            torn_eligible = False
+            try:
+                event = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as e:
+                # Garbled/incomplete bytes plausibly indicate an interrupted (torn) write.
+                torn_eligible = True
+                problem = f"invalid JSON ({e})"
+            else:
+                if isinstance(event, dict) and "event" in event:
+                    out.append(event)
+                    continue
+                # Parsed as complete JSON but the wrong shape: the write finished, so this is
+                # real corruption, not a torn tail — surface it regardless of newline.
+                problem = 'record is not a JSON object with an "event" field'
+            # Tolerate ONLY an unparseable final record with no trailing newline (a torn append).
+            if torn_eligible and i == last and not ends_clean:
+                print(f"crucible: ignoring a partial trailing record in {self._events_file} "
+                      f"(interrupted write)", file=sys.stderr)
+                break
+            raise RunLogCorruptError(f"{self._events_file}: line {i + 1} is corrupt — {problem}")
         return out
 
     def save_dag(self, dag_data: dict[str, Any]) -> None:
-        (self.path / "dag.json").write_text(json.dumps(dag_data, indent=2, ensure_ascii=False))
+        (self.path / "dag.json").write_text(
+            json.dumps(dag_data, indent=2, ensure_ascii=False), encoding="utf-8")
 
     def load_dag(self) -> dict[str, Any]:
         return json.loads((self.path / "dag.json").read_text(encoding="utf-8"))
@@ -49,7 +82,7 @@ class RunLog:
 
 def init_run(goal: str, cfg: Config, base_dir: str | Path = "runs") -> RunLog:
     base = Path(base_dir)
-    slug = slugify(goal)[:40] or "run"
+    slug = slugify(goal)[:40].strip("-") or "run"
     run_dir = None
     for attempt in range(1000):
         stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d-%H%M%S-%f")
@@ -63,7 +96,8 @@ def init_run(goal: str, cfg: Config, base_dir: str | Path = "runs") -> RunLog:
             continue
     if run_dir is None:  # pragma: no cover - 1000 same-microsecond collisions is implausible
         raise RuntimeError("could not allocate a unique run directory")
-    (run_dir / "config.json").write_text(json.dumps(cfg.to_dict(), indent=2))
+    (run_dir / "config.json").write_text(
+        json.dumps(cfg.to_dict(), indent=2, ensure_ascii=False), encoding="utf-8")
     run = RunLog(run_dir)
     run.append("run_start", goal=goal, config=cfg.to_dict())
     return run

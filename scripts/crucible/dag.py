@@ -40,26 +40,41 @@ class DAG:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "DAG":
+        if not isinstance(data, dict):
+            raise ValueError("dependency tree must be a JSON object")
         nodes: dict[str, Node] = {}
         order: list[str] = []
-        for raw in data.get("nodes", []):
+        nodes_raw = data.get("nodes", [])
+        if not isinstance(nodes_raw, list):
+            raise ValueError('dependency tree "nodes" must be a list')
+        for i, raw in enumerate(nodes_raw):
+            if not isinstance(raw, dict):
+                raise ValueError(f"node at index {i} must be a JSON object")
             nid = raw["id"]
             if nid in nodes:
                 raise ValueError(f"duplicate node id: {nid}")
             status = raw.get("status", "pending")
             if status not in VALID_STATUSES:
                 raise ValueError(f"invalid status {status!r} for node {nid}")
+            files = raw.get("files", [])
+            if not isinstance(files, list) or not all(isinstance(p, str) for p in files):
+                raise ValueError(f'node {nid!r} "files" must be a list of strings')
             nodes[nid] = Node(
                 id=nid,
                 title=raw.get("title", nid),
                 description=raw.get("description", ""),
-                files=list(raw.get("files", [])),
+                files=list(files),
                 test_plan=raw.get("test_plan", ""),
                 status=status,
             )
             order.append(nid)
         deps: dict[str, set[str]] = {nid: set() for nid in nodes}
-        for edge in data.get("edges", []):
+        edges_raw = data.get("edges", [])
+        if not isinstance(edges_raw, list):
+            raise ValueError('dependency tree "edges" must be a list')
+        for i, edge in enumerate(edges_raw):
+            if not isinstance(edge, dict):
+                raise ValueError(f"edge at index {i} must be a JSON object")
             frm, dep = edge["from"], edge["depends_on"]
             if frm not in nodes:
                 raise ValueError(f"edge 'from' references unknown node: {frm}")
@@ -98,9 +113,49 @@ class DAG:
                 out.append(nid)
         return out
 
+    def is_complete(self) -> bool:
+        """True when every node is ``done`` (vacuously true for an empty graph)."""
+        return all(n.status == "done" for n in self.nodes.values())
+
+    def in_flight(self) -> list[str]:
+        """Ids of nodes whose work is active (``in_progress``/``in_review``), in order."""
+        return [nid for nid in self.order if self.nodes[nid].status in ("in_progress", "in_review")]
+
+    def unfinished(self) -> list[str]:
+        """Ids of nodes that are not ``done``, in order."""
+        return [nid for nid in self.order if self.nodes[nid].status != "done"]
+
+    def unfinished_detail(self) -> list[dict[str, Any]]:
+        """Per unfinished node: its id, status, and the unmet (non-``done``) deps."""
+        detail = []
+        for nid in self.unfinished():
+            waiting = sorted(d for d in self.deps[nid] if self.nodes[d].status != "done")
+            detail.append({"id": nid, "status": self.nodes[nid].status, "waiting_on": waiting})
+        return detail
+
+    def next_state(self) -> tuple[str, str | None]:
+        """Classify the scheduling state for ``crucible next``:
+
+        - ``("ready", node_id)`` — a node is ready to implement.
+        - ``("complete", None)`` — every node is ``done``.
+        - ``("in_flight", None)`` — nothing ready, work is active and nothing is blocked.
+        - ``("stuck", None)`` — nothing ready and either a node is ``blocked`` or no active
+          work remains (a deadlock the human must resolve). ``blocked`` takes priority over
+          in-flight work so a blocker is never masked.
+        """
+        ready = self.ready_nodes()
+        if ready:
+            return ("ready", ready[0])
+        if self.is_complete():
+            return ("complete", None)
+        blocked = any(n.status == "blocked" for n in self.nodes.values())
+        if self.in_flight() and not blocked:
+            return ("in_flight", None)
+        return ("stuck", None)
+
     def set_status(self, node_id: str, status: str) -> None:
         if node_id not in self.nodes:
-            raise KeyError(node_id)
+            raise ValueError(f"unknown node: {node_id}")
         if status not in VALID_STATUSES:
             raise ValueError(f"invalid status: {status}")
         self.nodes[node_id].status = status
