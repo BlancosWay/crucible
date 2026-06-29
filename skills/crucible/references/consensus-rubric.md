@@ -30,5 +30,5 @@ When the Builder rebuts a finding with `wontfix` + rationale:
 
 The deterministic decision (`CONSENSUS` / `CHANGES` / `CAPPED` / `PROCEED_WITH_FLAGS`) is computed
 by `crucible verdict` — the skill never eyeballs it. Pass the Builder's per-finding resolutions via
-`crucible verdict --resolutions res.json` (`{"F1": "wontfix"}`); `decide()` then applies
+`crucible verdict --resolutions "$RUN"/res.json` (`{"F1": "wontfix"}`); `decide()` then applies
 `defer_severities` and `strict_rebuttal` and records a `builder_resolution` event.

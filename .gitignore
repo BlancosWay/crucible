@@ -7,3 +7,11 @@ __pycache__/
 runs/
 .coverage
 htmlcov/
+
+# Crucible scratch artifacts (root-level only) — should live under runs/, never committed
+/dag.json
+/plan.md
+/verdict*.json
+/res.json
+/out.txt
+/critic-output.txt

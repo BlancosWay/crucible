@@ -57,11 +57,14 @@ The skill drives the loop and calls the deterministic CLI for every decision:
 
 ```bash
 RUN=$(PYTHONPATH=scripts python3 -m crucible init-run --goal "add a rate limiter")
-PYTHONPATH=scripts python3 -m crucible load-dag --run "$RUN" --file dag.json
+PYTHONPATH=scripts python3 -m crucible load-dag --run "$RUN" --file "$RUN"/dag.json
 PYTHONPATH=scripts python3 -m crucible next --run "$RUN"
-PYTHONPATH=scripts python3 -m crucible verdict --run "$RUN" --gate plan --round 1 --file verdict.json
+PYTHONPATH=scripts python3 -m crucible verdict --run "$RUN" --gate plan --round 1 --file "$RUN"/verdict.json
 PYTHONPATH=scripts python3 -m crucible report --run "$RUN" --html
 ```
+
+Scratch files (`dag.json`, `plan.md`, `verdict.json`, …) live under `"$RUN"/` (inside the
+git-ignored `runs/`), so they are never committed — in-repo or as an installed plugin.
 
 ## Development
 
