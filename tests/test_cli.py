@@ -23,6 +23,26 @@ def test_init_run_prints_run_dir(tmp_path):
     assert (run_dir / "config.json").exists()
 
 
+def test_init_run_default_base_is_crucible_home(tmp_path):
+    # No --base-dir: runs land under ~/.crucible/runs, never the target repo.
+    env = {**os.environ, "PYTHONPATH": str(ROOT / "scripts"), "HOME": str(tmp_path)}
+    env.pop("CRUCIBLE_RUNS_DIR", None)
+    r = subprocess.run([sys.executable, "-m", "crucible", "init-run", "--goal", "g"],
+                       capture_output=True, text=True, env=env, cwd=ROOT)
+    assert r.returncode == 0, r.stderr
+    run_dir = Path(r.stdout.strip())
+    assert run_dir.exists()
+    assert str(run_dir).startswith(str(tmp_path / ".crucible" / "runs"))
+
+
+def test_init_run_env_override_base(tmp_path):
+    env = {**os.environ, "PYTHONPATH": str(ROOT / "scripts"), "CRUCIBLE_RUNS_DIR": str(tmp_path / "elsewhere")}
+    r = subprocess.run([sys.executable, "-m", "crucible", "init-run", "--goal", "g"],
+                       capture_output=True, text=True, env=env, cwd=ROOT)
+    assert r.returncode == 0, r.stderr
+    assert str(Path(r.stdout.strip())).startswith(str(tmp_path / "elsewhere"))
+
+
 def test_full_dry_run_flow(tmp_path):
     r = _run(["init-run", "--goal", "Add caching", "--base-dir", str(tmp_path)])
     run_dir = r.stdout.strip()
@@ -557,6 +577,35 @@ def test_clean_missing_dir_is_clean_error(tmp_path):
     r = _run(["clean", "--run", str(Path(tmp_path) / "nope")])
     assert r.returncode != 0
     assert "Traceback" not in r.stderr
+
+
+def test_clean_refuses_in_progress_run(tmp_path):
+    run_dir = _init(tmp_path)
+    df = Path(tmp_path) / "d.json"; df.write_text(json.dumps(_two_node_dag()))
+    _run(["load-dag", "--run", run_dir, "--file", str(df)])  # node 'a' stays pending
+    r = _run(["clean", "--run", run_dir])
+    assert r.returncode != 0
+    assert "progress" in r.stderr.lower() or "force" in r.stderr.lower()
+    assert Path(run_dir).exists()
+
+
+def test_clean_force_removes_in_progress_run(tmp_path):
+    run_dir = _init(tmp_path)
+    df = Path(tmp_path) / "d.json"; df.write_text(json.dumps(_two_node_dag()))
+    _run(["load-dag", "--run", run_dir, "--file", str(df)])
+    r = _run(["clean", "--run", run_dir, "--force"])
+    assert r.returncode == 0, r.stderr
+    assert not Path(run_dir).exists()
+
+
+def test_clean_allows_finished_run(tmp_path):
+    run_dir = _init(tmp_path)
+    df = Path(tmp_path) / "d.json"; df.write_text(json.dumps(_two_node_dag()))
+    _run(["load-dag", "--run", run_dir, "--file", str(df)])
+    _run(["set-status", "--run", run_dir, "--node", "a", "--status", "done"])
+    r = _run(["clean", "--run", run_dir])
+    assert r.returncode == 0, r.stderr
+    assert not Path(run_dir).exists()
 
 
 def test_verdict_rejects_round_below_one(tmp_path):

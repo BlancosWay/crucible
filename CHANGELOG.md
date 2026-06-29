@@ -7,6 +7,16 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
 
 ## [Unreleased]
 
+### Changed
+- **Runs default to `~/.crucible/runs`, never the target repo.** `init-run` now writes under
+  `~/.crucible/runs` by default (override with `--base-dir` or `$CRUCIBLE_RUNS_DIR`), so running
+  Crucible inside any project no longer drops a `runs/` dir in that repo. Unique timestamped run
+  dirs mean concurrent runs across projects coexist; clear all with `rm -rf ~/.crucible/runs`.
+- **`clean` refuses an in-progress run.** `crucible clean` will not delete a run whose DAG has
+  nodes still `pending`/`in_progress`/`in_review` (exits non-zero); pass `--force` to override.
+  Prevents wiping a run that is still building. The skill's Finish step cleans only after all
+  nodes are `done`.
+
 ## [0.5.0] - 2026-06-29
 
 ### Added
