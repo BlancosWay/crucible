@@ -30,6 +30,20 @@ consensus, Crucible **halts and surfaces** the unresolved findings (configurable
 
 Override via a JSON config (see `config.example.json`).
 
+## Install
+
+Crucible is a Copilot CLI plugin (and runs on Claude Code / Codex). It needs **no MCP servers and
+no API keys** — only [Superpowers](https://github.com/obra/superpowers) and Python 3.11+. Install
+**locally** from this repo:
+
+```bash
+copilot plugin marketplace add ~/personal/crucible
+copilot plugin install crucible@crucible-marketplace
+```
+
+Then `/crucible <goal>`. Full per-platform steps: **[Copilot CLI](docs/install/copilot-cli.md)** ·
+**[Claude Code](docs/install/claude-code.md)** · **[Codex](docs/install/codex.md)**.
+
 ## Usage
 
 In an agent runtime with Superpowers installed, run the skill:
@@ -59,5 +73,6 @@ python -m pytest -q     # run the test suite (pytest.ini sets pythonpath=scripts
 - `commands/crucible.md` — `/crucible` entry point.
 - `scripts/crucible/` — deterministic helpers: `config`, `dag`, `verdict`, `runlog`, `report`, `cli`.
 - `.claude-plugin/` — plugin + marketplace manifests.
+- `docs/install/` — per-platform install guides (Copilot CLI, Claude Code, Codex).
 
 Engineering tool. Not affiliated with any model provider.

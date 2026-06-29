@@ -1,12 +1,20 @@
 {
   "name": "crucible-marketplace",
-  "owner": "BlancosWay",
+  "description": "Crucible — two-model adversarial planning + implementation on Superpowers, for agentic coding CLIs (GitHub Copilot CLI, Claude Code, Codex).",
+  "owner": {
+    "name": "BlancosWay",
+    "url": "https://github.com/BlancosWay/crucible"
+  },
   "plugins": [
     {
       "name": "crucible",
       "source": "./",
       "version": "0.1.0",
-      "description": "Two-model adversarial planning + implementation on Superpowers."
+      "description": "Two-model adversarial planning + implementation on Superpowers.",
+      "author": {
+        "name": "BlancosWay",
+        "url": "https://github.com/BlancosWay/crucible"
+      }
     }
   ]
 }
