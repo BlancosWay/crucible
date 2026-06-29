@@ -284,6 +284,17 @@ def cmd_should_final(args) -> int:
     return 0 if cfg.final_review else 1
 
 
+def cmd_should_approve(args) -> int:
+    """Deterministically answer whether to pause for human approval after PLAN consensus.
+
+    Prints ``yes``/``no`` and exits 0/1 so the orchestrator gates the optional approval
+    pause on the config flag instead of eyeballing it. Default is ``no`` (no pause).
+    """
+    cfg = load_config(RunLog(args.run).path / "config.json")
+    print("yes" if cfg.human_approval else "no")
+    return 0 if cfg.human_approval else 1
+
+
 def cmd_report(args) -> int:
     run = RunLog(args.run)
     if args.html:
@@ -337,6 +348,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("should-final"); s.add_argument("--run", required=True)
     s.set_defaults(func=cmd_should_final)
+
+    s = sub.add_parser("should-approve"); s.add_argument("--run", required=True)
+    s.set_defaults(func=cmd_should_approve)
 
     s = sub.add_parser("report"); s.add_argument("--run", required=True); s.add_argument("--html", action="store_true")
     s.add_argument("--open", action="store_true")

@@ -17,6 +17,7 @@ DEFAULTS: dict[str, Any] = {
     "blocking_severities": ["blocker", "major"],
     "strict_rebuttal": False,
     "final_review": True,
+    "human_approval": False,
 }
 
 VALID_ON_CAP = ("halt", "proceed_with_flags")
@@ -50,6 +51,7 @@ class Config:
     blocking_severities: list[str]
     strict_rebuttal: bool
     final_review: bool
+    human_approval: bool
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Config":
@@ -87,6 +89,7 @@ class Config:
             blocking_severities=list(merged["blocking_severities"]),
             strict_rebuttal=_require_bool("strict_rebuttal", merged["strict_rebuttal"]),
             final_review=_require_bool("final_review", merged["final_review"]),
+            human_approval=_require_bool("human_approval", merged["human_approval"]),
         )
         cfg._validate()
         return cfg
@@ -124,6 +127,7 @@ class Config:
             "blocking_severities": list(self.blocking_severities),
             "strict_rebuttal": self.strict_rebuttal,
             "final_review": self.final_review,
+            "human_approval": self.human_approval,
         }
 
 

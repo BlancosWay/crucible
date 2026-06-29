@@ -27,8 +27,24 @@ consensus, Crucible **halts and surfaces** the unresolved findings (configurable
 | Critic | `gpt-5.5` (effort `xhigh`) |
 | Rounds per gate | 5 |
 | On cap | `halt` |
+| Human approval | off (`human_approval: false`) |
 
-Override via a JSON config (see `config.example.json`).
+Override via a JSON config (see `config.example.json`). Set `human_approval: true` to pause after
+PLAN consensus for your explicit OK before any implementation (off by default).
+
+## Install
+
+Crucible is a Copilot CLI plugin (and runs on Claude Code / Codex). It needs **no MCP servers and
+no API keys** — only [Superpowers](https://github.com/obra/superpowers) and Python 3.11+. Install
+**locally** from this repo:
+
+```bash
+copilot plugin marketplace add ~/personal/crucible
+copilot plugin install crucible@crucible-marketplace
+```
+
+Then `/crucible <goal>`. Full per-platform steps: **[Copilot CLI](docs/install/copilot-cli.md)** ·
+**[Claude Code](docs/install/claude-code.md)** · **[Codex](docs/install/codex.md)**.
 
 ## Usage
 
@@ -59,5 +75,6 @@ python -m pytest -q     # run the test suite (pytest.ini sets pythonpath=scripts
 - `commands/crucible.md` — `/crucible` entry point.
 - `scripts/crucible/` — deterministic helpers: `config`, `dag`, `verdict`, `runlog`, `report`, `cli`.
 - `.claude-plugin/` — plugin + marketplace manifests.
+- `docs/install/` — per-platform install guides (Copilot CLI, Claude Code, Codex).
 
 Engineering tool. Not affiliated with any model provider.

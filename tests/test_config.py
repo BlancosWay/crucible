@@ -16,6 +16,7 @@ def test_defaults_match_spec():
     assert cfg.blocking_severities == ["blocker", "major"]
     assert cfg.strict_rebuttal is False
     assert cfg.final_review is True
+    assert cfg.human_approval is False
 
 
 def test_partial_override_keeps_other_defaults():
@@ -76,6 +77,17 @@ def test_string_boolean_strict_rebuttal_raises():
 def test_string_boolean_final_review_raises():
     with pytest.raises(ValueError, match="final_review must be a boolean"):
         Config.from_dict({"final_review": "false"})
+
+
+def test_string_boolean_human_approval_raises():
+    with pytest.raises(ValueError, match="human_approval must be a boolean"):
+        Config.from_dict({"human_approval": "true"})
+
+
+def test_human_approval_enabled_round_trips():
+    cfg = Config.from_dict({"human_approval": True})
+    again = Config.from_dict(cfg.to_dict())
+    assert again.human_approval is True
 
 
 def test_numeric_boolean_raises():

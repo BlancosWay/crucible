@@ -1,0 +1,25 @@
+Crucible
+Copyright (c) 2026 BlancosWay and the Crucible contributors
+
+This product is licensed under the MIT License (see the LICENSE file).
+
+------------------------------------------------------------------------
+Built on Superpowers
+------------------------------------------------------------------------
+
+Crucible is a workflow that runs on top of Superpowers
+(https://github.com/obra/superpowers). It does not vendor or redistribute
+Superpowers; it invokes Superpowers skills (writing-plans, brainstorming,
+subagent-driven-development, using-git-worktrees, finishing-a-development-branch)
+and the plan-document-reviewer / spec-document-reviewer / code-reviewer agents
+at runtime. Superpowers must be installed separately. Crucible is not
+affiliated with or endorsed by the Superpowers project.
+
+------------------------------------------------------------------------
+Independence
+------------------------------------------------------------------------
+
+Crucible is an engineering tool. It is not affiliated with, sponsored by, or
+endorsed by any model or platform provider. Model names referenced in defaults
+and docs (e.g. Opus, GPT) are trademarks of their respective owners and are
+used only to identify the configured backbones.
