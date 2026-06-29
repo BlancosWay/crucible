@@ -102,6 +102,11 @@ def _events(run_dir):
     return [json.loads(l) for l in (Path(run_dir) / "runlog.jsonl").read_text().splitlines() if l.strip()]
 
 
+def _two_node_dag():
+    return {"nodes": [{"id": "a", "title": "A", "description": "", "files": [], "test_plan": "",
+                       "status": "pending"}], "edges": []}
+
+
 def test_log_rejects_reserved_event(tmp_path):
     # N1: `log` must not be able to forge a CLI-managed terminal/verdict event.
     run_dir = _init(tmp_path)
@@ -496,6 +501,37 @@ def test_should_approve_missing_config_is_clean(tmp_path):
     assert "Traceback" not in r.stderr
     assert "crucible:" in r.stderr
     assert r.stdout.strip() not in ("yes", "no")
+
+
+# --- show-plan: echo the approved plan + DAG to the terminal at consensus -----
+
+def _approve_plan(tmp_path):
+    run_dir = _init(tmp_path)
+    df = Path(tmp_path) / "d.json"; df.write_text(json.dumps(_two_node_dag()))
+    _run(["load-dag", "--run", run_dir, "--file", str(df)])
+    plan = Path(tmp_path) / "plan.md"; plan.write_text("# Final plan\nDo the thing.")
+    _run(["log", "--run", run_dir, "--event", "builder_output", "--gate", "plan", "--round", "1", "--file", str(plan)])
+    v = Path(tmp_path) / "v.json"
+    v.write_text(json.dumps({"gate": "plan", "round": 1, "verdict": "APPROVE", "summary": "ok", "findings": []}))
+    _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1", "--file", str(v)])
+    return run_dir
+
+
+def test_show_plan_prints_final_plan_and_dag(tmp_path):
+    run_dir = _approve_plan(tmp_path)
+    r = _run(["show-plan", "--run", run_dir])
+    assert r.returncode == 0
+    assert "Final plan" in r.stdout and "Do the thing." in r.stdout
+    assert "a" in r.stdout and "Dependency tree" in r.stdout
+
+
+def test_show_plan_requires_plan_consensus(tmp_path):
+    run_dir = _init(tmp_path)
+    df = Path(tmp_path) / "d.json"; df.write_text(json.dumps(_two_node_dag()))
+    _run(["load-dag", "--run", run_dir, "--file", str(df)])
+    r = _run(["show-plan", "--run", run_dir])
+    assert r.returncode != 0
+    assert "consensus" in r.stderr.lower()
 
 
 def test_verdict_rejects_round_below_one(tmp_path):

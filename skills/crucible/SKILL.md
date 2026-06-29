@@ -58,6 +58,9 @@ new gate begins.
    - `CAPPED` (`on_cap: halt`) -> stop and surface the unresolved findings; do not proceed.
    - `PROCEED_WITH_FLAGS` (`on_cap: proceed_with_flags`) -> proceed to the **approval gate** below;
      the unresolved findings are recorded (`gate_proceeded_with_flags`) and shown in the report.
+6. **Show the approved plan + DAG.** Once the plan gate settles (`CONSENSUS`/`PROCEED_WITH_FLAGS`),
+   print the final plan and dependency tree to the terminal so they are visible before any
+   implementation: `PYTHONPATH=scripts python3 -m crucible show-plan --run "$RUN"`.
 
 ### Approval gate (optional human OK — default off)
 

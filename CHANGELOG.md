@@ -7,6 +7,13 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
 
 ## [Unreleased]
 
+### Added
+- **`show-plan` prints the approved plan + DAG to the terminal.** After the PLAN gate reaches
+  consensus, `crucible show-plan --run <dir>` echoes the final plan artifact and the dependency
+  tree (in build order) so the operator sees exactly what was approved before implementation
+  begins; it exits non-zero until the plan gate has concluded. The orchestrator runs it as PLAN
+  step 6.
+
 ## [0.2.0] - 2026-06-28
 
 ### Added
