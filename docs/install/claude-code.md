@@ -20,17 +20,22 @@ Crucible needs **no MCP servers and no API keys**.
 
 ## Option A: Just run it
 
-**Install — from a local clone.** `--plugin-dir` reads the clone directly — edits apply
-immediately, with no marketplace cache to refresh:
+**Install — from GitHub (no clone needed).** Add this repo as a marketplace and install by name:
+
+```text
+/plugin marketplace add BlancosWay/crucible
+/plugin install crucible
+```
+
+The workflow loads as the `crucible:crucible` skill with `crucible:crucible` as a slash command.
+
+…or read a local clone directly with `--plugin-dir` — edits apply immediately, with no marketplace
+cache to refresh:
 
 ```bash
 git clone https://github.com/BlancosWay/crucible.git
 claude --plugin-dir /path/to/crucible
 ```
-
-…or add it as a marketplace: `/plugin marketplace add /path/to/crucible` then
-`/plugin install crucible`. The workflow loads as the `crucible:crucible` skill with
-`crucible:crucible` as a slash command.
 
 **Run — interactive.**
 

@@ -20,11 +20,11 @@ Crucible needs **no MCP servers and no API keys**.
 
 ## Option A: Just run it
 
-**Install — local marketplace.** This repo doubles as a Copilot CLI plugin marketplace; add the
-clone as a marketplace and install by name:
+**Install — from GitHub.** This repo doubles as a Copilot CLI plugin marketplace; add it straight
+from GitHub and install by name (no clone needed):
 
 ```bash
-copilot plugin marketplace add ~/personal/crucible
+copilot plugin marketplace add BlancosWay/crucible
 copilot plugin install crucible@crucible-marketplace
 ```
 
