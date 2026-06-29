@@ -7,5 +7,6 @@
   "defer_severities": ["minor", "nit"],
   "blocking_severities": ["blocker", "major"],
   "strict_rebuttal": false,
-  "final_review": true
+  "final_review": true,
+  "human_approval": false
 }

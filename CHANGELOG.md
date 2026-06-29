@@ -8,6 +8,11 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
 ## [Unreleased]
 
 ### Added
+- **Optional human-approval gate (default off).** New config flag `human_approval` (default
+  `false`) plus a `crucible should-approve --run <dir>` command (prints `yes`/`no`, exits 0/1,
+  mirroring `should-final`). When enabled, the orchestrator pauses after PLAN-gate consensus and
+  waits for explicit human OK before any implementation; default keeps the fully automated
+  behavior unchanged. SKILL.md adds the deterministic approval-gate step keyed off the token.
 - **Local-install packaging parity.** Crucible can now be installed directly as a local plugin
   (`copilot plugin marketplace add ~/personal/crucible` → `copilot plugin install
   crucible@crucible-marketplace`). Added per-platform install guides

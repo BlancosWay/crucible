@@ -27,8 +27,10 @@ consensus, Crucible **halts and surfaces** the unresolved findings (configurable
 | Critic | `gpt-5.5` (effort `xhigh`) |
 | Rounds per gate | 5 |
 | On cap | `halt` |
+| Human approval | off (`human_approval: false`) |
 
-Override via a JSON config (see `config.example.json`).
+Override via a JSON config (see `config.example.json`). Set `human_approval: true` to pause after
+PLAN consensus for your explicit OK before any implementation (off by default).
 
 ## Install
 

@@ -50,14 +50,34 @@ new gate begins.
    findings into the verdict JSON (`critic-prompt.md`). Capture to `verdict.json`. (See
    `references/platform-notes.md`.)
 5. Decide: `PYTHONPATH=scripts python3 -m crucible verdict --run "$RUN" --gate plan --round N --file verdict.json`.
-   - `CONSENSUS` -> go to Stage 2.
+   - `CONSENSUS` -> proceed to the **approval gate** below.
    - `CHANGES` -> revise as Builder, increment N, then **repeat from step 2** — re-emit the
      dependency tree (the Critic reviews DAG edges/order too) and re-run `load-dag` so a
      corrected DAG is reloaded before re-logging and re-deciding. (`load-dag` is idempotent
      when the tree is unchanged; the plan is still all-`pending` at this stage.)
    - `CAPPED` (`on_cap: halt`) -> stop and surface the unresolved findings; do not proceed.
-   - `PROCEED_WITH_FLAGS` (`on_cap: proceed_with_flags`) -> go to Stage 2; the unresolved
-     findings are recorded (`gate_proceeded_with_flags`) and shown in the report.
+   - `PROCEED_WITH_FLAGS` (`on_cap: proceed_with_flags`) -> proceed to the **approval gate** below;
+     the unresolved findings are recorded (`gate_proceeded_with_flags`) and shown in the report.
+
+### Approval gate (optional human OK — default off)
+
+Once the PLAN gate settles (`CONSENSUS` or `PROCEED_WITH_FLAGS`), check whether the human must
+approve before any implementation. This is **off by default**; enable it with `human_approval: true`
+in the config. Gate it deterministically — key off the printed token so a config-load error halts:
+
+```bash
+case "$(PYTHONPATH=scripts python3 -m crucible should-approve --run "$RUN")" in
+  no)  : ;;                                    # default — go straight to Stage 2
+  yes) echo "Plan + dependency tree approved by the Critic; awaiting your OK to implement." ;;
+                                               # surface the plan + DAG, then WAIT for the human
+  *)   echo "crucible: cannot determine approval policy; halting" >&2; exit 1 ;;
+esac
+```
+
+On `yes`, present the plan and the dependency tree and **stop until the human approves** — do not
+implement. PLAN consensus is already terminal, so a rejection cannot reopen it: if the human wants
+changes, **halt** and start a fresh run with the revised goal (same posture as `on_cap: halt`). On
+`no` (default), continue without pausing.
 
 ## Stage 2 — IMPLEMENT gates (one per dependency)
 
