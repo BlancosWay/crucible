@@ -7,6 +7,17 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
 
 ## [Unreleased]
 
+## [Unreleased]
+
+### Added
+- **Always-on PLAN provenance in the run-log.** `dag_loaded` now embeds the full dependency tree
+  (nodes+edges) in addition to the node count, and the plan gate's terminal event
+  (`gate_consensus` / `gate_proceeded_with_flags`) snapshots the planned DAG — so the dependency
+  tree at consensus is captured durably in the append-only log, not just the mutable side-file.
+  A plan gate can no longer terminalize without a loaded DAG: the snapshot is read and the guard
+  enforced before any append, so a missing/corrupt DAG aborts with zero partial records. Dep/final
+  gates are unchanged.
+
 ## [0.2.0] - 2026-06-28
 
 ### Added

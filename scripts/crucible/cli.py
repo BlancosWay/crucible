@@ -129,7 +129,7 @@ def cmd_load_dag(args) -> int:
         raise SystemExit(f"load-dag: a freshly imported plan must have every node 'pending'; "
                          f"these are not: {non_pending}. Node statuses change only via set-status.")
     run.save_dag(dag.to_dict())
-    run.append("dag_loaded", gate="plan", nodes=len(dag.nodes))
+    run.append("dag_loaded", gate="plan", nodes=len(dag.nodes), dag=dag.to_dict())
     print(f"loaded {len(dag.nodes)} nodes")
     return 0
 
@@ -242,10 +242,31 @@ def cmd_verdict(args) -> int:
     if bad_defer:
         raise ValueError(f"cannot defer finding(s) {bad_defer}: 'deferred' is only allowed for "
                          f"severities in defer_severities {cfg.defer_severities}")
+    # PLAN provenance: snapshot the planned DAG into the plan gate's terminal event so the
+    # dependency tree at consensus is captured durably in the append-only log (not just the
+    # mutable side-file). Read it BEFORE any run.append (including builder_resolution) so a
+    # missing/corrupt DAG leaves no partial record; only the plan gate has a DAG, so other
+    # gates get no snapshot.
+    plan_dag = None
+    if args.gate == "plan":
+        try:
+            plan_dag = run.load_dag()
+        except FileNotFoundError:  # DAG not loaded yet; snapshot is best-effort, others abort
+            plan_dag = None
+
     if resolutions_raw:
-        run.append("builder_resolution", gate=args.gate, round=args.round, payload=resolutions_raw)
+        _resolution_pending = resolutions_raw  # appended after the plan-dag guard, never before
+    else:
+        _resolution_pending = None
 
     decision = decide(verdict, cfg, round_index=args.round, max_rounds=max_rounds, resolutions=resolutions)
+    # Always-log PLAN provenance: a concluding plan gate MUST carry the DAG snapshot, so refuse
+    # to terminalize the plan gate without a loaded DAG. Enforce before ANY append (including
+    # builder_resolution) so a missing-DAG abort leaves no partial record.
+    if args.gate == "plan" and decision.outcome in ("CONSENSUS", "PROCEED_WITH_FLAGS") and plan_dag is None:
+        raise SystemExit("plan gate cannot reach consensus without a loaded DAG; run load-dag first")
+    if _resolution_pending is not None:
+        run.append("builder_resolution", gate=args.gate, round=args.round, payload=_resolution_pending)
 
     # F6: persist both the parsed verdict and the Critic's full raw output. These are not
     # redundant: the report renders the parsed payload as a readable digest (verdict + summary
@@ -253,10 +274,12 @@ def cmd_verdict(args) -> int:
     # bytes/formatting/extra keys). Keeping both is intentional (digest for humans, raw for audit).
     run.append("critic_verdict", gate=args.gate, round=args.round, payload=data, raw=raw_text)
     if decision.outcome == "CONSENSUS":
-        run.append("gate_consensus", gate=args.gate, round=args.round)
+        extra = {"dag": plan_dag} if plan_dag is not None else {}
+        run.append("gate_consensus", gate=args.gate, round=args.round, **extra)
     elif decision.outcome == "PROCEED_WITH_FLAGS":
+        extra = {"dag": plan_dag} if plan_dag is not None else {}
         run.append("gate_proceeded_with_flags", gate=args.gate, round=args.round,
-                   open_findings=[f.id for f in decision.open_findings])
+                   open_findings=[f.id for f in decision.open_findings], **extra)
     elif decision.outcome == "CAPPED":
         run.append("gate_capped", gate=args.gate, round=args.round,
                    open_findings=[f.id for f in decision.open_findings])

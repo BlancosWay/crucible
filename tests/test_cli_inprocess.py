@@ -108,6 +108,9 @@ def test_main_init_run_non_object_config_returns_1(tmp_path, capsys):
 def test_main_verdict_consensus_returns_0(tmp_path, capsys):
     run = _init(tmp_path)
     capsys.readouterr()  # drain the init-run path print
+    dagf = _write(tmp_path, "d.json", {"nodes": [{"id": "a", "title": "A", "description": "",
+                  "files": [], "test_plan": "", "status": "pending"}], "edges": []})
+    main(["load-dag", "--run", run, "--file", dagf]); capsys.readouterr()
     vfile = _write(tmp_path, "v.json", {"gate": "plan", "round": 1, "verdict": "APPROVE",
                                         "summary": "ok", "findings": []})
     rc = main(["verdict", "--run", run, "--gate", "plan", "--round", "1", "--file", vfile])

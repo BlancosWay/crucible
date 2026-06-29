@@ -73,6 +73,8 @@ def test_verdict_proceed_with_flags_outcome(tmp_path):
     cfg.write_text(json.dumps({"on_cap": "proceed_with_flags"}))
     r = _run(["init-run", "--goal", "g", "--base-dir", str(tmp_path), "--config", str(cfg)])
     run_dir = r.stdout.strip()
+    f = Path(tmp_path) / "dag.json"; f.write_text(json.dumps(_two_node_dag()))
+    _run(["load-dag", "--run", run_dir, "--file", str(f)])
     vfile = Path(tmp_path) / "v.json"
     vfile.write_text(json.dumps({
         "gate": "plan", "round": 5, "verdict": "REQUEST_CHANGES", "summary": "unresolved",
@@ -84,7 +86,87 @@ def test_verdict_proceed_with_flags_outcome(tmp_path):
     events = [json.loads(l) for l in (Path(run_dir) / "runlog.jsonl").read_text().splitlines() if l.strip()]
     proceeded = [e for e in events if e["event"] == "gate_proceeded_with_flags"]
     assert proceeded and proceeded[-1]["open_findings"] == ["F1"]
+    assert proceeded[-1]["dag"]["nodes"][0]["id"] == "a"
     assert not any(e["event"] == "gate_capped" for e in events)
+
+
+def _two_node_dag():
+    return {"nodes": [{"id": "a", "title": "A", "description": "", "files": [], "test_plan": "",
+                       "status": "pending"}], "edges": []}
+
+
+def test_dag_loaded_event_carries_full_dag(tmp_path):
+    run_dir = _run(["init-run", "--goal", "g", "--base-dir", str(tmp_path)]).stdout.strip()
+    f = Path(tmp_path) / "dag.json"; f.write_text(json.dumps(_two_node_dag()))
+    _run(["load-dag", "--run", run_dir, "--file", str(f)])
+    loaded = [e for e in _events(run_dir) if e["event"] == "dag_loaded"][-1]
+    assert loaded["nodes"] == 1                       # back-compat count preserved
+    assert loaded["dag"]["nodes"][0]["id"] == "a"     # full nodes+edges embedded
+    assert loaded["dag"]["edges"] == []
+
+
+def test_plan_consensus_event_snapshots_dag(tmp_path):
+    run_dir = _run(["init-run", "--goal", "g", "--base-dir", str(tmp_path)]).stdout.strip()
+    f = Path(tmp_path) / "dag.json"; f.write_text(json.dumps(_two_node_dag()))
+    _run(["load-dag", "--run", run_dir, "--file", str(f)])
+    v = Path(tmp_path) / "v.json"
+    v.write_text(json.dumps({"gate": "plan", "round": 1, "verdict": "APPROVE", "summary": "ok", "findings": []}))
+    _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1", "--file", str(v)])
+    cons = [e for e in _events(run_dir) if e["event"] == "gate_consensus"][-1]
+    assert cons["dag"]["nodes"][0]["id"] == "a"
+
+
+def test_dep_consensus_event_has_no_dag_snapshot(tmp_path):
+    run_dir = _run(["init-run", "--goal", "g", "--base-dir", str(tmp_path)]).stdout.strip()
+    f = Path(tmp_path) / "dag.json"; f.write_text(json.dumps(_two_node_dag()))
+    _run(["load-dag", "--run", run_dir, "--file", str(f)])
+    v = Path(tmp_path) / "v.json"
+    v.write_text(json.dumps({"gate": "dep:a", "round": 1, "verdict": "APPROVE", "summary": "ok", "findings": []}))
+    _run(["verdict", "--run", run_dir, "--gate", "dep:a", "--round", "1", "--file", str(v)])
+    cons = [e for e in _events(run_dir) if e["event"] == "gate_consensus"][-1]
+    assert "dag" not in cons
+
+
+def test_plan_consensus_without_dag_aborts(tmp_path):
+    run_dir = _run(["init-run", "--goal", "g", "--base-dir", str(tmp_path)]).stdout.strip()
+    v = Path(tmp_path) / "v.json"
+    v.write_text(json.dumps({"gate": "plan", "round": 1, "verdict": "APPROVE", "summary": "ok", "findings": []}))
+    r = _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1", "--file", str(v)])
+    assert r.returncode != 0
+    assert not any(e["event"] in ("critic_verdict", "gate_consensus") for e in _events(run_dir))
+
+
+def test_plan_consensus_no_dag_with_resolutions_logs_nothing(tmp_path):
+    run_dir = _run(["init-run", "--goal", "g", "--base-dir", str(tmp_path)]).stdout.strip()
+    res = Path(tmp_path) / "r.json"; res.write_text(json.dumps({"F1": "deferred"}))
+    v = Path(tmp_path) / "v.json"
+    v.write_text(json.dumps({"gate": "plan", "round": 1, "verdict": "APPROVE", "summary": "x",
+                             "findings": [{"id": "F1", "severity": "minor", "location": "x", "claim": "c", "suggestion": "s"}]}))
+    r = _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1", "--file", str(v), "--resolutions", str(res)])
+    assert r.returncode != 0
+    assert not any(e["event"] in ("builder_resolution", "critic_verdict", "gate_consensus") for e in _events(run_dir))
+
+
+def test_plan_verdict_with_corrupt_dag_aborts_before_logging(tmp_path):
+    run_dir = _run(["init-run", "--goal", "g", "--base-dir", str(tmp_path)]).stdout.strip()
+    (Path(run_dir) / "dag.json").write_text("{ not json")  # corrupt, not merely absent
+    v = Path(tmp_path) / "v.json"
+    v.write_text(json.dumps({"gate": "plan", "round": 1, "verdict": "APPROVE", "summary": "ok", "findings": []}))
+    r = _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1", "--file", str(v)])
+    assert r.returncode != 0
+    assert not any(e["event"] in ("critic_verdict", "gate_consensus") for e in _events(run_dir))
+
+
+def test_plan_verdict_corrupt_dag_with_resolutions_logs_nothing(tmp_path):
+    run_dir = _run(["init-run", "--goal", "g", "--base-dir", str(tmp_path)]).stdout.strip()
+    (Path(run_dir) / "dag.json").write_text("{ not json")
+    res = Path(tmp_path) / "r.json"; res.write_text(json.dumps({"F1": "fixed"}))
+    v = Path(tmp_path) / "v.json"
+    v.write_text(json.dumps({"gate": "plan", "round": 1, "verdict": "REQUEST_CHANGES", "summary": "x",
+                             "findings": [{"id": "F1", "severity": "major", "location": "x", "claim": "c", "suggestion": "s"}]}))
+    r = _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1", "--file", str(v), "--resolutions", str(res)])
+    assert r.returncode != 0
+    assert not any(e["event"] in ("builder_resolution", "critic_verdict", "gate_consensus") for e in _events(run_dir))
 
 
 def test_log_appends_full_payload(tmp_path):
@@ -169,6 +251,8 @@ def test_verdict_rejects_gate_mismatch(tmp_path):
 def test_verdict_resolutions_and_raw_are_logged(tmp_path):
     r = _run(["init-run", "--goal", "g", "--base-dir", str(tmp_path)])
     run_dir = r.stdout.strip()
+    df = Path(tmp_path) / "d.json"; df.write_text(json.dumps(_two_node_dag()))
+    _run(["load-dag", "--run", run_dir, "--file", str(df)])
     vfile = Path(tmp_path) / "v.json"
     vfile.write_text(json.dumps({
         "gate": "plan", "round": 1, "verdict": "REQUEST_CHANGES", "summary": "x",
@@ -780,6 +864,8 @@ def test_set_status_blocked_not_gated_by_deps(tmp_path):
 def test_verdict_rejects_already_concluded_gate(tmp_path):
     # C3: once a gate logs a terminal outcome, a second verdict must not silently rewrite it.
     run_dir = _init(tmp_path)
+    df = Path(tmp_path) / "d.json"; df.write_text(json.dumps(_two_node_dag()))
+    _run(["load-dag", "--run", run_dir, "--file", str(df)])
     vfile = Path(tmp_path) / "v.json"
     vfile.write_text(json.dumps({"gate": "plan", "round": 1, "verdict": "APPROVE",
                                  "summary": "first", "findings": []}))
@@ -817,6 +903,8 @@ def test_verdict_rejects_defer_of_blocking_finding(tmp_path):
 def test_verdict_defer_of_minor_finding_is_allowed(tmp_path):
     # The legitimate case: a minor (deferrable) finding can be deferred and clears the gate.
     run_dir = _init(tmp_path)
+    df = Path(tmp_path) / "d.json"; df.write_text(json.dumps(_two_node_dag()))
+    _run(["load-dag", "--run", run_dir, "--file", str(df)])
     vfile = Path(tmp_path) / "v.json"
     vfile.write_text(json.dumps({
         "gate": "plan", "round": 1, "verdict": "APPROVE", "summary": "x",
