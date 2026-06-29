@@ -35,11 +35,11 @@ PLAN consensus for your explicit OK before any implementation (off by default).
 ## Install
 
 Crucible is a Copilot CLI plugin (and runs on Claude Code / Codex). It needs **no MCP servers and
-no API keys** — only [Superpowers](https://github.com/obra/superpowers) and Python 3.11+. Install
-**locally** from this repo:
+no API keys** — only [Superpowers](https://github.com/obra/superpowers) and Python 3.11+. Add this
+repo as a marketplace and install by name (no clone needed):
 
 ```bash
-copilot plugin marketplace add ~/personal/crucible
+copilot plugin marketplace add BlancosWay/crucible
 copilot plugin install crucible@crucible-marketplace
 ```
 

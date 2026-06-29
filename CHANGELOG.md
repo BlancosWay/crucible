@@ -7,6 +7,15 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-06-29
+
+### Fixed
+- **Install docs point at the GitHub marketplace, not an author-local path.** The Copilot CLI and
+  Claude Code "just run it" steps (README, `CLAUDE.md`, `docs/install/`) now add the marketplace
+  from GitHub — `copilot plugin marketplace add BlancosWay/crucible` /
+  `/plugin marketplace add BlancosWay/crucible` — instead of `~/personal/crucible`, so a first-time
+  install works with no clone.
+
 ## [0.6.0] - 2026-06-29
 
 ### Changed
