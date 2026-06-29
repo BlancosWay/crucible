@@ -7,6 +7,12 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
 
 ## [Unreleased]
 
+### Added
+- **`clean` command + Finish cleanup step.** `crucible clean --run <dir>` deletes a finished run's
+  directory (logs, report, and all scratch) and refuses any path without a `runlog.jsonl`, so a
+  typo can't wipe an unrelated dir. The skill's Finish stage now removes the run data once the
+  report is captured (and notes `rm -rf runs/` to clear all prior runs).
+
 ## [0.4.0] - 2026-06-29
 
 ### Changed

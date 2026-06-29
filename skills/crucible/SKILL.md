@@ -156,6 +156,12 @@ fi
 1. `PYTHONPATH=scripts python3 -m crucible status --run "$RUN"` to confirm all nodes `done`.
 2. `PYTHONPATH=scripts python3 -m crucible report --run "$RUN"` (add `--html` for HTML) to render the run report.
 3. Use **superpowers:finishing-a-development-branch** to complete the work.
+4. **Clean up the run data.** Once you've captured anything you need from the report, delete the
+   entire run dir (logs + all scratch) so nothing lingers:
+   `PYTHONPATH=scripts python3 -m crucible clean --run "$RUN"` (refuses any path without a
+   `runlog.jsonl`). To clear **all** prior runs at once, remove the base: `rm -rf runs/` (or your
+   `--base-dir`). The Builder's implementation diff is already committed/in the branch — the run
+   dir is disposable provenance.
 
 ## Red flags
 

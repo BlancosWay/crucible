@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import sys
 import webbrowser
 from pathlib import Path
@@ -320,6 +321,22 @@ def cmd_show_plan(args) -> int:
     return 0
 
 
+def cmd_clean(args) -> int:
+    """Delete a finished run's directory (logs, report, and all scratch).
+
+    Refuses any path that is not a Crucible run dir — it must exist and contain a
+    ``runlog.jsonl`` — so a typo/wrong path can never remove an unrelated directory.
+    """
+    run_dir = Path(args.run)
+    if not run_dir.is_dir():
+        raise SystemExit(f"crucible: not a run directory: {run_dir}")
+    if not (run_dir / "runlog.jsonl").exists():
+        raise SystemExit(f"crucible: refusing to delete {run_dir} — no runlog.jsonl (not a run dir)")
+    shutil.rmtree(run_dir)
+    print(f"removed {run_dir}")
+    return 0
+
+
 def cmd_report(args) -> int:
     run = RunLog(args.run)
     if args.html:
@@ -379,6 +396,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("show-plan"); s.add_argument("--run", required=True)
     s.set_defaults(func=cmd_show_plan)
+
+    s = sub.add_parser("clean"); s.add_argument("--run", required=True)
+    s.set_defaults(func=cmd_clean)
 
     s = sub.add_parser("report"); s.add_argument("--run", required=True); s.add_argument("--html", action="store_true")
     s.add_argument("--open", action="store_true")
