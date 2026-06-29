@@ -295,6 +295,31 @@ def cmd_should_approve(args) -> int:
     return 0 if cfg.human_approval else 1
 
 
+def cmd_show_plan(args) -> int:
+    """Print the approved plan + dependency tree to the terminal after PLAN consensus.
+
+    Refuses to run until the plan gate has concluded, so the operator always sees exactly
+    what was approved before any implementation begins. Reads from the run-log (final plan
+    artifact) and the loaded DAG.
+    """
+    run = RunLog(args.run)
+    concluded = [e for e in run.read_events()
+                 if e.get("gate") == "plan" and e.get("event") in _TERMINAL_EVENTS]
+    if not concluded:
+        raise SystemExit("show-plan: the plan gate has not reached consensus yet; nothing to show")
+    plans = [e for e in run.read_events()
+             if e.get("gate") == "plan" and e.get("event") == "builder_output"]
+    print("=== Approved plan ===")
+    print(plans[-1].get("payload", "(no plan artifact logged)") if plans else "(no plan artifact logged)")
+    dag = DAG.from_dict(run.load_dag())
+    print("\n=== Dependency tree (build order) ===")
+    for nid in dag.order:
+        n = dag.nodes[nid]
+        deps = ", ".join(sorted(dag.deps.get(nid, ()))) or "—"
+        print(f"  {n.id}: {n.title}  [deps: {deps}]")
+    return 0
+
+
 def cmd_report(args) -> int:
     run = RunLog(args.run)
     if args.html:
@@ -351,6 +376,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("should-approve"); s.add_argument("--run", required=True)
     s.set_defaults(func=cmd_should_approve)
+
+    s = sub.add_parser("show-plan"); s.add_argument("--run", required=True)
+    s.set_defaults(func=cmd_show_plan)
 
     s = sub.add_parser("report"); s.add_argument("--run", required=True); s.add_argument("--html", action="store_true")
     s.add_argument("--open", action="store_true")
