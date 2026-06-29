@@ -7,6 +7,8 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-06-29
+
 ### Added
 - **`show-plan` prints the approved plan + DAG to the terminal.** After the PLAN gate reaches
   consensus, `crucible show-plan --run <dir>` echoes the final plan artifact and the dependency
