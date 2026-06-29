@@ -534,6 +534,31 @@ def test_show_plan_requires_plan_consensus(tmp_path):
     assert "consensus" in r.stderr.lower()
 
 
+# --- clean: delete a finished run's directory --------------------------------
+
+def test_clean_removes_run_dir(tmp_path):
+    run_dir = _init(tmp_path)
+    assert Path(run_dir).is_dir()
+    r = _run(["clean", "--run", run_dir])
+    assert r.returncode == 0, r.stderr
+    assert not Path(run_dir).exists()
+
+
+def test_clean_refuses_non_run_dir(tmp_path):
+    bogus = Path(tmp_path) / "not_a_run"; bogus.mkdir()
+    (bogus / "keep.txt").write_text("important")
+    r = _run(["clean", "--run", str(bogus)])
+    assert r.returncode != 0
+    assert "crucible:" in r.stderr
+    assert bogus.exists()  # refused to delete a dir with no runlog.jsonl
+
+
+def test_clean_missing_dir_is_clean_error(tmp_path):
+    r = _run(["clean", "--run", str(Path(tmp_path) / "nope")])
+    assert r.returncode != 0
+    assert "Traceback" not in r.stderr
+
+
 def test_verdict_rejects_round_below_one(tmp_path):
     run_dir = _init(tmp_path)
     vfile = Path(tmp_path) / "v.json"
