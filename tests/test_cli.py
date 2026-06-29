@@ -470,6 +470,34 @@ def test_should_final_missing_config_is_clean(tmp_path):
     assert r.stdout.strip() not in ("yes", "no")
 
 
+# --- should-approve gate (human approval, default off) -----------------------
+
+def test_should_approve_no_by_default(tmp_path):
+    run_dir = _init(tmp_path)
+    r = _run(["should-approve", "--run", run_dir])
+    assert r.returncode == 1
+    assert r.stdout.strip() == "no"
+
+
+def test_should_approve_yes_when_enabled(tmp_path):
+    cfg = Path(tmp_path) / "c.json"
+    cfg.write_text(json.dumps({"human_approval": True}))
+    run_dir = _run(["init-run", "--goal", "g", "--base-dir", str(tmp_path), "--config", str(cfg)]).stdout.strip()
+    r = _run(["should-approve", "--run", run_dir])
+    assert r.returncode == 0
+    assert r.stdout.strip() == "yes"
+
+
+def test_should_approve_missing_config_is_clean(tmp_path):
+    bare = Path(tmp_path) / "bare_run"
+    bare.mkdir()
+    r = _run(["should-approve", "--run", str(bare)])
+    assert r.returncode != 0
+    assert "Traceback" not in r.stderr
+    assert "crucible:" in r.stderr
+    assert r.stdout.strip() not in ("yes", "no")
+
+
 def test_verdict_rejects_round_below_one(tmp_path):
     run_dir = _init(tmp_path)
     vfile = Path(tmp_path) / "v.json"
