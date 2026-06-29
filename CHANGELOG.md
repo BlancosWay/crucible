@@ -7,6 +7,8 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-06-29
+
 ### Added
 - **`clean` command + Finish cleanup step.** `crucible clean --run <dir>` deletes a finished run's
   directory (logs, report, and all scratch) and refuses any path without a `runlog.jsonl`, so a
