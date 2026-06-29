@@ -7,6 +7,15 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
 
 ## [Unreleased]
 
+## [Unreleased]
+
+### Changed
+- **Crucible scratch files stay out of version control.** The orchestrator now writes every
+  scratch artifact (`dag.json`, `plan.md`, `verdict.json`, `res.json`, node diffs) under the
+  git-ignored run dir (`"$RUN"/`) instead of the working-tree root, and reviews diffs against the
+  base branch — so a run never stages/commits temp files, in-repo or as an installed plugin. Root
+  scratch names are also git-ignored as a safety net.
+
 ## [0.3.0] - 2026-06-29
 
 ### Added
