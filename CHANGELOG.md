@@ -7,8 +7,6 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
 
 ## [Unreleased]
 
-## [Unreleased]
-
 ### Changed
 - **Crucible scratch files stay out of version control.** The orchestrator now writes every
   scratch artifact (`dag.json`, `plan.md`, `verdict.json`, `res.json`, node diffs) under the
