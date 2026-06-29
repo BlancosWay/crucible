@@ -63,8 +63,9 @@ PYTHONPATH=scripts python3 -m crucible verdict --run "$RUN" --gate plan --round 
 PYTHONPATH=scripts python3 -m crucible report --run "$RUN" --html
 ```
 
-Scratch files (`dag.json`, `plan.md`, `verdict.json`, …) live under `"$RUN"/` (inside the
-git-ignored `runs/`), so they are never committed — in-repo or as an installed plugin.
+Scratch files (`dag.json`, `plan.md`, `verdict.json`, …) live under `"$RUN"/`, and runs default to
+`~/.crucible/runs` (override `--base-dir`/`$CRUCIBLE_RUNS_DIR`), so nothing is written into the
+target repo. Delete a finished run with `crucible clean --run "$RUN"` (refuses in-progress runs).
 
 ## Development
 

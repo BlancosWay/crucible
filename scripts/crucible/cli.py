@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import sys
 import webbrowser
@@ -110,7 +111,8 @@ def _max_rounds_for_gate(cfg: Config, gate: str) -> int:
 
 def cmd_init_run(args) -> int:
     cfg = load_config(args.config) if args.config else Config.from_dict({})
-    run = init_run(args.goal, cfg, base_dir=args.base_dir)
+    base = args.base_dir or os.environ.get("CRUCIBLE_RUNS_DIR") or str(Path.home() / ".crucible" / "runs")
+    run = init_run(args.goal, cfg, base_dir=base)
     print(run.path)
     return 0
 
@@ -325,13 +327,22 @@ def cmd_clean(args) -> int:
     """Delete a finished run's directory (logs, report, and all scratch).
 
     Refuses any path that is not a Crucible run dir — it must exist and contain a
-    ``runlog.jsonl`` — so a typo/wrong path can never remove an unrelated directory.
+    ``runlog.jsonl`` — so a typo/wrong path can never remove an unrelated directory. Also
+    refuses a run still in progress (any node not ``done``) unless ``--force`` is given.
     """
     run_dir = Path(args.run)
     if not run_dir.is_dir():
         raise SystemExit(f"crucible: not a run directory: {run_dir}")
     if not (run_dir / "runlog.jsonl").exists():
         raise SystemExit(f"crucible: refusing to delete {run_dir} — no runlog.jsonl (not a run dir)")
+    if not args.force:
+        try:
+            prog = DAG.from_dict(RunLog(args.run).load_dag()).progress()
+        except FileNotFoundError:
+            prog = None  # no DAG loaded yet — nothing in progress, safe to remove
+        if prog and prog["total"] and prog.get("done", 0) < prog["total"]:
+            raise SystemExit(f"crucible: refusing to delete {run_dir} — run is in progress "
+                             f"({prog.get('done', 0)}/{prog['total']} nodes done); pass --force to override")
     shutil.rmtree(run_dir)
     print(f"removed {run_dir}")
     return 0
@@ -360,7 +371,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True)
 
     s = sub.add_parser("init-run"); s.add_argument("--goal", required=True)
-    s.add_argument("--config"); s.add_argument("--base-dir", default="runs")
+    s.add_argument("--config"); s.add_argument("--base-dir", default=None,
+                   help="run base dir; default $CRUCIBLE_RUNS_DIR or ~/.crucible/runs (keeps runs out of the target repo)")
     s.set_defaults(func=cmd_init_run)
 
     s = sub.add_parser("load-dag"); s.add_argument("--run", required=True); s.add_argument("--file", required=True)
@@ -398,6 +410,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_show_plan)
 
     s = sub.add_parser("clean"); s.add_argument("--run", required=True)
+    s.add_argument("--force", action="store_true", help="delete even if the run is still in progress")
     s.set_defaults(func=cmd_clean)
 
     s = sub.add_parser("report"); s.add_argument("--run", required=True); s.add_argument("--html", action="store_true")

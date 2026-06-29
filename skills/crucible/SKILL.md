@@ -26,16 +26,15 @@ Start a run:
 RUN=$(PYTHONPATH=scripts python3 -m crucible init-run --goal "<the user's goal>")   # add --config config.json to override defaults
 ```
 
-When Crucible runs as an installed plugin over **someone else's** project, keep the whole run dir
-out of their tree: pass an explicit base, e.g. `--base-dir ~/.crucible/runs`, so neither `runs/`
-nor any scratch lands in the target repo.
+When Crucible runs as an installed plugin over **someone else's** project, runs already stay out of
+their tree: `init-run` defaults its base to `~/.crucible/runs` (override with `--base-dir` or
+`$CRUCIBLE_RUNS_DIR`), so neither a `runs/` dir nor any scratch lands in the target repo.
 
 **Scratch files live in the run dir.** Write every scratch artifact (`dag.json`, `plan.md`,
-`verdict.json`, `res.json`, node diffs) under `"$RUN"/` — never in the working tree root — so they
-stay out of version control and are cleaned up with the run. `runs/` is git-ignored, so this works
-both in-repo and (with the base above) as an installed plugin. **Always review the implementation
-by diffing against the base branch (`git diff <base> -- <paths>`), never the staged tree** —
-scratch files are untracked and excluded automatically.
+`verdict.json`, `res.json`, node diffs) under `"$RUN"/` — never in the working tree root. Combined
+with the home-based default above, nothing is written into the target repo. **Always review the
+implementation by diffing against the base branch (`git diff <base> -- <paths>`), never the staged
+tree** — scratch files live outside it.
 
 **Round caps & rebuttals.** `crucible verdict` reads the round cap from the run config by gate
 (`max_rounds_plan` for `plan`, `max_rounds_dep` for `dep:*`/`final`); pass `--max-rounds` only to
@@ -159,9 +158,10 @@ fi
 4. **Clean up the run data.** Once you've captured anything you need from the report, delete the
    entire run dir (logs + all scratch) so nothing lingers:
    `PYTHONPATH=scripts python3 -m crucible clean --run "$RUN"` (refuses any path without a
-   `runlog.jsonl`). To clear **all** prior runs at once, remove the base: `rm -rf runs/` (or your
-   `--base-dir`). The Builder's implementation diff is already committed/in the branch — the run
-   dir is disposable provenance.
+   `runlog.jsonl`, and refuses a run still in progress unless you pass `--force`). To clear **all**
+   prior runs at once, remove the base: `rm -rf ~/.crucible/runs`
+   (or your `--base-dir`/`$CRUCIBLE_RUNS_DIR`). The Builder's implementation diff is already
+   committed/in the branch — the run dir is disposable provenance.
 
 ## Red flags
 
