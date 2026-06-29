@@ -7,6 +7,8 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-06-28
+
 ### Added
 - **Optional human-approval gate (default off).** New config flag `human_approval` (default
   `false`) plus a `crucible should-approve --run <dir>` command (prints `yes`/`no`, exits 0/1,
