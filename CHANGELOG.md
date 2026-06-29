@@ -7,6 +7,8 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-06-29
+
 ### Changed
 - **Runs default to `~/.crucible/runs`, never the target repo.** `init-run` now writes under
   `~/.crucible/runs` by default (override with `--base-dir` or `$CRUCIBLE_RUNS_DIR`), so running
