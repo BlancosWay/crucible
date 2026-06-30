@@ -7,6 +7,8 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-06-29
+
 ### Added
 - **Optional REPRODUCE gate for bug fixes (default off).** New config flag `reproduce_gate`
   (default `false`) + `crucible should-reproduce` command (yes/no, exit 0/1). When enabled, a
