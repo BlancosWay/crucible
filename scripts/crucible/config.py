@@ -18,6 +18,7 @@ DEFAULTS: dict[str, Any] = {
     "strict_rebuttal": False,
     "final_review": True,
     "human_approval": False,
+    "reproduce_gate": False,
 }
 
 VALID_ON_CAP = ("halt", "proceed_with_flags")
@@ -52,6 +53,7 @@ class Config:
     strict_rebuttal: bool
     final_review: bool
     human_approval: bool
+    reproduce_gate: bool
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Config":
@@ -90,6 +92,7 @@ class Config:
             strict_rebuttal=_require_bool("strict_rebuttal", merged["strict_rebuttal"]),
             final_review=_require_bool("final_review", merged["final_review"]),
             human_approval=_require_bool("human_approval", merged["human_approval"]),
+            reproduce_gate=_require_bool("reproduce_gate", merged["reproduce_gate"]),
         )
         cfg._validate()
         return cfg
@@ -128,6 +131,7 @@ class Config:
             "strict_rebuttal": self.strict_rebuttal,
             "final_review": self.final_review,
             "human_approval": self.human_approval,
+            "reproduce_gate": self.reproduce_gate,
         }
 
 

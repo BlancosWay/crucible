@@ -54,18 +54,18 @@ def _load_resolutions(path):
 
 
 def _validate_gate(gate: str) -> None:
-    """A gate is ``plan``, ``final``, or ``dep:<node-id>``. Reject anything else (e.g. a
-    typo like ``finale``) so a verdict/log is never recorded under a bogus, off-convention
+    """A gate is ``plan``, ``reproduce``, ``final``, or ``dep:<node-id>``. Reject anything else
+    (e.g. a typo like ``finale``) so a verdict/log is never recorded under a bogus, off-convention
     gate — which would otherwise silently use the dependency round cap and render as a
     spurious report section. The ``dep:`` id must be non-empty and free of surrounding
     whitespace (``dep:`` / ``dep:  `` are blank ids, not real nodes)."""
-    if gate in ("plan", "final"):
+    if gate in ("plan", "final", "reproduce"):
         return
     if gate.startswith("dep:"):
         node_id = gate[len("dep:"):]
         if node_id and node_id == node_id.strip():
             return
-    raise ValueError(f"invalid --gate {gate!r}; must be 'plan', 'final', or 'dep:<node-id>'")
+    raise ValueError(f"invalid --gate {gate!r}; must be 'plan', 'reproduce', 'final', or 'dep:<node-id>'")
 
 
 # A gate concludes with exactly one of these terminal events; a second one would silently
@@ -106,7 +106,7 @@ def _require_gate_not_terminal(run: RunLog, gate: str) -> None:
 
 
 def _max_rounds_for_gate(cfg: Config, gate: str) -> int:
-    return cfg.max_rounds_plan if gate == "plan" else cfg.max_rounds_dep
+    return cfg.max_rounds_plan if gate in ("plan", "reproduce") else cfg.max_rounds_dep
 
 
 def cmd_init_run(args) -> int:
@@ -248,7 +248,8 @@ def cmd_verdict(args) -> int:
     if resolutions_raw:
         run.append("builder_resolution", gate=args.gate, round=args.round, payload=resolutions_raw)
 
-    decision = decide(verdict, cfg, round_index=args.round, max_rounds=max_rounds, resolutions=resolutions)
+    decision = decide(verdict, cfg, round_index=args.round, max_rounds=max_rounds,
+                      resolutions=resolutions, always_halt=(args.gate == "reproduce"))
 
     # F6: persist both the parsed verdict and the Critic's full raw output. These are not
     # redundant: the report renders the parsed payload as a readable digest (verdict + summary
@@ -296,6 +297,17 @@ def cmd_should_approve(args) -> int:
     cfg = load_config(RunLog(args.run).path / "config.json")
     print("yes" if cfg.human_approval else "no")
     return 0 if cfg.human_approval else 1
+
+
+def cmd_should_reproduce(args) -> int:
+    """Deterministically answer whether to run the REPRODUCE gate (Stage 0) before PLAN.
+
+    Prints ``yes``/``no`` and exits 0/1 so the orchestrator gates bug-fix reproduction on
+    the config flag instead of eyeballing it. Default is ``no`` (skip; no behavior change).
+    """
+    cfg = load_config(RunLog(args.run).path / "config.json")
+    print("yes" if cfg.reproduce_gate else "no")
+    return 0 if cfg.reproduce_gate else 1
 
 
 def cmd_show_plan(args) -> int:
@@ -405,6 +417,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("should-approve"); s.add_argument("--run", required=True)
     s.set_defaults(func=cmd_should_approve)
+
+    s = sub.add_parser("should-reproduce"); s.add_argument("--run", required=True)
+    s.set_defaults(func=cmd_should_reproduce)
 
     s = sub.add_parser("show-plan"); s.add_argument("--run", required=True)
     s.set_defaults(func=cmd_show_plan)

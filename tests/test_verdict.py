@@ -73,6 +73,17 @@ def test_decide_proceeds_with_flags_at_cap_when_configured():
     assert [f.id for f in d.open_findings] == ["F1"]
 
 
+def test_decide_always_halt_caps_instead_of_proceeding():
+    # The REPRODUCE gate must never proceed_with_flags: an unconfirmed bug halts regardless of on_cap.
+    cfg = Config.from_dict({"on_cap": "proceed_with_flags"})
+    v = _verdict("REQUEST_CHANGES", [
+        {"id": "F1", "severity": "blocker", "location": "x", "claim": "c", "suggestion": "s"},
+    ])
+    d = decide(v, cfg, round_index=5, max_rounds=5, always_halt=True)
+    assert d.outcome == "CAPPED"
+    assert [f.id for f in d.open_findings] == ["F1"]
+
+
 def test_decide_consensus_beats_cap_even_with_proceed_config():
     cfg = Config.from_dict({"on_cap": "proceed_with_flags"})
     v = _verdict("APPROVE", [])

@@ -17,6 +17,7 @@ def test_defaults_match_spec():
     assert cfg.strict_rebuttal is False
     assert cfg.final_review is True
     assert cfg.human_approval is False
+    assert cfg.reproduce_gate is False
 
 
 def test_partial_override_keeps_other_defaults():
@@ -88,6 +89,17 @@ def test_human_approval_enabled_round_trips():
     cfg = Config.from_dict({"human_approval": True})
     again = Config.from_dict(cfg.to_dict())
     assert again.human_approval is True
+
+
+def test_string_boolean_reproduce_gate_raises():
+    with pytest.raises(ValueError, match="reproduce_gate must be a boolean"):
+        Config.from_dict({"reproduce_gate": "true"})
+
+
+def test_reproduce_gate_enabled_round_trips():
+    cfg = Config.from_dict({"reproduce_gate": True})
+    again = Config.from_dict(cfg.to_dict())
+    assert again.reproduce_gate is True
 
 
 def test_numeric_boolean_raises():
