@@ -7,6 +7,14 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
 
 ## [Unreleased]
 
+### Added
+- **Optional REPRODUCE gate for bug fixes (default off).** New config flag `reproduce_gate`
+  (default `false`) + `crucible should-reproduce` command (yes/no, exit 0/1). When enabled, a
+  Stage 0 runs before PLAN: the Builder reproduces the bug with a failing test via
+  `superpowers:systematic-debugging` and the Critic confirms it fails for the stated reason —
+  unconfirmed bugs halt before any planning, and the reproduction test carries forward as the
+  fix's done-signal. `reproduce` is now a valid gate (plan round cap). Default off = unchanged.
+
 ## [0.6.1] - 2026-06-29
 
 ### Fixed

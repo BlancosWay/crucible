@@ -8,5 +8,6 @@
   "blocking_severities": ["blocker", "major"],
   "strict_rebuttal": false,
   "final_review": true,
-  "human_approval": false
+  "human_approval": false,
+  "reproduce_gate": false
 }

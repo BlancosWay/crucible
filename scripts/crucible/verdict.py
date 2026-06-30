@@ -131,6 +131,7 @@ def decide(
     round_index: int,
     max_rounds: int,
     resolutions=None,
+    always_halt: bool = False,
 ) -> Decision:
     resolutions = resolutions or {}
     open_blocking = [
@@ -142,8 +143,9 @@ def decide(
         return Decision(outcome="CONSENSUS", open_findings=[])
     if round_index >= max_rounds:
         # At the cap with unresolved blockers, on_cap decides whether to halt (CAPPED) or
-        # advance past the gate carrying the unresolved findings as flags.
-        if cfg.on_cap == "proceed_with_flags":
+        # advance past the gate carrying the unresolved findings as flags. ``always_halt``
+        # gates (e.g. REPRODUCE) must never advance with flags — an unconfirmed result halts.
+        if cfg.on_cap == "proceed_with_flags" and not always_halt:
             return Decision(outcome="PROCEED_WITH_FLAGS", open_findings=open_blocking)
         return Decision(outcome="CAPPED", open_findings=open_blocking)
     return Decision(outcome="CHANGES", open_findings=open_blocking)

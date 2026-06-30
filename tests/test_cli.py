@@ -523,6 +523,32 @@ def test_should_approve_missing_config_is_clean(tmp_path):
     assert r.stdout.strip() not in ("yes", "no")
 
 
+def test_should_reproduce_no_by_default(tmp_path):
+    run_dir = _init(tmp_path)
+    r = _run(["should-reproduce", "--run", run_dir])
+    assert r.returncode == 1
+    assert r.stdout.strip() == "no"
+
+
+def test_should_reproduce_yes_when_enabled(tmp_path):
+    cfg = Path(tmp_path) / "c.json"
+    cfg.write_text(json.dumps({"reproduce_gate": True}))
+    run_dir = _run(["init-run", "--goal", "g", "--base-dir", str(tmp_path), "--config", str(cfg)]).stdout.strip()
+    r = _run(["should-reproduce", "--run", run_dir])
+    assert r.returncode == 0
+    assert r.stdout.strip() == "yes"
+
+
+def test_should_reproduce_missing_config_is_clean(tmp_path):
+    bare = Path(tmp_path) / "bare_repro"
+    bare.mkdir()
+    r = _run(["should-reproduce", "--run", str(bare)])
+    assert r.returncode != 0
+    assert "Traceback" not in r.stderr
+    assert "crucible:" in r.stderr
+    assert r.stdout.strip() not in ("yes", "no")
+
+
 # --- show-plan: echo the approved plan + DAG to the terminal at consensus -----
 
 def _approve_plan(tmp_path):
@@ -739,6 +765,30 @@ def test_verdict_rejects_invalid_gate_name(tmp_path):
     assert "gate" in r.stderr.lower()
     assert "CONSENSUS" not in r.stdout
     assert "critic_verdict" not in [e["event"] for e in _events(run_dir)]
+
+
+def test_verdict_accepts_reproduce_gate(tmp_path):
+    run_dir = _init(tmp_path)
+    vfile = Path(tmp_path) / "v.json"
+    vfile.write_text(json.dumps({"gate": "reproduce", "round": 1, "verdict": "APPROVE",
+                                 "summary": "bug reproduced", "findings": []}))
+    r = _run(["verdict", "--run", run_dir, "--gate", "reproduce", "--round", "1", "--file", str(vfile)])
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "CONSENSUS"
+
+
+def test_reproduce_gate_halts_even_with_proceed_with_flags(tmp_path):
+    # An unconfirmed reproduction must HALT (CAPPED), never PROCEED_WITH_FLAGS, regardless of on_cap.
+    cfg = Path(tmp_path) / "c.json"
+    cfg.write_text(json.dumps({"on_cap": "proceed_with_flags", "max_rounds_plan": 1}))
+    run_dir = _run(["init-run", "--goal", "g", "--base-dir", str(tmp_path), "--config", str(cfg)]).stdout.strip()
+    vfile = Path(tmp_path) / "v.json"
+    vfile.write_text(json.dumps({"gate": "reproduce", "round": 1, "verdict": "REQUEST_CHANGES", "summary": "no repro",
+                                 "findings": [{"id": "F1", "severity": "blocker", "location": "x", "claim": "c", "suggestion": "s"}]}))
+    r = _run(["verdict", "--run", run_dir, "--gate", "reproduce", "--round", "1", "--file", str(vfile)])
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "CAPPED"
+    assert not any(e["event"] == "gate_proceeded_with_flags" for e in _events(run_dir))
 
 
 def test_verdict_accepts_final_gate(tmp_path):

@@ -43,6 +43,29 @@ override. When the Builder responds to findings, record per-finding resolutions 
 `--resolutions "$RUN"/res.json`; the decision honors `defer_severities` and `strict_rebuttal`, and the
 resolutions are logged to the run for provenance.
 
+## Stage 0 — REPRODUCE gate (bug fixes; default off)
+
+For bug-fix goals, validate the bug **before** planning a fix. This is **off by default**; enable
+with `reproduce_gate: true` in the config. Gate it deterministically — key off the printed token so
+a config-load error halts:
+
+```bash
+case "$(PYTHONPATH=scripts python3 -m crucible should-reproduce --run "$RUN")" in
+  no)  : ;;                                    # default — skip straight to Stage 1 (PLAN)
+  yes) : ;;                                    # run the REPRODUCE gate below
+  *)   echo "crucible: cannot determine reproduce policy; halting" >&2; exit 1 ;;
+esac
+```
+
+On `yes`: as **Builder**, use **superpowers:systematic-debugging** to write a **failing test** that
+reproduces the reported bug; log it (`... log --event builder_output --gate reproduce --round N`).
+Dispatch the **Critic** to confirm the test fails **for the stated reason** (verdict `--gate
+reproduce`). `CONSENSUS` -> bug validated; carry that test into Stage 2 as the fix's done-signal,
+then go to PLAN. If the Builder cannot produce a failing repro, or the Critic rejects it -> **halt**
+and surface (the bug is unconfirmed; same posture as `on_cap: halt`) — do not plan. The reproduce
+gate **always halts** on unresolved findings even under `on_cap: proceed_with_flags` (an unconfirmed
+bug must never slip through to planning). On `no` (default), skip to Stage 1.
+
 ## Stage 1 — PLAN gate
 
 Rounds are 1-based and per-gate: start each gate at `N=1` and increment `N` on every
