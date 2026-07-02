@@ -204,8 +204,15 @@ def cmd_log(args) -> int:
     _validate_gate(args.gate)
     run = RunLog(args.run)
     _require_dep_node_in_dag(run, args.gate)
-    run.append(args.event, gate=args.gate, round=args.round, payload=_read_payload(args.file))
-    print("logged")
+    payload = _read_payload(args.file)
+    run.append(args.event, gate=args.gate, round=args.round, payload=payload)
+    if payload is None:
+        print(f"logged {args.event} (gate {args.gate}, round {args.round}); "
+              f"no --file, empty payload")
+    else:
+        print(f"logged {args.event} (gate {args.gate}, round {args.round}, "
+              f"{len(payload)} chars):")
+        sys.stdout.write(payload if payload.endswith("\n") else payload + "\n")
     return 0
 
 

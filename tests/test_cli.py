@@ -166,6 +166,38 @@ def test_log_stores_json_file_as_raw_text(tmp_path):
     assert _events(run_dir)[-1]["payload"] == raw
 
 
+def test_log_echoes_payload_to_terminal(tmp_path):
+    run_dir = _init(tmp_path)
+    f = Path(tmp_path) / "plan.md"
+    f.write_text("# Final plan\nStep 1: do the thing.\n")
+    r = _run(["log", "--run", run_dir, "--event", "builder_output",
+              "--gate", "plan", "--round", "1", "--file", str(f)])
+    assert r.returncode == 0, r.stderr
+    assert "logged builder_output" in r.stdout
+    assert "gate plan" in r.stdout and "round 1" in r.stdout
+    # the actual plan details are visible on the terminal, not just a confirmation
+    assert "# Final plan" in r.stdout and "Step 1: do the thing." in r.stdout
+
+
+def test_log_without_file_reports_empty_payload(tmp_path):
+    run_dir = _init(tmp_path)
+    r = _run(["log", "--run", run_dir, "--event", "critic_output",
+              "--gate", "plan", "--round", "1"])
+    assert r.returncode == 0, r.stderr
+    assert "empty payload" in r.stdout
+
+
+def test_log_echoes_non_ascii_payload_under_ascii_locale(tmp_path):
+    _require_ascii_locale()
+    run_dir = _init(tmp_path)
+    f = Path(tmp_path) / "plan.md"
+    f.write_text("# Plan café ✅\n", encoding="utf-8")
+    r = _run_ascii(["log", "--run", run_dir, "--event", "builder_output",
+                    "--gate", "plan", "--round", "1", "--file", str(f)])
+    assert r.returncode == 0, r.stderr                       # encoding-safe: no crash
+    assert _events(run_dir)[-1]["payload"] == "# Plan café ✅\n"  # stored verbatim (UTF-8 runlog)
+
+
 def test_verdict_cap_from_config_when_max_rounds_omitted(tmp_path):
     cfg = Path(tmp_path) / "c.json"
     cfg.write_text(json.dumps({"max_rounds_plan": 1}))
