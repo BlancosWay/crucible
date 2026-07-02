@@ -7,6 +7,8 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-07-01
+
 ### Changed
 - **`load-dag` and `log` now echo the plan/DAG details to the terminal when logged.**
   `crucible load-dag` prints the dependency tree in true build (topological) order right after
