@@ -30,6 +30,18 @@ def _read_payload(path):
     return Path(path).read_text(encoding="utf-8")
 
 
+def _print_dependency_tree(dag) -> None:
+    """Print the dependency tree in build (topological) order: one line per node with its
+    title and the ids it depends on. Shared by `load-dag` (echo at import) and `show-plan`.
+    Uses `topological_order()` — not the raw insertion `order` — so the 'build order' label
+    is honest even when the plan lists nodes out of order."""
+    print("=== Dependency tree (build order) ===")
+    for nid in dag.topological_order():
+        n = dag.nodes[nid]
+        deps = ", ".join(sorted(dag.deps.get(nid, ()))) or "—"
+        print(f"  {n.id}: {n.title}  [deps: {deps}]")
+
+
 def _load_resolutions(path):
     """Return (normalized {id: resolution}, raw {id: {...}}) from a resolutions file."""
     if not path:
@@ -134,6 +146,8 @@ def cmd_load_dag(args) -> int:
     run.save_dag(dag.to_dict())
     run.append("dag_loaded", gate="plan", nodes=len(dag.nodes))
     print(f"loaded {len(dag.nodes)} nodes")
+    print()
+    _print_dependency_tree(dag)
     return 0
 
 
@@ -327,11 +341,8 @@ def cmd_show_plan(args) -> int:
     print("=== Approved plan ===")
     print(plans[-1].get("payload", "(no plan artifact logged)") if plans else "(no plan artifact logged)")
     dag = DAG.from_dict(run.load_dag())
-    print("\n=== Dependency tree (build order) ===")
-    for nid in dag.order:
-        n = dag.nodes[nid]
-        deps = ", ".join(sorted(dag.deps.get(nid, ()))) or "—"
-        print(f"  {n.id}: {n.title}  [deps: {deps}]")
+    print()
+    _print_dependency_tree(dag)
     return 0
 
 

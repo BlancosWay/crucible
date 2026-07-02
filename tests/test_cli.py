@@ -595,6 +595,36 @@ def test_show_plan_requires_plan_consensus(tmp_path):
     assert "consensus" in r.stderr.lower()
 
 
+# --- load-dag echoes the dependency tree on the terminal ---------------------
+
+def test_load_dag_echoes_tree_in_build_order(tmp_path):
+    run_dir = _init(tmp_path)
+    # nodes listed OUT of build order: b before a, with b depends-on a
+    dag = {"nodes": [{"id": "b", "title": "Second"}, {"id": "a", "title": "First"}],
+           "edges": [{"from": "b", "depends_on": "a"}]}
+    f = Path(tmp_path) / "d.json"; f.write_text(json.dumps(dag))
+    r = _run(["load-dag", "--run", run_dir, "--file", str(f)])
+    assert r.returncode == 0, r.stderr
+    assert "loaded 2 nodes" in r.stdout
+    assert "Dependency tree" in r.stdout
+    # 'a' (a dependency of 'b') must be printed before 'b' — true build order, not input order
+    assert r.stdout.index("a: First") < r.stdout.index("b: Second")
+    assert "b: Second  [deps: a]" in r.stdout
+    assert "a: First  [deps: —]" in r.stdout
+
+
+def test_load_dag_echoes_tree_with_non_ascii_title_under_ascii_locale(tmp_path):
+    _require_ascii_locale()
+    run_dir = _init(tmp_path)
+    dagf = Path(tmp_path) / "dag.json"
+    dagf.write_text(json.dumps({"nodes": [{"id": "a", "title": "Café ✅", "description": "",
+                    "files": [], "test_plan": "", "status": "pending"}], "edges": []}),
+                    encoding="utf-8")
+    r = _run_ascii(["load-dag", "--run", run_dir, "--file", str(dagf)])
+    assert r.returncode == 0, r.stderr           # encoding-safe: no crash
+    assert "Dependency tree" in r.stdout          # tree is echoed
+
+
 # --- clean: delete a finished run's directory --------------------------------
 
 def test_clean_removes_run_dir(tmp_path):
