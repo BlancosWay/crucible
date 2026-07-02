@@ -7,6 +7,21 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
 
 ## [Unreleased]
 
+### Changed
+- **`load-dag` and `log` now echo the plan/DAG details to the terminal when logged.**
+  `crucible load-dag` prints the dependency tree in true build (topological) order right after
+  `loaded N nodes`, and `crucible log` prints the payload it recorded under an
+  `event/gate/round/size` header (or flags a missing `--file` as an empty payload) — so the plan
+  and dependency tree are visible *as they are recorded*, not only later via `show-plan` after PLAN
+  consensus. `show-plan` reuses the same renderer.
+
+### Fixed
+- **Console output no longer crashes on non-ASCII under an ASCII/`C` locale.** The CLI reconfigures
+  stdout/stderr to escape uncodable characters (`backslashreplace`) instead of aborting with
+  `UnicodeEncodeError` (previously `report`/`show-plan` could crash on a non-ASCII goal/title). File
+  provenance (runlog, `dag.json`, `report.*`) stays UTF-8. This also corrects the dependency-tree
+  "build order" label, which had rendered nodes in input order rather than topological order.
+
 ## [0.7.0] - 2026-06-29
 
 ### Added

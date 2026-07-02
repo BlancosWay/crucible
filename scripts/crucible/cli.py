@@ -30,6 +30,18 @@ def _read_payload(path):
     return Path(path).read_text(encoding="utf-8")
 
 
+def _print_dependency_tree(dag) -> None:
+    """Print the dependency tree in build (topological) order: one line per node with its
+    title and the ids it depends on. Shared by `load-dag` (echo at import) and `show-plan`.
+    Uses `topological_order()` — not the raw insertion `order` — so the 'build order' label
+    is honest even when the plan lists nodes out of order."""
+    print("=== Dependency tree (build order) ===")
+    for nid in dag.topological_order():
+        n = dag.nodes[nid]
+        deps = ", ".join(sorted(dag.deps.get(nid, ()))) or "—"
+        print(f"  {n.id}: {n.title}  [deps: {deps}]")
+
+
 def _load_resolutions(path):
     """Return (normalized {id: resolution}, raw {id: {...}}) from a resolutions file."""
     if not path:
@@ -134,6 +146,8 @@ def cmd_load_dag(args) -> int:
     run.save_dag(dag.to_dict())
     run.append("dag_loaded", gate="plan", nodes=len(dag.nodes))
     print(f"loaded {len(dag.nodes)} nodes")
+    print()
+    _print_dependency_tree(dag)
     return 0
 
 
@@ -190,8 +204,15 @@ def cmd_log(args) -> int:
     _validate_gate(args.gate)
     run = RunLog(args.run)
     _require_dep_node_in_dag(run, args.gate)
-    run.append(args.event, gate=args.gate, round=args.round, payload=_read_payload(args.file))
-    print("logged")
+    payload = _read_payload(args.file)
+    run.append(args.event, gate=args.gate, round=args.round, payload=payload)
+    if payload is None:
+        print(f"logged {args.event} (gate {args.gate}, round {args.round}); "
+              f"no --file, empty payload")
+    else:
+        print(f"logged {args.event} (gate {args.gate}, round {args.round}, "
+              f"{len(payload)} chars):")
+        sys.stdout.write(payload if payload.endswith("\n") else payload + "\n")
     return 0
 
 
@@ -327,11 +348,8 @@ def cmd_show_plan(args) -> int:
     print("=== Approved plan ===")
     print(plans[-1].get("payload", "(no plan artifact logged)") if plans else "(no plan artifact logged)")
     dag = DAG.from_dict(run.load_dag())
-    print("\n=== Dependency tree (build order) ===")
-    for nid in dag.order:
-        n = dag.nodes[nid]
-        deps = ", ".join(sorted(dag.deps.get(nid, ()))) or "—"
-        print(f"  {n.id}: {n.title}  [deps: {deps}]")
+    print()
+    _print_dependency_tree(dag)
     return 0
 
 
@@ -436,6 +454,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv=None) -> int:
+    # Make console output resilient to characters the terminal encoding cannot represent
+    # (e.g. a non-ASCII plan title or payload under an ASCII/C locale): escape them instead
+    # of aborting with UnicodeEncodeError. No-op under a UTF-8 locale. File provenance
+    # (runlog.jsonl, dag.json, report.*) is always written UTF-8 and is unaffected.
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(errors="backslashreplace")
+        except (AttributeError, ValueError, OSError):
+            pass
     parser = build_parser()
     args = parser.parse_args(argv)
     # Surface expected input/IO failures as a clean message instead of a raw traceback.

@@ -166,6 +166,38 @@ def test_log_stores_json_file_as_raw_text(tmp_path):
     assert _events(run_dir)[-1]["payload"] == raw
 
 
+def test_log_echoes_payload_to_terminal(tmp_path):
+    run_dir = _init(tmp_path)
+    f = Path(tmp_path) / "plan.md"
+    f.write_text("# Final plan\nStep 1: do the thing.\n")
+    r = _run(["log", "--run", run_dir, "--event", "builder_output",
+              "--gate", "plan", "--round", "1", "--file", str(f)])
+    assert r.returncode == 0, r.stderr
+    assert "logged builder_output" in r.stdout
+    assert "gate plan" in r.stdout and "round 1" in r.stdout
+    # the actual plan details are visible on the terminal, not just a confirmation
+    assert "# Final plan" in r.stdout and "Step 1: do the thing." in r.stdout
+
+
+def test_log_without_file_reports_empty_payload(tmp_path):
+    run_dir = _init(tmp_path)
+    r = _run(["log", "--run", run_dir, "--event", "critic_output",
+              "--gate", "plan", "--round", "1"])
+    assert r.returncode == 0, r.stderr
+    assert "empty payload" in r.stdout
+
+
+def test_log_echoes_non_ascii_payload_under_ascii_locale(tmp_path):
+    _require_ascii_locale()
+    run_dir = _init(tmp_path)
+    f = Path(tmp_path) / "plan.md"
+    f.write_text("# Plan café ✅\n", encoding="utf-8")
+    r = _run_ascii(["log", "--run", run_dir, "--event", "builder_output",
+                    "--gate", "plan", "--round", "1", "--file", str(f)])
+    assert r.returncode == 0, r.stderr                       # encoding-safe: no crash
+    assert _events(run_dir)[-1]["payload"] == "# Plan café ✅\n"  # stored verbatim (UTF-8 runlog)
+
+
 def test_verdict_cap_from_config_when_max_rounds_omitted(tmp_path):
     cfg = Path(tmp_path) / "c.json"
     cfg.write_text(json.dumps({"max_rounds_plan": 1}))
@@ -390,6 +422,23 @@ def test_init_run_preserves_non_ascii_config_under_ascii_locale(tmp_path):
     assert "modèle" in saved
 
 
+def test_cli_stdout_tolerates_non_ascii_under_ascii_locale(tmp_path):
+    # main() reconfigures stdout so echoing non-ASCII cannot abort with UnicodeEncodeError under
+    # an ASCII/C locale. Source the non-ASCII from a FILE (load-dag's tree) — NOT argv, which a
+    # C locale decodes via surrogateescape and would fail the UTF-8 run-log write for reasons
+    # unrelated to stdout. Assert it renders faithfully: raw if stdout is UTF-8, or backslash-
+    # escaped (é -> \xe9, ✅ -> \u2705) if stdout is ASCII — never dropped or replaced with '?'.
+    _require_ascii_locale()
+    run_dir = _init(tmp_path)
+    dagf = Path(tmp_path) / "dag.json"
+    dagf.write_text(json.dumps({"nodes": [{"id": "a", "title": "Café ✅", "description": "",
+                    "files": [], "test_plan": "", "status": "pending"}], "edges": []}),
+                    encoding="utf-8")
+    r = _run_ascii(["load-dag", "--run", run_dir, "--file", str(dagf)])
+    assert r.returncode == 0, r.stderr
+    assert ("Café ✅" in r.stdout) or (r"Caf\xe9 \u2705" in r.stdout)
+
+
 # --- clean error handling (M5) -----------------------------------------------
 
 def _assert_clean_error(r, *needles):
@@ -578,6 +627,36 @@ def test_show_plan_requires_plan_consensus(tmp_path):
     r = _run(["show-plan", "--run", run_dir])
     assert r.returncode != 0
     assert "consensus" in r.stderr.lower()
+
+
+# --- load-dag echoes the dependency tree on the terminal ---------------------
+
+def test_load_dag_echoes_tree_in_build_order(tmp_path):
+    run_dir = _init(tmp_path)
+    # nodes listed OUT of build order: b before a, with b depends-on a
+    dag = {"nodes": [{"id": "b", "title": "Second"}, {"id": "a", "title": "First"}],
+           "edges": [{"from": "b", "depends_on": "a"}]}
+    f = Path(tmp_path) / "d.json"; f.write_text(json.dumps(dag))
+    r = _run(["load-dag", "--run", run_dir, "--file", str(f)])
+    assert r.returncode == 0, r.stderr
+    assert "loaded 2 nodes" in r.stdout
+    assert "Dependency tree" in r.stdout
+    # 'a' (a dependency of 'b') must be printed before 'b' — true build order, not input order
+    assert r.stdout.index("a: First") < r.stdout.index("b: Second")
+    assert "b: Second  [deps: a]" in r.stdout
+    assert "a: First  [deps: —]" in r.stdout
+
+
+def test_load_dag_echoes_tree_with_non_ascii_title_under_ascii_locale(tmp_path):
+    _require_ascii_locale()
+    run_dir = _init(tmp_path)
+    dagf = Path(tmp_path) / "dag.json"
+    dagf.write_text(json.dumps({"nodes": [{"id": "a", "title": "Café ✅", "description": "",
+                    "files": [], "test_plan": "", "status": "pending"}], "edges": []}),
+                    encoding="utf-8")
+    r = _run_ascii(["load-dag", "--run", run_dir, "--file", str(dagf)])
+    assert r.returncode == 0, r.stderr           # encoding-safe: no crash
+    assert "Dependency tree" in r.stdout          # tree is echoed
 
 
 # --- clean: delete a finished run's directory --------------------------------
