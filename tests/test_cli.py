@@ -390,6 +390,21 @@ def test_init_run_preserves_non_ascii_config_under_ascii_locale(tmp_path):
     assert "modèle" in saved
 
 
+def test_cli_stdout_tolerates_non_ascii_under_ascii_locale(tmp_path):
+    # A command that echoes non-ASCII content to stdout (here `report`, which prints the goal)
+    # must escape uncodable characters instead of aborting with UnicodeEncodeError under a C locale.
+    _require_ascii_locale()
+    r = _run_ascii(["init-run", "--goal", "Café ✅ résumé", "--base-dir", str(tmp_path)])
+    assert r.returncode == 0, r.stderr
+    run_dir = r.stdout.strip()
+    r = _run_ascii(["report", "--run", run_dir])
+    assert r.returncode == 0, r.stderr
+    # Non-lossy: uncodable chars are backslash-escaped (é -> \xe9, ✅ -> \u2705), not dropped
+    # or replaced with '?'. This distinguishes 'backslashreplace' from lossy 'ignore'/'replace'.
+    assert r"Caf\xe9" in r.stdout
+    assert r"\u2705" in r.stdout
+
+
 # --- clean error handling (M5) -----------------------------------------------
 
 def _assert_clean_error(r, *needles):

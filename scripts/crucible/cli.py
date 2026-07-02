@@ -436,6 +436,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv=None) -> int:
+    # Make console output resilient to characters the terminal encoding cannot represent
+    # (e.g. a non-ASCII plan title or payload under an ASCII/C locale): escape them instead
+    # of aborting with UnicodeEncodeError. No-op under a UTF-8 locale. File provenance
+    # (runlog.jsonl, dag.json, report.*) is always written UTF-8 and is unaffected.
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(errors="backslashreplace")
+        except (AttributeError, ValueError, OSError):
+            pass
     parser = build_parser()
     args = parser.parse_args(argv)
     # Surface expected input/IO failures as a clean message instead of a raw traceback.
