@@ -7,6 +7,8 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-07-03
+
 ### Added
 - **`crucible verdict` now prints the two finding lists the Builder faces to the terminal (stderr).**
   After the outcome token, it surfaces *Findings the Builder will fix* (findings the Builder resolved
