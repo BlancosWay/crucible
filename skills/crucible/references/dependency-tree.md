@@ -31,3 +31,9 @@ The Builder emits the dependency tree as a single JSON object the `crucible` CLI
 
 Keep nodes small: one clear responsibility, independently testable. Files that change together
 belong to the same node.
+
+**Each node owns its own documentation.** A node that adds or changes behavior includes the
+documentation and `CHANGELOG` updates for *its own* deliverable in the same node — the docs live
+with the code they describe (they are among "the files that node owns"), never deferred to a
+separate catch-all node or a later step. Split documentation into its own node only when it is a
+standalone deliverable (e.g. a tutorial or guide rewrite) not tied to a specific code change.

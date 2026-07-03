@@ -25,6 +25,13 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
   `verdict` is decoupled from the DAG — and `show-plan` behavior is unchanged.
 
 ### Changed
+- **Crucible now makes "each node owns its own documentation" an explicit, Critic-enforced rule.**
+  `references/dependency-tree.md` and `references/builder-prompt.md` state that a dependency node
+  includes the documentation + `CHANGELOG` updates for *its own* deliverable (docs live with the code;
+  a docs-only node is reserved for standalone documentation not tied to a specific code change).
+  `references/critic-prompt.md` now flags a behavior-changing node that omits its own
+  documentation/`CHANGELOG` at **both** gates — the PLAN reviewer (plan / dependency tree) and the
+  IMPLEMENT/FINAL reviewer (dependency diff).
 - **Copilot CLI: the orchestrator now surfaces the approved plan + dependency tree in its response.**
   Because the Copilot CLI renders bash-tool output collapsed/truncated, the plan + DAG that `verdict`
   echoes at PLAN settlement (and `show-plan`, gate outcomes, and unresolved findings) were not visible

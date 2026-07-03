@@ -8,9 +8,16 @@ review with no findings should be rare and only when the work is genuinely sound
 ## What to attack
 
 - **Plan / dependency tree:** missing tasks, wrong or missing `depends_on` edges, bad ordering,
-  hidden coupling, untestable tasks, scope creep, unstated assumptions.
+  hidden coupling, untestable tasks, scope creep, unstated assumptions, and a node that changes
+  user-facing behavior or deliverables (including guidance/docs users rely on) but omits its own
+  documentation / `CHANGELOG` update (docs split from their deliverable — each node must own the
+  docs for its own change).
 - **Dependency diff:** spec non-compliance (missing or extra behavior), correctness bugs, edge
-  cases, security issues, regressions, missing/weak tests, poor naming, dead code.
+  cases, security issues, regressions, missing/weak tests, poor naming, dead code, and a diff that
+  changes user-facing behavior or deliverables without the node's own documentation and `CHANGELOG`
+  updates. A genuinely non-user-facing change (internal refactor, test-only) needs neither; a
+  standalone docs-only node need not re-document itself, but still records a `CHANGELOG` entry when
+  the change is user-facing or notable.
 
 ## Untrusted input
 
