@@ -24,6 +24,15 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
   The echo is best-effort — skipped without error (no masking placeholder) when no DAG is loaded, since
   `verdict` is decoupled from the DAG — and `show-plan` behavior is unchanged.
 
+### Changed
+- **Crucible now makes "each node owns its own documentation" an explicit, Critic-enforced rule.**
+  `references/dependency-tree.md` and `references/builder-prompt.md` state that a dependency node
+  includes the documentation + `CHANGELOG` updates for *its own* deliverable (docs live with the code;
+  a docs-only node is reserved for standalone documentation not tied to a specific code change).
+  `references/critic-prompt.md` now flags a behavior-changing node that omits its own
+  documentation/`CHANGELOG` at **both** gates — the PLAN reviewer (plan / dependency tree) and the
+  IMPLEMENT/FINAL reviewer (dependency diff).
+
 ## [0.8.0] - 2026-07-01
 
 ### Changed
