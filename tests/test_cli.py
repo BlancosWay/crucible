@@ -629,6 +629,112 @@ def test_show_plan_requires_plan_consensus(tmp_path):
     assert "consensus" in r.stderr.lower()
 
 
+def test_verdict_echoes_plan_and_dag_to_stderr_on_plan_consensus(tmp_path):
+    # Bug repro: when the PLAN gate settles, `crucible verdict` must deterministically echo the
+    # approved plan + dependency tree to the terminal (stderr) so the final plan/DAG is always
+    # visible before implementation — not reliant on a separately-invoked `show-plan` (which the
+    # orchestrator can skip). The outcome token must stay alone on stdout.
+    run_dir = _init(tmp_path)
+    df = Path(tmp_path) / "d.json"; df.write_text(json.dumps(_two_node_dag()))
+    _run(["load-dag", "--run", run_dir, "--file", str(df)])
+    plan = Path(tmp_path) / "plan.md"; plan.write_text("# Final plan\nDo the thing.")
+    _run(["log", "--run", run_dir, "--event", "builder_output", "--gate", "plan",
+          "--round", "1", "--file", str(plan)])
+    v = Path(tmp_path) / "v.json"
+    v.write_text(json.dumps({"gate": "plan", "round": 1, "verdict": "APPROVE",
+                             "summary": "ok", "findings": []}))
+    r = _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1", "--file", str(v)])
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "CONSENSUS"          # outcome token stays alone on stdout
+    assert "Approved plan" in r.stderr              # plan echoed to stderr at settlement
+    assert "Final plan" in r.stderr and "Do the thing." in r.stderr
+    assert "Dependency tree" in r.stderr            # dependency tree echoed to stderr
+
+
+def _load_two_node_dag(tmp_path, run_dir):
+    df = Path(tmp_path) / "d.json"; df.write_text(json.dumps(_two_node_dag()))
+    _run(["load-dag", "--run", run_dir, "--file", str(df)])
+
+
+def test_verdict_plan_changes_does_not_echo_plan(tmp_path):
+    # A non-settling plan outcome (CHANGES) must NOT echo the approved plan/DAG.
+    run_dir = _init(tmp_path)
+    _load_two_node_dag(tmp_path, run_dir)
+    v = Path(tmp_path) / "v.json"
+    v.write_text(json.dumps({"gate": "plan", "round": 1, "verdict": "REQUEST_CHANGES",
+                             "summary": "no", "findings": [{"id": "F1", "severity": "blocker",
+                             "location": "x", "claim": "c", "suggestion": "s"}]}))
+    r = _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1", "--file", str(v)])
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "CHANGES"
+    assert "Approved plan" not in (r.stdout + r.stderr)
+    assert "Dependency tree" not in (r.stdout + r.stderr)
+
+
+def test_verdict_plan_proceed_with_flags_echoes_plan(tmp_path):
+    # PROCEED_WITH_FLAGS advances past the PLAN gate, so it MUST echo the approved plan + DAG.
+    cfg = Path(tmp_path) / "c.json"; cfg.write_text(json.dumps({"on_cap": "proceed_with_flags"}))
+    r0 = _run(["init-run", "--goal", "g", "--base-dir", str(tmp_path), "--config", str(cfg)])
+    run_dir = r0.stdout.strip()
+    _load_two_node_dag(tmp_path, run_dir)
+    plan = Path(tmp_path) / "plan.md"; plan.write_text("# Final plan\nProceed body.")
+    _run(["log", "--run", run_dir, "--event", "builder_output", "--gate", "plan",
+          "--round", "5", "--file", str(plan)])
+    v = Path(tmp_path) / "v.json"
+    v.write_text(json.dumps({"gate": "plan", "round": 5, "verdict": "REQUEST_CHANGES",
+                             "summary": "unresolved", "findings": [{"id": "F1", "severity": "blocker",
+                             "location": "x", "claim": "c", "suggestion": "s"}]}))
+    r = _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "5", "--max-rounds", "5",
+              "--file", str(v)])
+    assert r.returncode == 0, r.stderr
+    assert "PROCEED_WITH_FLAGS" in r.stdout
+    assert "Approved plan" in r.stderr and "Proceed body." in r.stderr
+    assert "Dependency tree" in r.stderr
+    assert "Approved plan" not in r.stdout          # echo is stderr-only
+
+
+def test_verdict_plan_capped_does_not_echo_plan(tmp_path):
+    # CAPPED (halt) does not advance past the gate, so it must NOT echo the approved plan/DAG.
+    run_dir = _init(tmp_path)
+    _load_two_node_dag(tmp_path, run_dir)
+    v = Path(tmp_path) / "v.json"
+    v.write_text(json.dumps({"gate": "plan", "round": 5, "verdict": "REQUEST_CHANGES",
+                             "summary": "still broken", "findings": [{"id": "F1", "severity": "blocker",
+                             "location": "x", "claim": "c", "suggestion": "s"}]}))
+    r = _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "5", "--max-rounds", "5",
+              "--file", str(v)])
+    assert "CAPPED" in r.stdout
+    assert "Approved plan" not in (r.stdout + r.stderr)
+    assert "Dependency tree" not in (r.stdout + r.stderr)
+
+
+def test_verdict_dep_gate_consensus_does_not_echo_plan(tmp_path):
+    # The echo is PLAN-gate only: a dependency gate reaching consensus must not echo the plan.
+    run_dir = _init(tmp_path)
+    _load_two_node_dag(tmp_path, run_dir)          # node "a" exists so dep:a is a real gate
+    v = Path(tmp_path) / "v.json"
+    v.write_text(json.dumps({"gate": "dep:a", "round": 1, "verdict": "APPROVE",
+                             "summary": "ok", "findings": []}))
+    r = _run(["verdict", "--run", run_dir, "--gate", "dep:a", "--round", "1", "--file", str(v)])
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "CONSENSUS"
+    assert "Approved plan" not in (r.stdout + r.stderr)
+
+
+def test_verdict_plan_consensus_without_dag_does_not_crash_or_echo(tmp_path):
+    # verdict is decoupled from the DAG: a plan gate may settle with no DAG loaded. The echo is
+    # best-effort — it must skip silently (no crash, no masking placeholder) when absent.
+    run_dir = _init(tmp_path)                       # deliberately NO load-dag
+    v = Path(tmp_path) / "v.json"
+    v.write_text(json.dumps({"gate": "plan", "round": 1, "verdict": "APPROVE",
+                             "summary": "ok", "findings": []}))
+    r = _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1", "--file", str(v)])
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "CONSENSUS"
+    assert "Approved plan" not in (r.stdout + r.stderr)
+    assert "no dependency tree" not in (r.stdout + r.stderr).lower()  # no masking placeholder
+
+
 # --- load-dag echoes the dependency tree on the terminal ---------------------
 
 def test_load_dag_echoes_tree_in_build_order(tmp_path):

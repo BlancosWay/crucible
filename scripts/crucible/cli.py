@@ -30,16 +30,33 @@ def _read_payload(path):
     return Path(path).read_text(encoding="utf-8")
 
 
-def _print_dependency_tree(dag) -> None:
+def _print_dependency_tree(dag, stream=None) -> None:
     """Print the dependency tree in build (topological) order: one line per node with its
     title and the ids it depends on. Shared by `load-dag` (echo at import) and `show-plan`.
     Uses `topological_order()` — not the raw insertion `order` — so the 'build order' label
-    is honest even when the plan lists nodes out of order."""
-    print("=== Dependency tree (build order) ===")
+    is honest even when the plan lists nodes out of order. ``stream`` defaults to stdout,
+    resolved at call time so a redirected stdout (pytest capsys) is still captured."""
+    stream = sys.stdout if stream is None else stream
+    print("=== Dependency tree (build order) ===", file=stream)
     for nid in dag.topological_order():
         n = dag.nodes[nid]
         deps = ", ".join(sorted(dag.deps.get(nid, ()))) or "—"
-        print(f"  {n.id}: {n.title}  [deps: {deps}]")
+        print(f"  {n.id}: {n.title}  [deps: {deps}]", file=stream)
+
+
+def _print_approved_plan(run, dag, stream=None) -> None:
+    """Render the approved plan artifact + a given (already-loaded) dependency tree to
+    ``stream``. Shared by `show-plan` (stdout) and the automatic echo when the PLAN gate
+    settles (stderr). The caller loads the DAG, so each caller owns its strict-vs-tolerant
+    policy; this renderer never loads the DAG and never prints a masking placeholder."""
+    stream = sys.stdout if stream is None else stream
+    plans = [e for e in run.read_events()
+             if e.get("gate") == "plan" and e.get("event") == "builder_output"]
+    print("=== Approved plan ===", file=stream)
+    print(plans[-1].get("payload", "(no plan artifact logged)") if plans else "(no plan artifact logged)",
+          file=stream)
+    print(file=stream)
+    _print_dependency_tree(dag, stream)
 
 
 def _load_resolutions(path):
@@ -322,6 +339,19 @@ def cmd_verdict(args) -> int:
     fixed = [f for f in verdict.findings if resolutions.get(f.id) == "fixed"]
     unresolved = [f for f in decision.open_findings if resolutions.get(f.id) != "fixed"]
     _print_finding_lists(fixed, unresolved, resolutions, sys.stderr)
+    # When the PLAN gate settles, deterministically echo the approved plan + dependency tree to
+    # stderr so the final plan and DAG are always visible before implementation — not dependent on
+    # the orchestrator remembering to run `show-plan` (the reported bug). `verdict` is decoupled
+    # from the DAG (it can settle a plan gate without one), so this is best-effort: skip the echo
+    # (never crash, never print a masking placeholder) if no DAG is loaded. Only the two
+    # "advance past PLAN" outcomes echo; CHANGES/CAPPED do not.
+    if args.gate == "plan" and decision.outcome in ("CONSENSUS", "PROCEED_WITH_FLAGS"):
+        try:
+            settled_dag = DAG.from_dict(run.load_dag())
+        except FileNotFoundError:
+            settled_dag = None
+        if settled_dag is not None:
+            _print_approved_plan(run, settled_dag, sys.stderr)
     return 0
 
 
@@ -377,13 +407,8 @@ def cmd_show_plan(args) -> int:
                  if e.get("gate") == "plan" and e.get("event") in _TERMINAL_EVENTS]
     if not concluded:
         raise SystemExit("show-plan: the plan gate has not reached consensus yet; nothing to show")
-    plans = [e for e in run.read_events()
-             if e.get("gate") == "plan" and e.get("event") == "builder_output"]
-    print("=== Approved plan ===")
-    print(plans[-1].get("payload", "(no plan artifact logged)") if plans else "(no plan artifact logged)")
     dag = DAG.from_dict(run.load_dag())
-    print()
-    _print_dependency_tree(dag)
+    _print_approved_plan(run, dag, sys.stdout)
     return 0
 
 

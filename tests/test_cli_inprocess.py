@@ -237,3 +237,43 @@ def test_finding_line_format():
     assert _finding_line(f, "fixed") == "  F1 [blocker] cli.py:9: boom"  # 'fixed' suppressed
     g = Finding(id="F2", severity="minor", location="", claim="", suggestion="")
     assert _finding_line(g) == "  F2 [minor]"
+
+
+# --- _print_approved_plan renders plan + a given DAG to any stream ------------
+
+def test_print_approved_plan_renders_to_given_stream():
+    import io
+    from crucible.cli import _print_approved_plan
+    from crucible.dag import DAG
+
+    class _FakeRun:
+        def read_events(self):
+            return [{"gate": "plan", "event": "builder_output", "payload": "PLAN BODY TEXT"}]
+
+    dag = DAG.from_dict({"nodes": [{"id": "a", "title": "Node A"},
+                                   {"id": "b", "title": "Node B"}],
+                         "edges": [{"from": "b", "depends_on": "a"}]})
+    buf = io.StringIO()
+    _print_approved_plan(_FakeRun(), dag, buf)
+    out = buf.getvalue()
+    assert "=== Approved plan ===" in out
+    assert "PLAN BODY TEXT" in out
+    assert "=== Dependency tree (build order) ===" in out
+    assert out.index("a: Node A") < out.index("b: Node B")  # build order
+
+
+def test_print_approved_plan_without_plan_artifact_uses_placeholder():
+    import io
+    from crucible.cli import _print_approved_plan
+    from crucible.dag import DAG
+
+    class _FakeRun:
+        def read_events(self):
+            return []
+
+    dag = DAG.from_dict({"nodes": [{"id": "a", "title": "Node A"}], "edges": []})
+    buf = io.StringIO()
+    _print_approved_plan(_FakeRun(), dag, buf)
+    out = buf.getvalue()
+    assert "(no plan artifact logged)" in out
+    assert "a: Node A" in out
