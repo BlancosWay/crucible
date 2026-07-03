@@ -20,6 +20,16 @@ the **IMPLEMENT** and **FINAL** gates.
   Superpowers packaging does not expose that `agent_type`, fall back to the platform's built-in
   code-review agent on the critic model (or the **No-subagent fallback** below) and note the
   substitution in the run-log.
+- **Surfacing output to the human:** the Copilot CLI renders bash-tool output **collapsed/truncated**
+  in the transcript, so anything `crucible` prints — the **approved plan + dependency tree** that
+  `verdict` echoes at PLAN settlement, `show-plan`, gate outcomes, unresolved-finding lists, the run
+  report — is **not visible** to the human by default. After the PLAN gate settles, **surface the
+  approved plan + dependency tree in your response** (paste `crucible show-plan --run "$RUN"` output)
+  before implementing. Do **not** suppress the settling `verdict`'s stderr (avoid `2>/dev/null`) —
+  run it plainly so the Copilot bash tool captures stderr separately. Do **not** use `2>&1` where the
+  stdout outcome token is parsed: it merges the echo into stdout and breaks the "outcome token alone
+  on stdout" contract. Surface gate outcomes and any unresolved findings in your replies too, rather
+  than relying on the collapsed shell output.
 
 ## Claude Code / Codex
 

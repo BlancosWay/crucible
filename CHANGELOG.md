@@ -24,6 +24,14 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
   The echo is best-effort — skipped without error (no masking placeholder) when no DAG is loaded, since
   `verdict` is decoupled from the DAG — and `show-plan` behavior is unchanged.
 
+### Changed
+- **Copilot CLI: the orchestrator now surfaces the approved plan + dependency tree in its response.**
+  Because the Copilot CLI renders bash-tool output collapsed/truncated, the plan + DAG that `verdict`
+  echoes at PLAN settlement (and `show-plan`, gate outcomes, and unresolved findings) were not visible
+  to the human. `references/platform-notes.md` and `SKILL.md` now direct the assistant to surface the
+  approved plan + dependency tree in its reply (via `show-plan`) before implementing, and not to
+  suppress the settling `verdict`'s stderr.
+
 ## [0.8.0] - 2026-07-01
 
 ### Changed
