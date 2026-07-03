@@ -14,7 +14,7 @@ from crucible.config import Config, load_config
 from crucible.dag import DAG
 from crucible.report import render_html, render_markdown
 from crucible.runlog import RunLog, RunLogCorruptError, init_run
-from crucible.verdict import VALID_RESOLUTIONS, Verdict, decide
+from crucible.verdict import VALID_RESOLUTIONS, Finding, Verdict, decide
 
 # Events that `crucible log` may append. All other events are emitted by their own
 # commands (verdict, set-status, load-dag, init-run); allowing `log` to write them would
@@ -63,6 +63,33 @@ def _load_resolutions(path):
                              f"{VALID_RESOLUTIONS} (omit the id to leave a finding unresolved)")
         norm[fid] = res
     return norm, raw
+
+
+def _finding_line(f: Finding, resolution: str | None = None) -> str:
+    """One detailed terminal line for a finding: ``  id [severity] (resolution) location: claim``.
+
+    ``resolution`` is tagged only when it is a non-``fixed`` value that failed to clear (in
+    practice a ``wontfix`` under ``strict_rebuttal``); ``fixed`` is suppressed because it is
+    redundant with the "will fix" header. ``location``/``claim`` are omitted when empty."""
+    tag = f" ({resolution})" if resolution and resolution != "fixed" else ""
+    location = f" {f.location}" if f.location else ""
+    claim = f": {f.claim}" if f.claim else ""
+    return f"  {f.id} [{f.severity}]{tag}{location}{claim}"
+
+
+def _print_finding_lists(fixed, unresolved, resolutions, stream) -> None:
+    """Print the two disjoint finding lists the Builder faces, each only when non-empty:
+    the findings it committed to fix (resolution ``fixed``) and the still-open blocking
+    findings it has not (from the deterministic decision). Informational, so writes to
+    ``stream`` (stderr) — the outcome token stays alone on stdout."""
+    if fixed:
+        print(f"Findings the Builder will fix ({len(fixed)}):", file=stream)
+        for f in fixed:
+            print(_finding_line(f), file=stream)
+    if unresolved:
+        print(f"Unresolved blocking findings ({len(unresolved)}):", file=stream)
+        for f in unresolved:
+            print(_finding_line(f, resolutions.get(f.id)), file=stream)
 
 
 def _validate_gate(gate: str) -> None:
@@ -288,6 +315,13 @@ def cmd_verdict(args) -> int:
     elif decision.outcome != "CHANGES":  # CHANGES intentionally logs no terminal event
         raise SystemExit(f"unexpected decision outcome: {decision.outcome!r}")
     print(decision.outcome)
+    # Surface the two finding lists the Builder faces (fix vs. still-open blockers) to stderr,
+    # leaving the machine-readable outcome token alone on stdout. Disjoint by construction:
+    # `fixed` are the findings resolved `fixed`; `unresolved` are the decision's still-open
+    # blockers not marked `fixed`.
+    fixed = [f for f in verdict.findings if resolutions.get(f.id) == "fixed"]
+    unresolved = [f for f in decision.open_findings if resolutions.get(f.id) != "fixed"]
+    _print_finding_lists(fixed, unresolved, resolutions, sys.stderr)
     return 0
 
 

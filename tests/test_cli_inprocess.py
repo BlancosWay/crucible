@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from crucible.cli import _load_resolutions, _validate_gate, main
+from crucible.cli import _finding_line, _load_resolutions, _validate_gate, main
 
 
 def _init(tmp_path) -> str:
@@ -113,3 +113,127 @@ def test_main_verdict_consensus_returns_0(tmp_path, capsys):
     rc = main(["verdict", "--run", run, "--gate", "plan", "--round", "1", "--file", vfile])
     assert rc == 0
     assert capsys.readouterr().out.strip() == "CONSENSUS"
+
+
+# --- verdict prints "will fix" + "unresolved blocking" finding lists (stderr) ----------------
+
+def _init_cfg(tmp_path, cfg: dict) -> str:
+    cfile = _write(tmp_path, "cfg.json", cfg)
+    rc = main(["init-run", "--goal", "g", "--base-dir", str(tmp_path), "--config", cfile])
+    assert rc == 0
+    runs = [p for p in Path(tmp_path).iterdir() if p.is_dir()]
+    assert len(runs) == 1
+    return str(runs[0])
+
+
+def _find(fid, severity, location="cli.py:1", claim="c", suggestion="s"):
+    return {"id": fid, "severity": severity, "location": location, "claim": claim,
+            "suggestion": suggestion}
+
+
+def _run_verdict(tmp_path, run, findings, verdict_label, resolutions=None, round="1"):
+    vfile = _write(tmp_path, "v.json", {"gate": "plan", "round": int(round), "verdict": verdict_label,
+                                        "summary": "s", "findings": findings})
+    argv = ["verdict", "--run", run, "--gate", "plan", "--round", round, "--file", vfile]
+    if resolutions is not None:
+        rfile = _write(tmp_path, "res.json", resolutions)
+        argv += ["--resolutions", rfile]
+    return main(argv)
+
+
+def test_verdict_fixed_blocker_lists_in_fix_section(tmp_path, capsys):
+    run = _init(tmp_path)
+    capsys.readouterr()
+    rc = _run_verdict(tmp_path, run, [_find("F1", "blocker")], "REQUEST_CHANGES",
+                      resolutions={"F1": "fixed"})
+    out = capsys.readouterr()
+    assert rc == 0
+    assert out.out.strip() == "CHANGES"  # fixed does not clear -> still open, round < cap
+    assert "Findings the Builder will fix (1):" in out.err
+    assert "F1 [blocker]" in out.err
+    assert "Unresolved blocking findings" not in out.err
+
+
+def test_verdict_unresolved_blocker_lists_in_unresolved_section(tmp_path, capsys):
+    run = _init(tmp_path)
+    capsys.readouterr()
+    rc = _run_verdict(tmp_path, run, [_find("F1", "blocker")], "REQUEST_CHANGES")
+    out = capsys.readouterr()
+    assert rc == 0
+    assert out.out.strip() == "CHANGES"
+    assert "Unresolved blocking findings (1):" in out.err
+    assert "F1 [blocker]" in out.err
+    assert "Findings the Builder will fix" not in out.err
+
+
+def test_verdict_mixed_fix_and_unresolved_are_disjoint(tmp_path, capsys):
+    run = _init(tmp_path)
+    capsys.readouterr()
+    rc = _run_verdict(tmp_path, run, [_find("F1", "blocker"), _find("F2", "major")],
+                      "REQUEST_CHANGES", resolutions={"F1": "fixed"})
+    err = capsys.readouterr().err
+    assert rc == 0
+    assert "Findings the Builder will fix (1):" in err
+    assert "Unresolved blocking findings (1):" in err
+    fix_i = err.index("Findings the Builder will fix")
+    unres_i = err.index("Unresolved blocking findings")
+    assert fix_i < unres_i  # fix list printed first
+    assert "F1 [blocker]" in err[fix_i:unres_i] and "F2" not in err[fix_i:unres_i]
+    assert "F2 [major]" in err[unres_i:] and "F1" not in err[unres_i:]
+
+
+def test_verdict_fixed_nonblocking_still_in_fix_list_at_consensus(tmp_path, capsys):
+    run = _init(tmp_path)
+    capsys.readouterr()
+    rc = _run_verdict(tmp_path, run, [_find("F1", "minor")], "APPROVE",
+                      resolutions={"F1": "fixed"})
+    out = capsys.readouterr()
+    assert rc == 0
+    assert out.out.strip() == "CONSENSUS"  # a minor is non-blocking
+    assert "Findings the Builder will fix (1):" in out.err
+    assert "F1 [minor]" in out.err
+    assert "Unresolved blocking findings" not in out.err
+
+
+def test_verdict_wontfix_default_clears_prints_no_sections(tmp_path, capsys):
+    run = _init(tmp_path)
+    capsys.readouterr()
+    rc = _run_verdict(tmp_path, run, [_find("F1", "blocker")], "REQUEST_CHANGES",
+                      resolutions={"F1": "wontfix"})
+    out = capsys.readouterr()
+    assert rc == 0
+    assert out.out.strip() == "CONSENSUS"  # default strict_rebuttal=false -> wontfix clears
+    assert out.err.strip() == ""
+
+
+def test_verdict_clean_approve_prints_no_sections(tmp_path, capsys):
+    run = _init(tmp_path)
+    capsys.readouterr()
+    rc = _run_verdict(tmp_path, run, [], "APPROVE")
+    out = capsys.readouterr()
+    assert rc == 0
+    assert out.out.strip() == "CONSENSUS"
+    assert out.err.strip() == ""  # regression guard: stdout-only, no stderr noise
+
+
+def test_verdict_strict_rebuttal_wontfix_shows_in_unresolved_with_tag(tmp_path, capsys):
+    run = _init_cfg(tmp_path, {"strict_rebuttal": True})
+    capsys.readouterr()
+    rc = _run_verdict(tmp_path, run, [_find("F1", "blocker")], "REQUEST_CHANGES",
+                      resolutions={"F1": "wontfix"})
+    out = capsys.readouterr()
+    assert rc == 0
+    assert out.out.strip() == "CHANGES"  # strict: wontfix stays open, round < cap
+    assert "Unresolved blocking findings (1):" in out.err
+    assert "F1 [blocker] (wontfix)" in out.err
+    assert "Findings the Builder will fix" not in out.err
+
+
+def test_finding_line_format():
+    from crucible.verdict import Finding
+    f = Finding(id="F1", severity="blocker", location="cli.py:9", claim="boom", suggestion="s")
+    assert _finding_line(f) == "  F1 [blocker] cli.py:9: boom"
+    assert _finding_line(f, "wontfix") == "  F1 [blocker] (wontfix) cli.py:9: boom"
+    assert _finding_line(f, "fixed") == "  F1 [blocker] cli.py:9: boom"  # 'fixed' suppressed
+    g = Finding(id="F2", severity="minor", location="", claim="", suggestion="")
+    assert _finding_line(g) == "  F2 [minor]"

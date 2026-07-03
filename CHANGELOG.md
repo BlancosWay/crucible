@@ -7,6 +7,15 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
 
 ## [Unreleased]
 
+### Added
+- **`crucible verdict` now prints the two finding lists the Builder faces to the terminal (stderr).**
+  After the outcome token, it surfaces *Findings the Builder will fix* (findings the Builder resolved
+  `fixed`) and, logged separately, *Unresolved blocking findings* (the deterministic still-open blockers
+  not marked `fixed`) — each only when non-empty and in a detailed `id [severity] location: claim` form.
+  A non-`fixed` resolution that failed to clear (in practice a `wontfix` under `strict_rebuttal`) is tagged
+  on its line. The lists go to stderr so the machine-readable outcome (`CONSENSUS`/`CHANGES`/…) stays alone
+  on stdout.
+
 ## [0.8.0] - 2026-07-01
 
 ### Changed
