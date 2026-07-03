@@ -58,3 +58,31 @@ def test_critic_uses_superpowers_plan_reviewer_for_plan_gate():
 def test_skill_dispatches_code_reviewer_at_code_gates():
     skill = (REF.parent / "SKILL.md").read_text()
     assert "superpowers:code-reviewer" in skill
+
+
+def test_dependency_tree_doc_requires_per_node_docs():
+    # Each node must own the documentation + CHANGELOG updates for its own deliverable.
+    low = (REF / "dependency-tree.md").read_text().lower()
+    assert "changelog" in low
+    assert "documentation" in low or "docs" in low
+
+
+def test_builder_prompt_requires_per_node_docs():
+    low = (REF / "builder-prompt.md").read_text().lower()
+    assert "changelog" in low
+    assert "documentation" in low or "docs" in low
+
+
+def test_critic_prompt_flags_missing_node_docs_at_both_gates():
+    # The docs/CHANGELOG-ownership rule must be enforced at BOTH the PLAN gate
+    # (Plan / dependency tree) AND the IMPLEMENT/FINAL gate (Dependency diff), so a node
+    # whose diff omits its docs is caught at code review — not only at planning.
+    text = (REF / "critic-prompt.md").read_text()
+    assert "## What to attack" in text
+    attack = text.split("## What to attack", 1)[1].split("\n## ", 1)[0]
+    assert "Plan / dependency tree:" in attack and "Dependency diff:" in attack
+    plan_part, diff_part = attack.split("Dependency diff:", 1)
+    for part in (plan_part, diff_part):
+        low = part.lower()
+        assert "changelog" in low, "missing CHANGELOG rule in a critic attack bullet"
+        assert "documentation" in low or "docs" in low, "missing docs rule in a critic attack bullet"

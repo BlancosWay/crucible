@@ -14,6 +14,9 @@ spec-compliant work, and respond to each Critic finding honestly.
 
 1. Implement the node following Superpowers `subagent-driven-development` (TDD, frequent commits).
 2. Only touch the files that node owns; do not pull in future nodes' work.
+3. Include the documentation and `CHANGELOG` updates for *this node's* deliverable in this node —
+   they are part of the files this node owns. Don't defer docs to a later or separate node (a
+   docs-only node is only for standalone documentation not tied to a specific code change).
 
 ## Responding to Critic findings
 
