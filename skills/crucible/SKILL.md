@@ -83,6 +83,10 @@ new gate begins.
    findings into the verdict JSON (`critic-prompt.md`). Capture to `"$RUN"/verdict.json`. (See
    `references/platform-notes.md`.)
 5. Decide: `PYTHONPATH=scripts python3 -m crucible verdict --run "$RUN" --gate plan --round N --file "$RUN"/verdict.json`.
+   When the plan gate settles (`CONSENSUS`/`PROCEED_WITH_FLAGS`), `verdict` **automatically echoes
+   the approved plan + dependency tree to stderr** (the outcome token stays alone on stdout), so the
+   final plan and DAG are always shown before implementation — you do not have to remember to print
+   them. Then:
    - `CONSENSUS` -> proceed to the **approval gate** below.
    - `CHANGES` -> revise as Builder, increment N, then **repeat from step 2** — re-emit the
      dependency tree (the Critic reviews DAG edges/order too) and re-run `load-dag` so a
@@ -91,9 +95,9 @@ new gate begins.
    - `CAPPED` (`on_cap: halt`) -> stop and surface the unresolved findings; do not proceed.
    - `PROCEED_WITH_FLAGS` (`on_cap: proceed_with_flags`) -> proceed to the **approval gate** below;
      the unresolved findings are recorded (`gate_proceeded_with_flags`) and shown in the report.
-6. **Show the approved plan + DAG.** Once the plan gate settles (`CONSENSUS`/`PROCEED_WITH_FLAGS`),
-   print the final plan and dependency tree to the terminal so they are visible before any
-   implementation: `PYTHONPATH=scripts python3 -m crucible show-plan --run "$RUN"`.
+6. **Re-display the approved plan + DAG on demand (optional).** The settling `verdict` already
+   echoed them; to re-print later (e.g. before the approval gate), run
+   `PYTHONPATH=scripts python3 -m crucible show-plan --run "$RUN"` (stdout).
 
 ### Approval gate (optional human OK — default off)
 

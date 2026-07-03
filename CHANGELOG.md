@@ -16,6 +16,14 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
   on its line. The lists go to stderr so the machine-readable outcome (`CONSENSUS`/`CHANGES`/…) stays alone
   on stdout.
 
+### Fixed
+- **The approved plan + dependency tree are now echoed deterministically when the PLAN gate settles.**
+  `crucible verdict` prints the approved plan + DAG to stderr on `CONSENSUS`/`PROCEED_WITH_FLAGS` for the
+  `plan` gate (the outcome token stays alone on stdout), so the final plan/DAG is always visible before
+  implementation instead of relying on a separately-invoked `show-plan` that the orchestrator could skip.
+  The echo is best-effort — skipped without error (no masking placeholder) when no DAG is loaded, since
+  `verdict` is decoupled from the DAG — and `show-plan` behavior is unchanged.
+
 ## [0.8.0] - 2026-07-01
 
 ### Changed
