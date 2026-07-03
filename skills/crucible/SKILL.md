@@ -85,8 +85,9 @@ new gate begins.
 5. Decide: `PYTHONPATH=scripts python3 -m crucible verdict --run "$RUN" --gate plan --round N --file "$RUN"/verdict.json`.
    When the plan gate settles (`CONSENSUS`/`PROCEED_WITH_FLAGS`), `verdict` **automatically echoes
    the approved plan + dependency tree to stderr** (the outcome token stays alone on stdout), so the
-   final plan and DAG are always shown before implementation — you do not have to remember to print
-   them. Then:
+   final plan and DAG are shown before implementation **in a real terminal**. On the Copilot CLI,
+   bash-tool output is collapsed and not visible to the human, so you **must** surface them yourself
+   (step 6). Then:
    - `CONSENSUS` -> proceed to the **approval gate** below.
    - `CHANGES` -> revise as Builder, increment N, then **repeat from step 2** — re-emit the
      dependency tree (the Critic reviews DAG edges/order too) and re-run `load-dag` so a
@@ -95,9 +96,12 @@ new gate begins.
    - `CAPPED` (`on_cap: halt`) -> stop and surface the unresolved findings; do not proceed.
    - `PROCEED_WITH_FLAGS` (`on_cap: proceed_with_flags`) -> proceed to the **approval gate** below;
      the unresolved findings are recorded (`gate_proceeded_with_flags`) and shown in the report.
-6. **Re-display the approved plan + DAG on demand (optional).** The settling `verdict` already
-   echoed them; to re-print later (e.g. before the approval gate), run
-   `PYTHONPATH=scripts python3 -m crucible show-plan --run "$RUN"` (stdout).
+6. **Surface the approved plan + DAG.** On the Copilot CLI, bash-tool output is collapsed/truncated
+   in the transcript and **not visible** to the human, so the settling `verdict`'s stderr echo alone
+   is insufficient — you **must** surface the approved plan + dependency tree in your response before
+   implementing: run `PYTHONPATH=scripts python3 -m crucible show-plan --run "$RUN"` and paste its
+   output into your reply (see `references/platform-notes.md`). In a plain terminal the settling
+   `verdict` already echoed them, so there this is just a re-print.
 
 ### Approval gate (optional human OK — default off)
 

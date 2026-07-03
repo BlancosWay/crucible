@@ -32,6 +32,12 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
   `references/critic-prompt.md` now flags a behavior-changing node that omits its own
   documentation/`CHANGELOG` at **both** gates — the PLAN reviewer (plan / dependency tree) and the
   IMPLEMENT/FINAL reviewer (dependency diff).
+- **Copilot CLI: the orchestrator now surfaces the approved plan + dependency tree in its response.**
+  Because the Copilot CLI renders bash-tool output collapsed/truncated, the plan + DAG that `verdict`
+  echoes at PLAN settlement (and `show-plan`, gate outcomes, and unresolved findings) were not visible
+  to the human. `references/platform-notes.md` and `SKILL.md` now direct the assistant to surface the
+  approved plan + dependency tree in its reply (via `show-plan`) before implementing, and not to
+  suppress the settling `verdict`'s stderr.
 
 ## [0.8.0] - 2026-07-01
 
