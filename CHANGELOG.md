@@ -7,6 +7,16 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
 
 ## [Unreleased]
 
+### Added
+- **The run report now opens with a deterministic `## Summary` banner.** Above the dependency tree,
+  `crucible report` renders an overall run status — `CLEAN` / `FLAGGED` / `BLOCKED` / `IN PROGRESS`
+  (BLOCKED > FLAGGED > CLEAN > IN PROGRESS precedence) — plus gate-outcome counts
+  (`total · consensus · flagged · capped`) and the total unresolved blocking findings with a
+  per-gate id breakdown. It is derived purely from the run-log's own terminal events
+  (`gate_consensus` / `gate_proceeded_with_flags` / `gate_capped`) and DAG node statuses — no model
+  calls, no Critic prose, and every interpolated value is a literal label, an integer, or a
+  sanitized id, so it adds no injection surface.
+
 ## [0.9.0] - 2026-07-03
 
 ### Added

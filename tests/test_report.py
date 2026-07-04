@@ -259,3 +259,155 @@ def test_report_markdown_keeps_provenance_fence_raw(tmp_path):
     md = render_markdown(run)
     assert "raw <tag> kept <as-is>" in md          # markdown fence: full fidelity
     assert "raw &lt;tag&gt;" in render_html(run)    # html: escaped
+
+
+# --- run-level Summary banner ------------------------------------------------
+
+def _summary_block(md: str) -> str:
+    """The text of the `## Summary` section (up to the next `## ` heading)."""
+    assert "## Summary" in md, "no Summary section rendered"
+    return md.split("## Summary", 1)[1].split("\n## ", 1)[0]
+
+
+def _node(nid, status="done"):
+    return {"id": nid, "title": nid.upper(), "description": "", "files": [],
+            "test_plan": "", "status": status}
+
+
+def test_summary_before_dependency_tree(tmp_path):
+    run = _build_run(tmp_path)
+    md = render_markdown(run)
+    assert "## Summary" in md and "## Dependency tree" in md
+    assert md.index("## Summary") < md.index("## Dependency tree")
+
+
+def test_summary_clean_when_all_gates_consensus_and_dag_done(tmp_path):
+    cfg = Config.from_dict({})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    run.save_dag({"nodes": [_node("a")], "edges": []})
+    run.append("gate_consensus", gate="plan", round=1)
+    run.append("gate_consensus", gate="dep:a", round=1)
+    block = _summary_block(render_markdown(run))
+    assert "Status:** CLEAN" in block
+    assert "2 total" in block and "2 consensus" in block
+    assert "Unresolved blocking findings" not in block  # none, so line omitted
+
+
+def test_summary_blocked_when_a_gate_capped(tmp_path):
+    cfg = Config.from_dict({})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    run.save_dag({"nodes": [_node("a", status="done"), _node("b", status="blocked")], "edges": []})
+    run.append("gate_consensus", gate="plan", round=1)
+    run.append("gate_consensus", gate="dep:a", round=1)
+    run.append("gate_capped", gate="dep:b", round=5, open_findings=["F1", "F3"])
+    block = _summary_block(render_markdown(run))
+    assert "Status:** BLOCKED" in block
+    assert "1 capped" in block
+    assert "Unresolved blocking findings:** 2" in block
+    assert "F1" in block and "F3" in block
+    assert "dep:b" in block
+
+
+def test_summary_flagged_when_proceeded_with_flags_no_capped(tmp_path):
+    cfg = Config.from_dict({"on_cap": "proceed_with_flags"})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    run.save_dag({"nodes": [_node("a")], "edges": []})
+    run.append("gate_consensus", gate="plan", round=1)
+    run.append("gate_proceeded_with_flags", gate="dep:a", round=5, open_findings=["F2"])
+    block = _summary_block(render_markdown(run))
+    assert "Status:** FLAGGED" in block
+    assert "1 flagged" in block
+    assert "Unresolved blocking findings:** 1" in block and "F2" in block
+
+
+def test_summary_capped_beats_flagged_precedence(tmp_path):
+    cfg = Config.from_dict({"on_cap": "proceed_with_flags"})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    run.save_dag({"nodes": [_node("a"), _node("b")], "edges": []})
+    run.append("gate_proceeded_with_flags", gate="dep:a", round=5, open_findings=["F1"])
+    run.append("gate_capped", gate="dep:b", round=5, open_findings=["F2"])
+    block = _summary_block(render_markdown(run))
+    assert "Status:** BLOCKED" in block  # capped outranks flagged
+    assert "1 flagged" in block and "1 capped" in block
+    assert "Unresolved blocking findings:** 2" in block
+
+
+def test_summary_in_progress_when_gate_undecided(tmp_path):
+    cfg = Config.from_dict({})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    run.save_dag({"nodes": [_node("a", status="pending")], "edges": []})
+    # a critic_verdict but NO terminal event => undecided gate
+    run.append("critic_verdict", gate="plan", round=1, payload={
+        "verdict": "REQUEST_CHANGES", "summary": "s",
+        "findings": [{"id": "F1", "severity": "major", "location": "x", "claim": "c", "suggestion": "s"}]})
+    block = _summary_block(render_markdown(run))
+    assert "Status:** IN PROGRESS" in block
+
+
+def test_summary_in_progress_when_consensus_but_no_dag(tmp_path):
+    # F1: a consensus gate with no loaded DAG (fallback {"nodes": []}) must NOT read CLEAN.
+    cfg = Config.from_dict({})
+    run = init_run("g", cfg, base_dir=tmp_path)  # deliberately NO save_dag
+    run.append("gate_consensus", gate="plan", round=1)
+    block = _summary_block(render_markdown(run))
+    assert "Status:** IN PROGRESS" in block
+    assert "CLEAN" not in block
+
+
+def test_summary_in_progress_when_node_not_done(tmp_path):
+    cfg = Config.from_dict({})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    run.save_dag({"nodes": [_node("a", status="done"), _node("b", status="in_review")], "edges": []})
+    run.append("gate_consensus", gate="plan", round=1)
+    run.append("gate_consensus", gate="dep:a", round=1)
+    block = _summary_block(render_markdown(run))
+    assert "Status:** IN PROGRESS" in block  # a node still in_review
+
+
+def test_summary_excludes_critic_prose(tmp_path):
+    # F2: the banner must never interpolate untrusted Critic summary/claim text.
+    cfg = Config.from_dict({})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    run.save_dag({"nodes": [_node("a")], "edges": []})
+    run.append("critic_verdict", gate="dep:a", round=5, payload={
+        "verdict": "REQUEST_CHANGES", "summary": "MALICIOUSSUMMARYXYZZY",
+        "findings": [{"id": "F1", "severity": "blocker", "location": "x",
+                      "claim": "MALICIOUSCLAIMPLUGH", "suggestion": "s"}]})
+    run.append("gate_capped", gate="dep:a", round=5, open_findings=["F1"])
+    block = _summary_block(render_markdown(run))
+    assert "MALICIOUSSUMMARYXYZZY" not in block
+    assert "MALICIOUSCLAIMPLUGH" not in block
+    assert "F1" in block  # the id (sanitized) is fine; the prose is not
+
+
+def test_summary_sanitizes_finding_ids(tmp_path):
+    cfg = Config.from_dict({})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    run.save_dag({"nodes": [_node("a")], "edges": []})
+    run.append("gate_capped", gate="dep:a", round=5, open_findings=["F1|x<b>"])
+    block = _summary_block(render_markdown(run))
+    assert "Status:** BLOCKED" in block
+    # raw markdown/HTML breakers from the untrusted id must be neutralized
+    assert "|x<b>" not in block
+    assert "<b>" not in block
+
+
+def test_summary_ids_not_wrapped_in_code_spans(tmp_path):
+    # F1: untrusted gate/finding ids must be plain _san text, never wrapped in a backtick code
+    # span (a backtick in an id would otherwise break out — Markdown code spans ignore backslash
+    # escapes). This asserts the wrappers are absent while the ids still render.
+    cfg = Config.from_dict({})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    run.save_dag({"nodes": [_node("a")], "edges": []})
+    run.append("gate_capped", gate="dep:a", round=5, open_findings=["Fx"])
+    block = _summary_block(render_markdown(run))
+    assert "`dep:a`" not in block  # gate id not code-span-wrapped
+    assert "`Fx`" not in block     # finding id not code-span-wrapped
+    assert "dep:a" in block and "Fx" in block  # but present as plain text
+
+
+def test_summary_empty_run_is_in_progress(tmp_path):
+    cfg = Config.from_dict({})
+    run = init_run("g", cfg, base_dir=tmp_path)  # no dag, no gates
+    block = _summary_block(render_markdown(run))
+    assert "Status:** IN PROGRESS" in block
