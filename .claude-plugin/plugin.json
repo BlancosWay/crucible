@@ -1,6 +1,6 @@
 {
   "name": "crucible",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "description": "Two-model adversarial planning and implementation on Superpowers: a Builder model plans/implements while a Critic model reviews the plan, dependency tree, and each dependency in a loop until consensus or a round cap.",
   "author": {
     "name": "BlancosWay",

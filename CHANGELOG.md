@@ -7,12 +7,7 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
 
 ## [Unreleased]
 
-### Changed
-- **Copilot CLI: the approved plan + dependency tree must be surfaced *in full*.** `SKILL.md`
-  Stage 1 step 6 and `references/platform-notes.md`'s Copilot surfacing guidance now require pasting
-  the `crucible show-plan` output into the reply in full — the complete plan + dependency tree — and
-  forbid piping it through `head`/`tail`/`grep`/`sed` or otherwise truncating it to a fragment, since
-  the collapsed bash output is not what the human sees.
+## [0.10.0] - 2026-07-04
 
 ### Added
 - **The run report now opens with a deterministic `## Summary` banner.** Above the dependency tree,
@@ -31,6 +26,11 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
   their original emission order elsewhere in the report, preserving provenance.
 
 ### Changed
+- **Copilot CLI: the approved plan + dependency tree must be surfaced *in full*.** `SKILL.md`
+  Stage 1 step 6 and `references/platform-notes.md`'s Copilot surfacing guidance now require pasting
+  the `crucible show-plan` output into the reply in full — the complete plan + dependency tree — and
+  forbid piping it through `head`/`tail`/`grep`/`sed` or otherwise truncating it to a fragment, since
+  the collapsed bash output is not what the human sees.
 - **The Builder role now must ground every claim in a tool run.** `references/builder-prompt.md`
   requires that any statement about the code, tests, or environment come from a tool run *this turn*
   (cite the `file:line` or observed output), forbids inventing flags/paths/APIs/config keys, and
