@@ -165,7 +165,10 @@ def _run_summary_lines(events: list[dict[str, Any]], dag: dict[str, Any]) -> lis
         # any unexpected severity label (defensive) rendered sanitized, in deterministic order
         parts += [f"{sev_counts[s]} {_san(s)}" for s in sorted(sev_counts) if s not in order]
         if parts:
-            lines.append(f"**Unresolved by severity:** {' \u00b7 '.join(parts)}")
+            # Join outside the f-string expression: a backslash (here the \u00b7
+            # escape) inside an f-string '{...}' is a SyntaxError before Python 3.12.
+            detail = " \u00b7 ".join(parts)
+            lines.append(f"**Unresolved by severity:** {detail}")
     lines.append("")
     return lines
 
