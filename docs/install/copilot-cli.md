@@ -11,7 +11,7 @@ Follow the option that fits you: **[A — just run it](#option-a-just-run-it)** 
 
 - **GitHub Copilot CLI** (`copilot`) — `copilot --version`.
 - **Superpowers** installed (Crucible dispatches its `writing-plans` / `brainstorming` reviewers
-  and the `code-reviewer` agent). Verify Superpowers loads in your session.
+  and the `code-reviewer` reviewer). Verify Superpowers loads in your session.
 - **Python 3.11+** for the deterministic `crucible` CLI invoked by the skill.
 
 Crucible needs **no MCP servers and no API keys**.

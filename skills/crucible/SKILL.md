@@ -147,9 +147,10 @@ For each `$NODE`:
 1. `PYTHONPATH=scripts python3 -m crucible set-status --run "$RUN" --node "$NODE" --status in_progress`.
 2. As **Builder**, implement the node with **superpowers:subagent-driven-development** (TDD).
 3. Log the diff/output: `... log --event builder_output --gate dep:$NODE --round N --file "$RUN"/out.txt`.
-4. Dispatch the **Critic** as the **`superpowers:code-reviewer`** agent (on the critic model) with
-   `critic-prompt.md` + this node's diff. Capture its findings as `"$RUN"/verdict.json`. (See
-   `references/platform-notes.md`.)
+4. Dispatch the **Critic** as a **`general-purpose`** subagent on the critic model, seeded with the
+   **`superpowers:requesting-code-review`** `code-reviewer.md` template + `critic-prompt.md` + this
+   node's diff; map its findings into the `critic-prompt.md` verdict JSON as `"$RUN"/verdict.json`.
+   (See `references/platform-notes.md`.)
 5. `PYTHONPATH=scripts python3 -m crucible verdict --run "$RUN" --gate "dep:$NODE" --round N --file "$RUN"/verdict.json`.
    - `CONSENSUS` -> `set-status --node "$NODE" --status done`; continue the loop.
    - `CHANGES` -> revise, increment N, repeat from step 3.
@@ -175,8 +176,9 @@ actual FINAL dispatch on the flag so `no` genuinely skips it:
 
 ```bash
 if [ "$RUN_FINAL" = 1 ]; then
-  # Dispatch the Critic as the superpowers:code-reviewer agent (on the critic model) once
-  # over the whole implementation; loop at --gate final (round cap is max_rounds_dep) exactly
+  # Dispatch the Critic as a general-purpose subagent on the critic model, seeded with the
+  # superpowers requesting-code-review code-reviewer.md template, once over the whole
+  # implementation; loop at --gate final (round cap is max_rounds_dep) exactly
   # like a dependency gate: CONSENSUS -> finish; CHANGES -> revise and repeat; CAPPED -> halt
   # and surface; PROCEED_WITH_FLAGS -> finish with the unresolved findings flagged in the report.
   :

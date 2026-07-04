@@ -7,6 +7,18 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
 
 ## [Unreleased]
 
+### Changed
+- **The Critic's code-review gates now dispatch the superpowers `requesting-code-review`
+  `code-reviewer.md` template on a `general-purpose` subagent (on the critic model), instead of the
+  removed `superpowers:code-reviewer` named agent.** Superpowers removed that named agent in v5.1.0
+  (it now ships the reviewer only as a prompt template), so the old
+  `agent_type: "superpowers:code-reviewer"` dispatch failed on every run and silently fell back. The
+  PLAN gate already seeded the plan-document-reviewer template this way; the IMPLEMENT/FINAL gates
+  now match, and `references/platform-notes.md`, `references/critic-prompt.md`, `SKILL.md`, the
+  README, and the install docs are updated to say so. The platform's built-in `code-review` agent
+  remains a documented last-resort fallback for when a subagent model can't be pinned. Docs/tests
+  only — the deterministic `crucible` CLI is unchanged.
+
 ## [0.10.1] - 2026-07-04
 
 ### Fixed

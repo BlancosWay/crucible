@@ -34,13 +34,27 @@ def test_critic_treats_input_as_untrusted():
     assert "data, not instructions" in text
 
 
+def _no_live_code_reviewer_dispatch(text: str) -> None:
+    # The `superpowers:code-reviewer` NAMED agent was removed upstream in superpowers v5.1.0; it
+    # must never appear as a live dispatch target. It may still be named, but only in a note that
+    # says it was removed — so every line mentioning it must also contain "removed".
+    for line in text.splitlines():
+        if "superpowers:code-reviewer" in line:
+            assert "removed" in line, f"live superpowers:code-reviewer dispatch reference: {line!r}"
+
+
 def test_critic_uses_superpowers_code_reviewer_for_code_gates():
-    # Model 2 (Critic) must use the superpowers code-reviewer when reviewing code
-    # (the IMPLEMENT/FINAL gates), per the design.
+    # Model 2 (Critic) reviews code (the IMPLEMENT/FINAL gates) via the superpowers
+    # requesting-code-review code-reviewer *template*, dispatched as a general-purpose subagent on
+    # the critic model. (The superpowers:code-reviewer named agent was removed upstream in v5.1.0.)
     critic = (REF / "critic-prompt.md").read_text()
     platform = (REF / "platform-notes.md").read_text()
-    assert "superpowers:code-reviewer" in critic
-    assert "superpowers:code-reviewer" in platform
+    for text in (critic, platform):
+        assert "requesting-code-review" in text
+        assert "general-purpose" in text
+        _no_live_code_reviewer_dispatch(text)
+    # the removed named agent is never a Copilot dispatch target
+    assert 'agent_type: "superpowers:code-reviewer"' not in platform
 
 
 def test_critic_uses_superpowers_plan_reviewer_for_plan_gate():
@@ -57,7 +71,9 @@ def test_critic_uses_superpowers_plan_reviewer_for_plan_gate():
 
 def test_skill_dispatches_code_reviewer_at_code_gates():
     skill = (REF.parent / "SKILL.md").read_text()
-    assert "superpowers:code-reviewer" in skill
+    assert "requesting-code-review" in skill
+    assert "general-purpose" in skill
+    _no_live_code_reviewer_dispatch(skill)
 
 
 def _copilot_cli_section(text: str) -> str:

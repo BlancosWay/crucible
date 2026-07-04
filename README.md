@@ -7,8 +7,8 @@ the plan, the dependency tree, and every dependency as it is built — looping e
 Critic signs off (**consensus**) or a configured round cap is hit.
 
 The Critic runs on a **separate model** and is realized as the matching **Superpowers reviewer**:
-the `writing-plans` **plan-document-reviewer** at the PLAN gate, and the
-**`superpowers:code-reviewer`** agent at the IMPLEMENT and FINAL gates.
+the `writing-plans` **plan-document-reviewer** at the PLAN gate, and the `requesting-code-review`
+**code-reviewer** at the IMPLEMENT and FINAL gates.
 
 ## How it works
 
