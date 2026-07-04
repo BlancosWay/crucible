@@ -1182,6 +1182,29 @@ def test_set_status_force_overrides_and_is_recorded(tmp_path):
     assert forced and forced[-1]["node"] == "a"
 
 
+def test_set_status_done_refused_when_last_terminal_is_capped(tmp_path):
+    # Last-terminal semantics: an earlier gate_consensus followed by a later gate_capped for
+    # dep:a must be treated as capped, so a legacy/hand-edited runlog can't sneak a node to done.
+    run_dir = _init(tmp_path)
+    _load(run_dir, tmp_path, {"a": "pending"})
+    log = Path(run_dir) / "runlog.jsonl"
+    with log.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"event": "gate_consensus", "gate": "dep:a", "round": 1}) + "\n")
+        fh.write(json.dumps({"event": "gate_capped", "gate": "dep:a", "round": 2}) + "\n")
+    r = _run(["set-status", "--run", run_dir, "--node", "a", "--status", "done"])
+    assert r.returncode != 0 and "consensus" in r.stderr.lower()
+
+
+def test_set_status_force_does_not_bypass_dependency_check(tmp_path):
+    # --force overrides ONLY the node-gate requirement, never the C2 dependency check.
+    run_dir = _init(tmp_path)
+    _load(run_dir, tmp_path, {"a": "pending", "b": "pending"},
+          edges=[{"from": "b", "depends_on": "a"}])
+    r = _run(["set-status", "--run", run_dir, "--node", "b", "--status", "done", "--force"])
+    assert r.returncode != 0
+    assert "dependenc" in r.stderr.lower()
+
+
 # --- C3: a concluded gate cannot be re-decided --------------------------------
 
 def test_verdict_rejects_already_concluded_gate(tmp_path):
