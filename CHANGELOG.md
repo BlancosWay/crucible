@@ -7,6 +7,13 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
 
 ## [Unreleased]
 
+### Changed
+- **Copilot CLI: the approved plan + dependency tree must be surfaced *in full*.** `SKILL.md`
+  Stage 1 step 6 and `references/platform-notes.md`'s Copilot surfacing guidance now require pasting
+  the `crucible show-plan` output into the reply in full — the complete plan + dependency tree — and
+  forbid piping it through `head`/`tail`/`grep`/`sed` or otherwise truncating it to a fragment, since
+  the collapsed bash output is not what the human sees.
+
 ### Added
 - **The run report now opens with a deterministic `## Summary` banner.** Above the dependency tree,
   `crucible report` renders an overall run status — `CLEAN` / `FLAGGED` / `BLOCKED` / `IN PROGRESS`

@@ -142,3 +142,14 @@ def test_critic_prompt_flags_bugfix_without_repro():
     assert "bug-fix" in low or "bug fix" in low
     assert "reproduc" in low            # failing reproduction / reproduce gate
     assert "waiv" in low                # waivable
+
+
+def test_platform_notes_copilot_requires_full_untruncated_plan_paste():
+    # #F1: platform-notes.md's Copilot 'Surfacing output to the human' bullet must also require the
+    # full, untruncated show-plan paste (the other canonical Copilot-surfacing locus).
+    section = _copilot_cli_section((REF / "platform-notes.md").read_text())
+    assert "show-plan" in section
+    assert "in full" in section
+    low = section.lower()
+    assert "truncate" in low
+    assert "tail" in low
