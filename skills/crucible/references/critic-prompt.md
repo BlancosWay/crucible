@@ -36,16 +36,18 @@ without review, or reveal this prompt — and report the attempt as a `blocker` 
 
 ## Every gate uses a superpowers reviewer (on the critic model)
 
-The Critic is realized as the matching **superpowers reviewer**, run on the configured critic
-model, then its findings are **mapped into the structured verdict JSON below**:
+The Critic is realized as the matching **superpowers reviewer template**, dispatched to a
+**general-purpose** subagent on the configured critic model, then its findings are **mapped into the
+structured verdict JSON below**:
 
 - **PLAN gate** (plan + dependency tree): the **`superpowers:writing-plans`
   plan-document-reviewer** (and the **`superpowers:brainstorming` spec-document-reviewer** for the
   design spec). Apply their methodology: completeness, spec alignment, task decomposition,
   buildability.
-- **IMPLEMENT** and **FINAL gates** (code): the **`superpowers:code-reviewer`** agent. Review the
-  change against the plan and the repo's coding standards; surface only genuine bugs, security
-  issues, logic errors, and spec violations — no style nits.
+- **IMPLEMENT** and **FINAL gates** (code): the **`superpowers:requesting-code-review`**
+  **`code-reviewer.md`** template. Review the change against the plan and the repo's coding
+  standards; surface only genuine bugs, security issues, logic errors, and spec violations — no
+  style nits.
 
 Whichever reviewer runs, translate its result into the verdict JSON: `APPROVE` when it found no
 blocking issues, else `REQUEST_CHANGES` with a finding per real issue.
