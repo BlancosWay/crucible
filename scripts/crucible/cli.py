@@ -165,6 +165,15 @@ def _max_rounds_for_gate(cfg: Config, gate: str) -> int:
     return cfg.max_rounds_plan if gate in ("plan", "reproduce") else cfg.max_rounds_dep
 
 
+def _expected_round(run: RunLog, gate: str) -> int:
+    """The next review round for a gate, DERIVED from run history: one past the number of
+    ``critic_verdict`` events already logged for that gate. This makes round counting CLI-owned
+    (F1b) so a caller cannot skip to the cap or repeat a round to dodge it."""
+    prior = sum(1 for e in run.read_events()
+                if e.get("gate") == gate and e.get("event") == "critic_verdict")
+    return prior + 1
+
+
 def cmd_init_run(args) -> int:
     cfg = load_config(args.config) if args.config else Config.from_dict({})
     base = args.base_dir or os.environ.get("CRUCIBLE_RUNS_DIR") or str(Path.home() / ".crucible" / "runs")
@@ -301,6 +310,18 @@ def cmd_verdict(args) -> int:
     # node — both before anything is logged or decided.
     _require_gate_not_terminal(run, args.gate)
     _require_dep_node_in_dag(run, args.gate)
+
+    # F1b: the round is DERIVED from run history, not trusted from the caller. It must be exactly
+    # one past the number of prior review rounds for this gate — closing the bypass where a caller
+    # asserts round=max (immediate cap) or repeats a round to never cap. Checked after C3/C1 so a
+    # concluded/ghost gate is still rejected for its own reason first.
+    expected = _expected_round(run, args.gate)
+    if args.round != expected:
+        raise SystemExit(
+            f"verdict --round {args.round} does not match the expected round {expected} for gate "
+            f"{args.gate!r} ({expected - 1} prior review round(s) logged); rounds are derived from "
+            f"run history and must be consecutive starting at 1."
+        )
 
     # H1: reject a Critic verdict whose APPROVE/REQUEST_CHANGES label contradicts its
     # findings under the run's blocking_severities, before logging or deciding.

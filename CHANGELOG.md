@@ -12,6 +12,10 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
   consensus (or proceeded with flags); pass `--force` to override for recovery (recorded in the
   run-log). Previously a node whose gate was capped — or never reviewed at all — could be marked
   `done` and unblock its dependents, advancing the run past a halted/un-reviewed gate.
+- `verdict` now derives the review round from run history (one past the number of prior
+  `critic_verdict` events for the gate) and rejects any `--round` that isn't the next consecutive
+  round. Previously the caller-asserted `--round` could skip straight to the cap (immediate
+  `CAPPED`/`PROCEED_WITH_FLAGS`) or repeat a round forever, bypassing the round cap.
 
 ## [0.10.2] - 2026-07-04
 

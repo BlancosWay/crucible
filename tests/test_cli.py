@@ -81,10 +81,10 @@ def test_verdict_capped_outcome(tmp_path):
     run_dir = r.stdout.strip()
     vfile = Path(tmp_path) / "v.json"
     vfile.write_text(json.dumps({
-        "gate": "plan", "round": 5, "verdict": "REQUEST_CHANGES", "summary": "still broken",
+        "gate": "plan", "round": 1, "verdict": "REQUEST_CHANGES", "summary": "still broken",
         "findings": [{"id": "F1", "severity": "blocker", "location": "x", "claim": "c", "suggestion": "s"}],
     }))
-    r = _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "5", "--max-rounds", "5", "--file", str(vfile)])
+    r = _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1", "--max-rounds", "1", "--file", str(vfile)])
     assert "CAPPED" in r.stdout
 
 
@@ -95,16 +95,57 @@ def test_verdict_proceed_with_flags_outcome(tmp_path):
     run_dir = r.stdout.strip()
     vfile = Path(tmp_path) / "v.json"
     vfile.write_text(json.dumps({
-        "gate": "plan", "round": 5, "verdict": "REQUEST_CHANGES", "summary": "unresolved",
+        "gate": "plan", "round": 1, "verdict": "REQUEST_CHANGES", "summary": "unresolved",
         "findings": [{"id": "F1", "severity": "blocker", "location": "x", "claim": "c", "suggestion": "s"}],
     }))
-    r = _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "5", "--max-rounds", "5", "--file", str(vfile)])
+    r = _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1", "--max-rounds", "1", "--file", str(vfile)])
     assert r.returncode == 0, r.stderr
     assert "PROCEED_WITH_FLAGS" in r.stdout
     events = [json.loads(l) for l in (Path(run_dir) / "runlog.jsonl").read_text().splitlines() if l.strip()]
     proceeded = [e for e in events if e["event"] == "gate_proceeded_with_flags"]
     assert proceeded and proceeded[-1]["open_findings"] == ["F1"]
     assert not any(e["event"] == "gate_capped" for e in events)
+
+
+# --- F1b: verdict derives/validates the round from run history ----------------
+
+def test_verdict_rejects_round_jumped_ahead(tmp_path):
+    # First-ever review must be round 1; asserting round 5 is refused (closes the cap-bypass).
+    run_dir = _init(tmp_path)
+    v = Path(tmp_path) / "v.json"
+    v.write_text(json.dumps({"gate": "plan", "round": 5, "verdict": "APPROVE",
+                             "summary": "ok", "findings": []}))
+    r = _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "5", "--file", str(v)])
+    assert r.returncode != 0
+    assert "expected round 1" in r.stderr and "round 5" in r.stderr
+
+
+def test_verdict_rejects_repeated_round(tmp_path):
+    # Round 1 CHANGES then a second round-1 verdict is refused (expected 2) — no infinite round 1.
+    run_dir = _init(tmp_path)
+    v1 = Path(tmp_path) / "v1.json"
+    v1.write_text(json.dumps({"gate": "plan", "round": 1, "verdict": "REQUEST_CHANGES",
+                              "summary": "x", "findings": [{"id": "F1", "severity": "blocker",
+                              "location": "x", "claim": "c", "suggestion": "s"}]}))
+    assert _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1",
+                 "--file", str(v1)]).stdout.strip() == "CHANGES"
+    r = _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1", "--file", str(v1)])
+    assert r.returncode != 0 and "expected round 2" in r.stderr
+
+
+def test_verdict_accepts_consecutive_rounds(tmp_path):
+    run_dir = _init(tmp_path)
+    v1 = Path(tmp_path) / "v1.json"
+    v1.write_text(json.dumps({"gate": "plan", "round": 1, "verdict": "REQUEST_CHANGES",
+                              "summary": "x", "findings": [{"id": "F1", "severity": "blocker",
+                              "location": "x", "claim": "c", "suggestion": "s"}]}))
+    assert _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1",
+                 "--file", str(v1)]).stdout.strip() == "CHANGES"
+    v2 = Path(tmp_path) / "v2.json"
+    v2.write_text(json.dumps({"gate": "plan", "round": 2, "verdict": "APPROVE",
+                              "summary": "ok", "findings": []}))
+    assert _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "2",
+                 "--file", str(v2)]).stdout.strip() == "CONSENSUS"
 
 
 def test_log_appends_full_payload(tmp_path):
@@ -682,12 +723,12 @@ def test_verdict_plan_proceed_with_flags_echoes_plan(tmp_path):
     _load_two_node_dag(tmp_path, run_dir)
     plan = Path(tmp_path) / "plan.md"; plan.write_text("# Final plan\nProceed body.")
     _run(["log", "--run", run_dir, "--event", "builder_output", "--gate", "plan",
-          "--round", "5", "--file", str(plan)])
+          "--round", "1", "--file", str(plan)])
     v = Path(tmp_path) / "v.json"
-    v.write_text(json.dumps({"gate": "plan", "round": 5, "verdict": "REQUEST_CHANGES",
+    v.write_text(json.dumps({"gate": "plan", "round": 1, "verdict": "REQUEST_CHANGES",
                              "summary": "unresolved", "findings": [{"id": "F1", "severity": "blocker",
                              "location": "x", "claim": "c", "suggestion": "s"}]}))
-    r = _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "5", "--max-rounds", "5",
+    r = _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1", "--max-rounds", "1",
               "--file", str(v)])
     assert r.returncode == 0, r.stderr
     assert "PROCEED_WITH_FLAGS" in r.stdout
@@ -701,10 +742,10 @@ def test_verdict_plan_capped_does_not_echo_plan(tmp_path):
     run_dir = _init(tmp_path)
     _load_two_node_dag(tmp_path, run_dir)
     v = Path(tmp_path) / "v.json"
-    v.write_text(json.dumps({"gate": "plan", "round": 5, "verdict": "REQUEST_CHANGES",
+    v.write_text(json.dumps({"gate": "plan", "round": 1, "verdict": "REQUEST_CHANGES",
                              "summary": "still broken", "findings": [{"id": "F1", "severity": "blocker",
                              "location": "x", "claim": "c", "suggestion": "s"}]}))
-    r = _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "5", "--max-rounds", "5",
+    r = _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1", "--max-rounds", "1",
               "--file", str(v)])
     assert "CAPPED" in r.stdout
     assert "Approved plan" not in (r.stdout + r.stderr)
