@@ -7,6 +7,14 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
 
 ## [Unreleased]
 
+### Fixed
+- **`crucible report` no longer crashes the CLI on Python 3.11.** The 0.10.0 "Unresolved by
+  severity" line put the `\u00b7` separator's backslash inside an f-string `{...}` expression, which
+  is a `SyntaxError` before Python 3.12 (PEP 701) — so importing `report.py` broke the whole CLI for
+  users on the documented 3.11 floor. The join now happens outside the f-string. A new
+  `Minimum Python` CI job runs the suite under 3.11 (the `tests` job only used the newest `3.x`, so
+  this class of newer-only syntax slipped through) to keep it from regressing.
+
 ## [0.10.0] - 2026-07-04
 
 ### Added

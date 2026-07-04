@@ -68,6 +68,26 @@ jobs:
         # pytest.ini sets pythonpath=scripts, so the crucible package imports cleanly.
         run: python3 -m pytest -q
 
+  min-python:
+    name: Minimum Python
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Set up the documented minimum Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.11"
+      - name: Install pytest
+        run: python3 -m pip install --quiet pytest
+      - name: Run the suite on the documented floor (README says Python 3.11+)
+        # The `tests` job pins "3.x" (always the newest Python), so syntax or
+        # features that only work on a newer release would pass there yet break
+        # real 3.11 users — e.g. a backslash inside an f-string '{...}' expression,
+        # which is a SyntaxError before 3.12. Pinning the documented minimum here
+        # imports/parses every module under 3.11 so that class of regression fails
+        # loudly in CI instead of only in the field.
+        run: python3 -m pytest -q
+
   changelog:
     name: Changelog entry
     if: github.event_name == 'pull_request'
