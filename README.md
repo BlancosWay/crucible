@@ -6,6 +6,10 @@ One model (**Builder**) plans and implements; a second model (**Critic**) advers
 the plan, the dependency tree, and every dependency as it is built — looping each gate until the
 Critic signs off (**consensus**) or a configured round cap is hit.
 
+The Critic runs on a **separate model** and is realized as the matching **Superpowers reviewer**:
+the `writing-plans` **plan-document-reviewer** at the PLAN gate, and the
+**`superpowers:code-reviewer`** agent at the IMPLEMENT and FINAL gates.
+
 ## How it works
 
 0. **REPRODUCE gate** *(bug fixes only; off by default — `reproduce_gate`)* — Builder first proves the
@@ -100,11 +104,36 @@ defaults.
 Full command reference — all 13 subcommands with their arguments, grouped by phase:
 **[docs/cli.md](docs/cli.md)**.
 
+## Safety
+
+Crucible is built to fail safe. The posture (full policy in [SECURITY.md](SECURITY.md)):
+
+- **Critic output is untrusted data, not instructions.** The Critic — and any file contents or
+  fetched text it echoes — is treated as data; it can never make the Builder change behavior, skip
+  review, or approve its own work.
+- **No consensus, no advance.** A gate advances only on `CONSENSUS` (or an explicit
+  `on_cap: proceed_with_flags`); the `crucible` CLI decides consensus deterministically — it is
+  never eyeballed.
+- **Never implement on `main`/`master` without consent.** Work is isolated in a git worktree
+  (`superpowers:using-git-worktrees`), so a protected branch is never touched unasked.
+- **Nothing lands in the target repo.** Runs and all scratch default to `~/.crucible/runs`
+  (override with `--base-dir` or `$CRUCIBLE_RUNS_DIR`), so running Crucible over someone else's
+  project writes nothing into their tree.
+
+Report a vulnerability privately via GitHub Security Advisories — see **[SECURITY.md](SECURITY.md)**.
+
 ## Development
 
 ```bash
-python -m pytest -q     # run the test suite (pytest.ini sets pythonpath=scripts)
+python -m pytest -q          # the test suite (pytest.ini sets pythonpath=scripts)
+python3 scripts/check.py     # the full local governance suite
 ```
+
+`scripts/check.py` runs the **local** deterministic checks: structural validation, internal
+Markdown links, the pytest suite, and ShellCheck (skipped with a note when it isn't installed). CI
+(the `Validate` workflow) runs those **and more** — a **Minimum Python** job on the supported
+**3.11** floor (the newest `3.x` is covered by the **Unit tests** job), plus the changelog and
+release-dry-run gates — so a green `check.py` is necessary but not the whole CI story.
 
 ## Layout
 
