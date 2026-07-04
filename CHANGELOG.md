@@ -17,6 +17,13 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
   calls, no Critic prose, and every interpolated value is a literal label, an integer, or a
   sanitized id, so it adds no injection surface.
 
+### Changed
+- **The Builder role now must ground every claim in a tool run.** `references/builder-prompt.md`
+  requires that any statement about the code, tests, or environment come from a tool run *this turn*
+  (cite the `file:line` or observed output), forbids inventing flags/paths/APIs/config keys, and
+  requires labeling anything unverified — so the Builder can't advance a confident-but-unchecked
+  assertion.
+
 ## [0.9.0] - 2026-07-03
 
 ### Added

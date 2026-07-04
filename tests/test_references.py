@@ -110,3 +110,16 @@ def test_critic_prompt_flags_missing_node_docs_at_both_gates():
         low = part.lower()
         assert "changelog" in low, "missing CHANGELOG rule in a critic attack bullet"
         assert "documentation" in low or "docs" in low, "missing docs rule in a critic attack bullet"
+
+
+def test_builder_prompt_requires_grounding_claims():
+    # #4: the Builder must ground claims in a tool run this turn, cite concrete evidence, never
+    # invent specifics, and label unverified. Whitespace-normalized so line-wrapping can't hide a
+    # phrase; asserts the specific guardrails, not vacuous synonyms.
+    low = " ".join((REF / "builder-prompt.md").read_text().lower().split())
+    assert "tool run this turn" in low            # grounding: evidence from THIS turn
+    assert "file:line" in low                      # cite concrete evidence (file:line/observed output)
+    assert "invent" in low
+    for item in ("flag", "path", "api", "config key"):  # the specific forbidden invented specifics
+        assert item in low, f"builder-prompt must forbid inventing a {item}"
+    assert "unverified" in low
