@@ -110,3 +110,35 @@ def test_critic_prompt_flags_missing_node_docs_at_both_gates():
         low = part.lower()
         assert "changelog" in low, "missing CHANGELOG rule in a critic attack bullet"
         assert "documentation" in low or "docs" in low, "missing docs rule in a critic attack bullet"
+
+
+def test_builder_prompt_requires_grounding_claims():
+    # #4: the Builder must ground claims in a tool run this turn, cite concrete evidence, never
+    # invent specifics, and label unverified. Whitespace-normalized so line-wrapping can't hide a
+    # phrase; asserts the specific guardrails, not vacuous synonyms.
+    low = " ".join((REF / "builder-prompt.md").read_text().lower().split())
+    assert "tool run this turn" in low            # grounding: evidence from THIS turn
+    assert "file:line" in low                      # cite concrete evidence (file:line/observed output)
+    assert "invent" in low
+    for item in ("flag", "path", "api", "config key"):  # the specific forbidden invented specifics
+        assert item in low, f"builder-prompt must forbid inventing a {item}"
+    assert "unverified" in low
+
+
+def test_critic_prompt_verifies_test_evidence():
+    # #3: the Critic verifies the Builder's cited test evidence and runs a node's test_plan only
+    # on doubt/missing-evidence (conditional), never fabricating a pass — NOT mandatory reruns.
+    low = " ".join((REF / "critic-prompt.md").read_text().lower().split())
+    assert "test_plan" in low
+    assert "evidence" in low
+    assert "unverified" in low          # degrade to unverified when it can't run
+    assert "fabricate" in low or "never fabricate" in low  # no fabricated pass
+
+
+def test_critic_prompt_flags_bugfix_without_repro():
+    # #7: a behavioral bug-fix plan with no failing reproduction (and no reproduce gate / waiver)
+    # is a SOFT, WAIVABLE finding — not an unconditional demand.
+    low = " ".join((REF / "critic-prompt.md").read_text().lower().split())
+    assert "bug-fix" in low or "bug fix" in low
+    assert "reproduc" in low            # failing reproduction / reproduce gate
+    assert "waiv" in low                # waivable

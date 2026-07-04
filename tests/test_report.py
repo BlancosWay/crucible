@@ -411,3 +411,57 @@ def test_summary_empty_run_is_in_progress(tmp_path):
     run = init_run("g", cfg, base_dir=tmp_path)  # no dag, no gates
     block = _summary_block(render_markdown(run))
     assert "Status:** IN PROGRESS" in block
+
+
+def test_summary_unresolved_by_severity_breakdown(tmp_path):
+    # #6: the banner breaks the unresolved findings down by severity, derived from each gate's
+    # last critic_verdict payload (id -> severity), deterministic from the run-log.
+    cfg = Config.from_dict({})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    run.save_dag({"nodes": [_node("a")], "edges": []})
+    run.append("critic_verdict", gate="dep:a", round=5, payload={
+        "verdict": "REQUEST_CHANGES", "summary": "s",
+        "findings": [{"id": "F1", "severity": "blocker", "location": "x", "claim": "c", "suggestion": "s"},
+                     {"id": "F2", "severity": "major", "location": "y", "claim": "c", "suggestion": "s"}]})
+    run.append("gate_capped", gate="dep:a", round=5, open_findings=["F1", "F2"])
+    block = _summary_block(render_markdown(run))
+    assert "Unresolved by severity:" in block
+    sev_line = [l for l in block.splitlines() if "Unresolved by severity:" in l][0]
+    assert "1 blocker" in sev_line and "1 major" in sev_line
+    assert sev_line.index("blocker") < sev_line.index("major")  # canonical order
+
+
+def test_summary_by_severity_omits_zero_counts(tmp_path):
+    # two blockers, no majors -> "2 blocker", no "0 major" noise.
+    cfg = Config.from_dict({})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    run.save_dag({"nodes": [_node("a")], "edges": []})
+    run.append("critic_verdict", gate="dep:a", round=3, payload={
+        "verdict": "REQUEST_CHANGES", "summary": "s",
+        "findings": [{"id": "F1", "severity": "blocker", "location": "x", "claim": "c", "suggestion": "s"},
+                     {"id": "F2", "severity": "blocker", "location": "y", "claim": "c", "suggestion": "s"}]})
+    run.append("gate_capped", gate="dep:a", round=3, open_findings=["F1", "F2"])
+    block = _summary_block(render_markdown(run))
+    sev_line = [l for l in block.splitlines() if "Unresolved by severity:" in l][0]
+    assert "2 blocker" in sev_line
+    assert "major" not in sev_line and "0 " not in sev_line
+
+
+def test_summary_by_severity_unknown_bucket_when_id_absent(tmp_path):
+    # An open id not present in the gate's critic_verdict is counted defensively as "unknown".
+    cfg = Config.from_dict({})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    run.save_dag({"nodes": [_node("a")], "edges": []})
+    run.append("gate_capped", gate="dep:a", round=5, open_findings=["Fx"])  # no critic_verdict
+    block = _summary_block(render_markdown(run))
+    sev_line = [l for l in block.splitlines() if "Unresolved by severity:" in l][0]
+    assert "1 unknown" in sev_line
+
+
+def test_summary_no_by_severity_line_when_clean(tmp_path):
+    cfg = Config.from_dict({})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    run.save_dag({"nodes": [_node("a")], "edges": []})
+    run.append("gate_consensus", gate="dep:a", round=1)
+    block = _summary_block(render_markdown(run))
+    assert "Unresolved by severity" not in block

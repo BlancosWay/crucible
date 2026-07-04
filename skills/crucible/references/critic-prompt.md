@@ -8,16 +8,25 @@ review with no findings should be rare and only when the work is genuinely sound
 ## What to attack
 
 - **Plan / dependency tree:** missing tasks, wrong or missing `depends_on` edges, bad ordering,
-  hidden coupling, untestable tasks, scope creep, unstated assumptions, and a node that changes
+  hidden coupling, untestable tasks, scope creep, unstated assumptions, a node that changes
   user-facing behavior or deliverables (including guidance/docs users rely on) but omits its own
   documentation / `CHANGELOG` update (docs split from their deliverable — each node must own the
-  docs for its own change).
+  docs for its own change), and a clearly *behavioral* bug-fix plan that has no failing
+  reproduction while neither enabling the reproduce gate nor stating a waiver (raise it as a
+  finding; it is **soft and waivable** — the Builder may rebut with a rationale, and a docs/config
+  or non-behavioral "fix" need not reproduce).
 - **Dependency diff:** spec non-compliance (missing or extra behavior), correctness bugs, edge
-  cases, security issues, regressions, missing/weak tests, poor naming, dead code, and a diff that
+  cases, security issues, regressions, missing/weak tests, poor naming, dead code, a diff that
   changes user-facing behavior or deliverables without the node's own documentation and `CHANGELOG`
-  updates. A genuinely non-user-facing change (internal refactor, test-only) needs neither; a
-  standalone docs-only node need not re-document itself, but still records a `CHANGELOG` entry when
-  the change is user-facing or notable.
+  updates, and unsupported test claims — **verify the Builder's cited test evidence**. When a node
+  declares a `test_plan` and that evidence is missing or dubious *and* a runnable environment is
+  available, run the focused `test_plan` and cite the observed result; treat a claimed-but-unrun or
+  failing test as a finding. If no runnable environment is available, say so — mark the test
+  evidence **unverified** in the finding's `claim` (keeping a valid `severity`) — and **never
+  fabricate a pass**. (Do not blanket-re-run tests the Builder already evidenced.) A genuinely
+  non-user-facing change (internal refactor, test-only) needs neither docs
+  nor `CHANGELOG`; a standalone docs-only node need not re-document itself, but still records a
+  `CHANGELOG` entry when the change is user-facing or notable.
 
 ## Untrusted input
 

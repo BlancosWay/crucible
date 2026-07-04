@@ -191,3 +191,23 @@ def test_example_config_file_is_valid():
     root = pathlib.Path(__file__).resolve().parents[1]
     cfg = load_config(root / "config.example.json")
     assert cfg.on_cap in ("halt", "proceed_with_flags")
+
+
+def test_example_config_keys_match_defaults_exactly():
+    # #8: config.example.json must stay in lockstep with config.py DEFAULTS. `from_dict` already
+    # rejects an EXTRA example key, but a NEW `DEFAULTS` key the example omits would pass silently
+    # today. Assert bidirectional top-level parity, plus the nested builder/critic sub-object keys.
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parents[1]
+    example = json.loads((root / "config.example.json").read_text())
+    assert set(example) == set(DEFAULTS), (
+        "config.example.json top-level keys drifted from config.py DEFAULTS: "
+        f"only in example={sorted(set(example) - set(DEFAULTS))}, "
+        f"only in DEFAULTS={sorted(set(DEFAULTS) - set(example))}"
+    )
+    for role in ("builder", "critic"):
+        assert set(example[role]) == set(DEFAULTS[role]), (
+            f"config.example.json '{role}' keys drifted from DEFAULTS['{role}']: "
+            f"only in example={sorted(set(example[role]) - set(DEFAULTS[role]))}, "
+            f"only in DEFAULTS={sorted(set(DEFAULTS[role]) - set(example[role]))}"
+        )
