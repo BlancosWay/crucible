@@ -319,7 +319,10 @@ def _load(run_dir, tmp_path, nodes, edges=None):
     if r.returncode == 0:
         for nid, st in nodes.items():
             if st != "pending":
-                _run(["set-status", "--run", run_dir, "--node", nid, "--status", st])
+                # Fixture scaffolding fabricates arbitrary states; --force bypasses the
+                # done-gate requirement (H2). Assert it applied so setup can't silently no-op.
+                sr = _run(["set-status", "--run", run_dir, "--node", nid, "--status", st, "--force"])
+                assert sr.returncode == 0, sr.stderr
     return r
 
 
@@ -813,7 +816,7 @@ def test_clean_allows_finished_run(tmp_path):
     run_dir = _init(tmp_path)
     df = Path(tmp_path) / "d.json"; df.write_text(json.dumps(_two_node_dag()))
     _run(["load-dag", "--run", run_dir, "--file", str(df)])
-    _run(["set-status", "--run", run_dir, "--node", "a", "--status", "done"])
+    _run(["set-status", "--run", run_dir, "--node", "a", "--status", "done", "--force"])
     r = _run(["clean", "--run", run_dir])
     assert r.returncode == 0, r.stderr
     assert not Path(run_dir).exists()
@@ -1106,8 +1109,8 @@ def test_set_status_done_allowed_when_deps_done(tmp_path):
     run_dir = _init(tmp_path)
     _load(run_dir, tmp_path, {"a": "pending", "b": "pending"},
           edges=[{"from": "b", "depends_on": "a"}])
-    assert _run(["set-status", "--run", run_dir, "--node", "a", "--status", "done"]).returncode == 0
-    r = _run(["set-status", "--run", run_dir, "--node", "b", "--status", "done"])
+    assert _run(["set-status", "--run", run_dir, "--node", "a", "--status", "done", "--force"]).returncode == 0
+    r = _run(["set-status", "--run", run_dir, "--node", "b", "--status", "done", "--force"])
     assert r.returncode == 0, r.stderr
 
 
@@ -1118,6 +1121,65 @@ def test_set_status_blocked_not_gated_by_deps(tmp_path):
           edges=[{"from": "b", "depends_on": "a"}])
     r = _run(["set-status", "--run", run_dir, "--node", "b", "--status", "blocked"])
     assert r.returncode == 0, r.stderr
+
+
+# --- H2: set-status done requires the node's own dep gate to have been accepted ----
+
+def test_set_status_done_refused_without_accepted_gate(tmp_path):
+    # A node cannot be marked done until its OWN dep:<node> gate reached consensus/proceed.
+    run_dir = _init(tmp_path)
+    _load(run_dir, tmp_path, {"a": "pending"})           # no deps, no gate yet
+    r = _run(["set-status", "--run", run_dir, "--node", "a", "--status", "done"])
+    assert r.returncode != 0
+    assert "dep:a" in r.stderr and "consensus" in r.stderr.lower()
+
+
+def test_set_status_done_allowed_after_gate_consensus(tmp_path):
+    run_dir = _init(tmp_path)
+    _load(run_dir, tmp_path, {"a": "pending"})
+    v = Path(tmp_path) / "v.json"
+    v.write_text(json.dumps({"gate": "dep:a", "round": 1, "verdict": "APPROVE",
+                             "summary": "ok", "findings": []}))
+    assert _run(["verdict", "--run", run_dir, "--gate", "dep:a", "--round", "1",
+                 "--file", str(v)]).stdout.strip() == "CONSENSUS"
+    assert _run(["set-status", "--run", run_dir, "--node", "a", "--status", "done"]).returncode == 0
+
+
+def test_set_status_done_allowed_after_proceed_with_flags(tmp_path):
+    cfg = Path(tmp_path) / "c.json"; cfg.write_text(json.dumps({"on_cap": "proceed_with_flags"}))
+    r0 = _run(["init-run", "--goal", "g", "--base-dir", str(tmp_path), "--config", str(cfg)])
+    run_dir = r0.stdout.strip()
+    _load(run_dir, tmp_path, {"a": "pending"})
+    v = Path(tmp_path) / "v.json"
+    v.write_text(json.dumps({"gate": "dep:a", "round": 1, "verdict": "REQUEST_CHANGES",
+                             "summary": "x", "findings": [{"id": "F1", "severity": "blocker",
+                             "location": "x", "claim": "c", "suggestion": "s"}]}))
+    assert "PROCEED_WITH_FLAGS" in _run(["verdict", "--run", run_dir, "--gate", "dep:a",
+        "--round", "1", "--max-rounds", "1", "--file", str(v)]).stdout
+    assert _run(["set-status", "--run", run_dir, "--node", "a", "--status", "done"]).returncode == 0
+
+
+def test_set_status_done_refused_after_gate_capped(tmp_path):
+    run_dir = _init(tmp_path)
+    _load(run_dir, tmp_path, {"a": "pending"})
+    v = Path(tmp_path) / "v.json"
+    v.write_text(json.dumps({"gate": "dep:a", "round": 1, "verdict": "REQUEST_CHANGES",
+                             "summary": "x", "findings": [{"id": "F1", "severity": "blocker",
+                             "location": "x", "claim": "c", "suggestion": "s"}]}))
+    assert "CAPPED" in _run(["verdict", "--run", run_dir, "--gate", "dep:a", "--round", "1",
+                             "--max-rounds", "1", "--file", str(v)]).stdout
+    r = _run(["set-status", "--run", run_dir, "--node", "a", "--status", "done"])
+    assert r.returncode != 0 and "consensus" in r.stderr.lower()
+
+
+def test_set_status_force_overrides_and_is_recorded(tmp_path):
+    run_dir = _init(tmp_path)
+    _load(run_dir, tmp_path, {"a": "pending"})
+    r = _run(["set-status", "--run", run_dir, "--node", "a", "--status", "done", "--force"])
+    assert r.returncode == 0, r.stderr
+    forced = [e for e in _events(run_dir)
+              if e["event"] == "node_status_change" and e.get("forced")]
+    assert forced and forced[-1]["node"] == "a"
 
 
 # --- C3: a concluded gate cannot be re-decided --------------------------------

@@ -234,9 +234,28 @@ def cmd_set_status(args) -> int:
         if unmet:
             raise SystemExit(f"set-status: cannot set {args.node!r} to {args.status!r} while these "
                              f"dependencies are not done: {unmet}")
+    # H2: a node may only be marked `done` once its OWN review gate (dep:<node>) reached a terminal
+    # ADVANCE outcome — gate_consensus or gate_proceeded_with_flags. A gate_capped (halt) does NOT
+    # qualify. Use LAST-terminal-event semantics (matching report.py) so a runlog where an earlier
+    # consensus is followed by a later gate_capped is correctly treated as capped. Without this,
+    # `next` would schedule dependents of a node whose review the CLI decided must halt (or that
+    # was never reviewed), advancing past a gate without consensus. `--force` is the explicit,
+    # logged human recovery override.
+    if args.status == "done" and not args.force:
+        node_gate = f"dep:{args.node}"
+        terminal = [e.get("event") for e in run.read_events()
+                    if e.get("gate") == node_gate
+                    and e.get("event") in ("gate_consensus", "gate_proceeded_with_flags", "gate_capped")]
+        accepted = bool(terminal) and terminal[-1] in ("gate_consensus", "gate_proceeded_with_flags")
+        if not accepted:
+            raise SystemExit(
+                f"set-status: refusing to mark {args.node!r} done — its review gate {node_gate!r} "
+                f"has not reached consensus (or proceeded with flags). Run the gate to a terminal "
+                f"advance first, or pass --force to override (recorded)."
+            )
     dag.set_status(args.node, args.status)
     run.save_dag(dag.to_dict())
-    run.append("node_status_change", node=args.node, status=args.status)
+    run.append("node_status_change", node=args.node, status=args.status, forced=bool(args.force))
     print(f"{args.node} -> {args.status}")
     return 0
 
@@ -472,6 +491,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("set-status"); s.add_argument("--run", required=True)
     s.add_argument("--node", required=True); s.add_argument("--status", required=True)
+    s.add_argument("--force", action="store_true",
+                   help="override the node-gate-consensus requirement when marking done (recovery; logged)")
     s.set_defaults(func=cmd_set_status)
 
     s = sub.add_parser("log"); s.add_argument("--run", required=True); s.add_argument("--event", required=True)

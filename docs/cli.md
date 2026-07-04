@@ -35,7 +35,7 @@ is the path `init-run` printed.
 | Command | Arguments | Behavior |
 |---------|-----------|----------|
 | `next` | `--run RUN` (required) | Print the next ready node id on stdout (empty line when every node is `done`). If no node can be scheduled: exit **4** when work is still in flight, exit **3** when the run is STUCK — both with the unfinished nodes and their unmet deps on stderr. |
-| `set-status` | `--run RUN`, `--node NODE`, `--status STATUS` (all required) | Set a node's status. Refuses to move a node to a work status (`in_progress`/`in_review`/`done`) while any dependency is not `done`. |
+| `set-status` | `--run RUN`, `--node NODE`, `--status STATUS` (all required); `--force` (optional) | Set a node's status. Refuses to move a node to a work status (`in_progress`/`in_review`/`done`) while any dependency is not `done`. Also refuses to mark a node `done` unless its own `dep:<node>` gate reached consensus (or proceeded with flags) — a capped or never-reviewed node is rejected. `--force` overrides that gate requirement for recovery; the override is recorded only in run-log provenance (the `node_status_change` `forced` flag), so a `--force`d/un-gated node can still render `CLEAN` in the report. |
 | `status` | `--run RUN` (required) | Print run progress as JSON (node counts by status). |
 
 ## Record gates & adjudicate verdicts

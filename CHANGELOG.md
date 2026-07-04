@@ -7,6 +7,12 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
 
 ## [Unreleased]
 
+### Fixed
+- `set-status` now refuses to mark a node `done` unless its own `dep:<node>` gate reached
+  consensus (or proceeded with flags); pass `--force` to override for recovery (recorded in the
+  run-log). Previously a node whose gate was capped — or never reviewed at all — could be marked
+  `done` and unblock its dependents, advancing the run past a halted/un-reviewed gate.
+
 ## [0.10.2] - 2026-07-04
 
 ### Changed
