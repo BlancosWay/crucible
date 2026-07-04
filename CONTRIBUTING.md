@@ -42,8 +42,9 @@ python3 scripts/check.py --install-hook
 
 ## Pull requests
 
-Every PR runs the `Validate` workflow; the required checks must pass before merge:
-**Structural validation**, **Markdown links**, **ShellCheck**, **Unit tests**, **Changelog entry**.
+Every PR runs the `Validate` workflow; its checks must pass before merge:
+**Structural validation**, **Markdown links**, **ShellCheck**, **Unit tests**, **Minimum Python**
+(the suite on the documented 3.11 floor), **Changelog entry**, and **Release dry run**.
 
 - Update [CHANGELOG.md](CHANGELOG.md) under `## [Unreleased]` for any shipped-path change
   (`scripts/`, `skills/`, `commands/`). If a change truly needs no entry, put `[skip changelog]` in
