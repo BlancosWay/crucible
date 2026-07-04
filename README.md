@@ -8,29 +8,39 @@ Critic signs off (**consensus**) or a configured round cap is hit.
 
 ## How it works
 
+0. **REPRODUCE gate** *(bug fixes only; off by default — `reproduce_gate`)* — Builder first proves the
+   bug with a **failing test**; the Critic confirms the test genuinely reproduces it before any plan.
 1. **PLAN gate** — Builder uses Superpowers `writing-plans` to produce a plan **and** a dependency
-   tree (DAG). Critic reviews both; loop until consensus or `max_rounds_plan`.
+   tree (DAG). Critic reviews both; loop until consensus or `max_rounds_plan`. Optionally pause here
+   for your explicit OK after consensus (`human_approval`).
 2. **IMPLEMENT gates** — for each dependency in topological order, Builder implements it
    (`subagent-driven-development`, TDD) and the Critic reviews that diff; loop until consensus or
    `max_rounds_dep`.
-3. **FINAL gate** — optional whole-implementation review, then a deterministic run report.
+3. **FINAL gate** — optional whole-implementation review (`final_review`), then a deterministic run
+   report.
 
 Consensus = Critic returns `APPROVE` (no open findings whose severity is in the configured
 `blocking_severities`, default `blocker`/`major`). On a round cap without
-consensus, Crucible **halts and surfaces** the unresolved findings (configurable).
+consensus, Crucible **halts and surfaces** the unresolved findings (configurable via `on_cap`).
 
-## Defaults
+## Configuration
 
-| Setting | Default |
-|---------|---------|
-| Builder | `claude-opus-4.8` (effort `max`) |
-| Critic | `gpt-5.5` (effort `xhigh`) |
-| Rounds per gate | 5 |
-| On cap | `halt` |
-| Human approval | off (`human_approval: false`) |
+Every setting has a default, so a config file is optional. Override any subset via a JSON file
+(`--config`, see [`config.example.json`](config.example.json)); unset keys keep their defaults.
 
-Override via a JSON config (see `config.example.json`). Set `human_approval: true` to pause after
-PLAN consensus for your explicit OK before any implementation (off by default).
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `builder` | `{"model": "claude-opus-4.8", "effort": "max"}` | Model + effort that plans and implements. |
+| `critic` | `{"model": "gpt-5.5", "effort": "xhigh"}` | Model + effort that adversarially reviews every gate. |
+| `max_rounds_plan` | `5` | Round cap for the PLAN gate before `on_cap` applies. |
+| `max_rounds_dep` | `5` | Round cap for **each** IMPLEMENT gate. |
+| `on_cap` | `halt` | At a round cap without consensus: `halt`, or `proceed_with_flags` (advance and record the open findings). |
+| `blocking_severities` | `["blocker", "major"]` | Severities that keep a gate from reaching consensus. |
+| `defer_severities` | `["minor", "nit"]` | Severities the Builder may defer (acknowledge without fixing) without blocking. |
+| `strict_rebuttal` | `false` | `false`: a Builder `wontfix` rebuttal clears the finding. `true`: it stays blocking until the Critic explicitly accepts it. |
+| `final_review` | `true` | Run the Stage 3 FINAL gate (whole-diff review). |
+| `human_approval` | `false` | Pause after PLAN consensus for your explicit OK before any implementation. |
+| `reproduce_gate` | `false` | Run the Stage 0 REPRODUCE gate (failing-test-first) before PLAN — for bug fixes. |
 
 ## Install
 
@@ -67,6 +77,29 @@ Scratch files (`dag.json`, `plan.md`, `verdict.json`, …) live under `"$RUN"/`,
 `~/.crucible/runs` (override `--base-dir`/`$CRUCIBLE_RUNS_DIR`), so nothing is written into the
 target repo. Delete a finished run with `crucible clean --run "$RUN"` (refuses in-progress runs).
 
+### Usage patterns
+
+Same loop, different config — pass a JSON file with `--config` on `init-run`; unset keys keep their
+defaults.
+
+- **Add a feature** *(default)* — the flow above: `init-run` → `load-dag` → per-gate `next` /
+  `verdict` → `report`.
+- **Fix a bug** — turn on the REPRODUCE gate so a failing test comes first:
+  ```bash
+  echo '{"reproduce_gate": true}' > cfg.json
+  RUN=$(PYTHONPATH=scripts python3 -m crucible init-run --goal "fix the crash" --config cfg.json)
+  ```
+- **Override defaults** — e.g. a lighter Critic, advance past a stuck gate, or skip FINAL:
+  ```json
+  {"critic": {"model": "gpt-5.5", "effort": "high"}, "on_cap": "proceed_with_flags", "final_review": false}
+  ```
+- **Inspect / clean up** — `crucible status --run "$RUN"` (JSON progress), `crucible show-plan --run
+  "$RUN"` (approved plan + DAG), `crucible report --run "$RUN" --open` (render + open in a browser),
+  `crucible clean --run "$RUN"` (delete a finished run).
+
+Full command reference — all 13 subcommands with their arguments, grouped by phase:
+**[docs/cli.md](docs/cli.md)**.
+
 ## Development
 
 ```bash
@@ -79,6 +112,6 @@ python -m pytest -q     # run the test suite (pytest.ini sets pythonpath=scripts
 - `commands/crucible.md` — `/crucible` entry point.
 - `scripts/crucible/` — deterministic helpers: `config`, `dag`, `verdict`, `runlog`, `report`, `cli`.
 - `.claude-plugin/` — plugin + marketplace manifests.
-- `docs/install/` — per-platform install guides (Copilot CLI, Claude Code, Codex).
+- `docs/cli.md` — full CLI reference; `docs/install/` — per-platform install guides.
 
 Engineering tool. Not affiliated with any model provider.
