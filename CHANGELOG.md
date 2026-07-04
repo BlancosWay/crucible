@@ -7,6 +7,8 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
 
 ## [Unreleased]
 
+## [0.10.2] - 2026-07-04
+
 ### Changed
 - **The Critic's code-review gates now dispatch the superpowers `requesting-code-review`
   `code-reviewer.md` template on a `general-purpose` subagent (on the critic model), instead of the
