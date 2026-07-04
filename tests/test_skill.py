@@ -34,3 +34,15 @@ def test_skill_does_not_hardcode_round_cap_override():
     # the cap must come from config; workflow examples should not pass --max-rounds
     text = SKILL.read_text()
     assert "--max-rounds 5" not in text
+
+
+def test_skill_step6_requires_full_untruncated_plan_paste():
+    # The Copilot-CLI surfacing step must require pasting the show-plan output IN FULL and forbid
+    # truncating it (observed failure: piped through `tail`, pasted a partial plan).
+    text = SKILL.read_text()
+    assert "show-plan" in text
+    # scope to the surfacing guidance: the 'in full' concept + a no-truncate/tail mechanism
+    assert "in full" in text
+    low = text.lower()
+    assert "truncate" in low
+    assert "tail" in low  # names the concrete truncation mechanism to avoid

@@ -100,8 +100,10 @@ new gate begins.
    in the transcript and **not visible** to the human, so the settling `verdict`'s stderr echo alone
    is insufficient — you **must** surface the approved plan + dependency tree in your response before
    implementing: run `PYTHONPATH=scripts python3 -m crucible show-plan --run "$RUN"` and paste its
-   output into your reply (see `references/platform-notes.md`). In a plain terminal the settling
-   `verdict` already echoed them, so there this is just a re-print.
+   output into your reply **in full** — the complete plan + dependency tree. Do **not** pipe it
+   through `head`/`tail`/`grep`/`sed` or otherwise truncate it to a fragment (a faithful, complete
+   paste — the collapsed bash output is not what the human sees; your reply is; see
+   `references/platform-notes.md`). In a plain terminal the settling `verdict` already echoed them, so there this is just a re-print.
 
 ### Approval gate (optional human OK — default off)
 

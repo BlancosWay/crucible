@@ -25,11 +25,13 @@ the **IMPLEMENT** and **FINAL** gates.
   `verdict` echoes at PLAN settlement, `show-plan`, gate outcomes, unresolved-finding lists, the run
   report — is **not visible** to the human by default. After the PLAN gate settles, **surface the
   approved plan + dependency tree in your response** (paste `crucible show-plan --run "$RUN"` output)
-  before implementing. Do **not** suppress the settling `verdict`'s stderr (avoid `2>/dev/null`) —
-  run it plainly so the Copilot bash tool captures stderr separately. Do **not** use `2>&1` where the
-  stdout outcome token is parsed: it merges the echo into stdout and breaks the "outcome token alone
-  on stdout" contract. Surface gate outcomes and any unresolved findings in your replies too, rather
-  than relying on the collapsed shell output.
+  before implementing — **in full**: paste the complete plan + dependency tree, and do **not** pipe it
+  through `head`/`tail`/`grep`/`sed` or otherwise truncate it to a fragment (the collapsed bash output
+  is not what the human sees — your reply is). Do **not** suppress the settling `verdict`'s stderr
+  (avoid `2>/dev/null`) — run it plainly so the Copilot bash tool captures stderr separately. Do
+  **not** use `2>&1` where the stdout outcome token is parsed: it merges the echo into stdout and
+  breaks the "outcome token alone on stdout" contract. Surface gate outcomes and any unresolved
+  findings in your replies too, rather than relying on the collapsed shell output.
 
 ## Claude Code / Codex
 
