@@ -16,6 +16,12 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
   (`gate_consensus` / `gate_proceeded_with_flags` / `gate_capped`) and DAG node statuses — no model
   calls, no Critic prose, and every interpolated value is a literal label, an integer, or a
   sanitized id, so it adds no injection surface.
+- **The `## Summary` banner now breaks unresolved findings down by severity.** Below the
+  unresolved-findings count, it adds an `Unresolved by severity: N blocker · M major` line in
+  canonical severity order (zero counts omitted), derived by cross-referencing each gate's last
+  `critic_verdict` payload for each open finding's severity — deterministic and from the run-log
+  only (an id whose severity can't be found is counted under `unknown`). Per-gate findings keep
+  their original emission order elsewhere in the report, preserving provenance.
 
 ### Changed
 - **The Builder role now must ground every claim in a tool run.** `references/builder-prompt.md`

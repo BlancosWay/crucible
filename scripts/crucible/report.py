@@ -140,6 +140,32 @@ def _run_summary_lines(events: list[dict[str, Any]], dag: dict[str, Any]) -> lis
         if breakdown:
             line += f" ({breakdown})"
         lines.append(line)
+
+        # By-severity breakdown of the same unresolved findings, derived from each gate's LAST
+        # critic_verdict payload (id -> severity) — deterministic, from the run-log only, never
+        # Critic prose. Open ids are blocking-severity by construction; an id whose severity can't
+        # be found is counted defensively under "unknown". Values are literal severity labels
+        # (from the fixed order) or _san-sanitized, plus int counts, so no injection surface.
+        sev_by_gate_id: dict[tuple[str, Any], Any] = {}
+        for gate, gate_events in gates.items():
+            critic_verdicts = [e for e in gate_events if e["event"] == "critic_verdict"]
+            if not critic_verdicts:
+                continue
+            payload = critic_verdicts[-1].get("payload") or {}
+            for f in payload.get("findings", []):
+                if isinstance(f, dict):
+                    sev_by_gate_id[(gate, f.get("id"))] = f.get("severity")
+        sev_counts: dict[str, int] = {}
+        for gate, ids in findings:
+            for fid in ids:
+                sev = sev_by_gate_id.get((gate, fid)) or "unknown"
+                sev_counts[sev] = sev_counts.get(sev, 0) + 1
+        order = ["blocker", "major", "minor", "nit", "unknown"]
+        parts = [f"{sev_counts[s]} {s}" for s in order if sev_counts.get(s)]
+        # any unexpected severity label (defensive) rendered sanitized, in deterministic order
+        parts += [f"{sev_counts[s]} {_san(s)}" for s in sorted(sev_counts) if s not in order]
+        if parts:
+            lines.append(f"**Unresolved by severity:** {' \u00b7 '.join(parts)}")
     lines.append("")
     return lines
 
