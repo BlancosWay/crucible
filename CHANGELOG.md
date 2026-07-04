@@ -7,6 +7,8 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-07-04
+
 ### Fixed
 - **`crucible report` no longer crashes the CLI on Python 3.11.** The 0.10.0 "Unresolved by
   severity" line put the `\u00b7` separator's backslash inside an f-string `{...}` expression, which
