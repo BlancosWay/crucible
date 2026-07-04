@@ -123,3 +123,22 @@ def test_builder_prompt_requires_grounding_claims():
     for item in ("flag", "path", "api", "config key"):  # the specific forbidden invented specifics
         assert item in low, f"builder-prompt must forbid inventing a {item}"
     assert "unverified" in low
+
+
+def test_critic_prompt_verifies_test_evidence():
+    # #3: the Critic verifies the Builder's cited test evidence and runs a node's test_plan only
+    # on doubt/missing-evidence (conditional), never fabricating a pass — NOT mandatory reruns.
+    low = " ".join((REF / "critic-prompt.md").read_text().lower().split())
+    assert "test_plan" in low
+    assert "evidence" in low
+    assert "unverified" in low          # degrade to unverified when it can't run
+    assert "fabricate" in low or "never fabricate" in low  # no fabricated pass
+
+
+def test_critic_prompt_flags_bugfix_without_repro():
+    # #7: a behavioral bug-fix plan with no failing reproduction (and no reproduce gate / waiver)
+    # is a SOFT, WAIVABLE finding — not an unconditional demand.
+    low = " ".join((REF / "critic-prompt.md").read_text().lower().split())
+    assert "bug-fix" in low or "bug fix" in low
+    assert "reproduc" in low            # failing reproduction / reproduce gate
+    assert "waiv" in low                # waivable

@@ -23,6 +23,13 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
   (cite the `file:line` or observed output), forbids inventing flags/paths/APIs/config keys, and
   requires labeling anything unverified — so the Builder can't advance a confident-but-unchecked
   assertion.
+- **The Critic now verifies test evidence and nudges bug-fix reproductions.**
+  `references/critic-prompt.md` tells the Critic to verify the Builder's cited test evidence and,
+  when a node declares a `test_plan` and that evidence is missing or dubious and a runnable
+  environment is available, to run the focused `test_plan` and cite the observed result (degrading
+  to *unverified* rather than fabricating a pass — not a blanket re-run). It also flags a clearly
+  behavioral bug-fix plan that ships no failing reproduction (and neither enables the reproduce gate
+  nor states a waiver) as a soft, waivable finding.
 
 ## [0.9.0] - 2026-07-03
 
