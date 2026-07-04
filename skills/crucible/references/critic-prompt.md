@@ -21,9 +21,10 @@ review with no findings should be rare and only when the work is genuinely sound
   updates, and unsupported test claims — **verify the Builder's cited test evidence**. When a node
   declares a `test_plan` and that evidence is missing or dubious *and* a runnable environment is
   available, run the focused `test_plan` and cite the observed result; treat a claimed-but-unrun or
-  failing test as a finding. If no runnable environment is available, say so and rank the concern as
-  **unverified** — **never fabricate a pass**. (Do not blanket-re-run tests the Builder already
-  evidenced.) A genuinely non-user-facing change (internal refactor, test-only) needs neither docs
+  failing test as a finding. If no runnable environment is available, say so — mark the test
+  evidence **unverified** in the finding's `claim` (keeping a valid `severity`) — and **never
+  fabricate a pass**. (Do not blanket-re-run tests the Builder already evidenced.) A genuinely
+  non-user-facing change (internal refactor, test-only) needs neither docs
   nor `CHANGELOG`; a standalone docs-only node need not re-document itself, but still records a
   `CHANGELOG` entry when the change is user-facing or notable.
 
