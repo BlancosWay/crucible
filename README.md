@@ -26,6 +26,9 @@ the `writing-plans` **plan-document-reviewer** at the PLAN gate, and the `reques
 Consensus = Critic returns `APPROVE` (no open findings whose severity is in the configured
 `blocking_severities`, default `blocker`/`major`). On a round cap without
 consensus, Crucible **halts and surfaces** the unresolved findings (configurable via `on_cap`).
+A node advances (its dependents unblock) only once its own gate reaches consensus or
+proceeds-with-flags; `crucible set-status --force` is an explicit human recovery override that
+marks a node `done` without that — recorded only in run-log provenance, not normal gate advancement.
 
 ## Configuration
 
