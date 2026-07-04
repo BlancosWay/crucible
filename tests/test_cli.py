@@ -148,6 +148,24 @@ def test_verdict_accepts_consecutive_rounds(tmp_path):
                  "--file", str(v2)]).stdout.strip() == "CONSENSUS"
 
 
+def test_verdict_expected_round_is_scoped_per_gate(tmp_path):
+    # Round counting is keyed by EXACT gate: a CHANGES round on `plan` must not bump the expected
+    # round of a different gate — dep:a still starts at round 1 (guards per-gate independence).
+    run_dir = _init(tmp_path)
+    _load(run_dir, tmp_path, {"a": "pending"})
+    vp = Path(tmp_path) / "vp.json"
+    vp.write_text(json.dumps({"gate": "plan", "round": 1, "verdict": "REQUEST_CHANGES",
+                              "summary": "x", "findings": [{"id": "F1", "severity": "blocker",
+                              "location": "x", "claim": "c", "suggestion": "s"}]}))
+    assert _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1",
+                 "--file", str(vp)]).stdout.strip() == "CHANGES"
+    va = Path(tmp_path) / "va.json"
+    va.write_text(json.dumps({"gate": "dep:a", "round": 1, "verdict": "APPROVE",
+                              "summary": "ok", "findings": []}))
+    assert _run(["verdict", "--run", run_dir, "--gate", "dep:a", "--round", "1",
+                 "--file", str(va)]).stdout.strip() == "CONSENSUS"
+
+
 def test_log_appends_full_payload(tmp_path):
     r = _run(["init-run", "--goal", "g", "--base-dir", str(tmp_path)])
     run_dir = r.stdout.strip()
