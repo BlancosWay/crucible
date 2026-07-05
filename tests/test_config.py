@@ -144,6 +144,16 @@ def test_config_partial_nested_override_still_allowed():
     assert cfg.builder["effort"] == "max"   # sibling default preserved
 
 
+def test_config_empty_nested_object_keeps_defaults():
+    cfg = Config.from_dict({"builder": {}})
+    assert cfg.builder == {"model": "claude-opus-4.8", "effort": "max"}
+
+
+def test_config_null_nested_override_keeps_defaults():
+    cfg = Config.from_dict({"builder": None})
+    assert cfg.builder == {"model": "claude-opus-4.8", "effort": "max"}
+
+
 def test_non_dict_builder_raises():
     with pytest.raises(ValueError, match="builder must be an object"):
         Config.from_dict({"builder": "oops"})
