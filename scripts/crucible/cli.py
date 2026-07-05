@@ -48,10 +48,20 @@ def _print_approved_plan(run, dag, stream=None) -> None:
     """Render the approved plan artifact + a given (already-loaded) dependency tree to
     ``stream``. Shared by `show-plan` (stdout) and the automatic echo when the PLAN gate
     settles (stderr). The caller loads the DAG, so each caller owns its strict-vs-tolerant
-    policy; this renderer never loads the DAG and never prints a masking placeholder."""
+    policy; this renderer never loads the DAG. The *approved* plan is the last plan
+    ``builder_output`` at or before the plan gate's advance-terminal (consensus/proceed) round —
+    never a later, un-reviewed edit; if nothing qualifies, the ``(no plan artifact logged)``
+    placeholder is shown rather than a post-consensus payload."""
     stream = sys.stdout if stream is None else stream
-    plans = [e for e in run.read_events()
-             if e.get("gate") == "plan" and e.get("event") == "builder_output"]
+    events = run.read_events()
+    advance = [e for e in events if e.get("gate") == "plan"
+               and e.get("event") in ("gate_consensus", "gate_proceeded_with_flags")]
+    approved_round = advance[-1].get("round") if advance else None
+    plans = [e for e in events if e.get("gate") == "plan" and e.get("event") == "builder_output"]
+    if approved_round is not None:
+        # Bound to the approved round; if nothing qualifies, do NOT fall back to a later
+        # (post-consensus) edit — render the no-artifact placeholder instead.
+        plans = [e for e in plans if isinstance(e.get("round"), int) and e["round"] <= approved_round]
     print("=== Approved plan ===", file=stream)
     print(plans[-1].get("payload", "(no plan artifact logged)") if plans else "(no plan artifact logged)",
           file=stream)
@@ -196,8 +206,25 @@ def cmd_load_dag(args) -> int:
     if non_pending:
         raise SystemExit(f"load-dag: a freshly imported plan must have every node 'pending'; "
                          f"these are not: {non_pending}. Node statuses change only via set-status.")
+    # G2b: refuse to clobber an existing run that already has progress. The incoming file is
+    # all-`pending` (checked above), but blindly overwriting would reset a run mid-implementation
+    # (done/in_progress -> pending). The PLAN loop re-runs load-dag while everything is still
+    # pending, so that path is unaffected; only a real in-flight run is protected. --force overrides.
+    if not args.force:
+        try:
+            existing = DAG.from_dict(run.load_dag())
+        except FileNotFoundError:
+            existing = None
+        if existing is not None:
+            progressed = [nid for nid in existing.order if existing.nodes[nid].status != "pending"]
+            if progressed:
+                raise SystemExit(
+                    f"load-dag: this run already has a dependency tree with progress (non-pending "
+                    f"nodes: {progressed}); refusing to overwrite and reset it. Pass --force to "
+                    f"replace it (discards current node statuses)."
+                )
     run.save_dag(dag.to_dict())
-    run.append("dag_loaded", gate="plan", nodes=len(dag.nodes))
+    run.append("dag_loaded", gate="plan", nodes=len(dag.nodes), forced=bool(args.force))
     print(f"loaded {len(dag.nodes)} nodes")
     print()
     _print_dependency_tree(dag)
@@ -444,9 +471,11 @@ def cmd_show_plan(args) -> int:
     """
     run = RunLog(args.run)
     concluded = [e for e in run.read_events()
-                 if e.get("gate") == "plan" and e.get("event") in _TERMINAL_EVENTS]
+                 if e.get("gate") == "plan"
+                 and e.get("event") in ("gate_consensus", "gate_proceeded_with_flags")]
     if not concluded:
-        raise SystemExit("show-plan: the plan gate has not reached consensus yet; nothing to show")
+        raise SystemExit("show-plan: the plan gate has not reached consensus (or proceeded with "
+                         "flags) yet; nothing to show")
     dag = DAG.from_dict(run.load_dag())
     _print_approved_plan(run, dag, sys.stdout)
     return 0
@@ -505,6 +534,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_init_run)
 
     s = sub.add_parser("load-dag"); s.add_argument("--run", required=True); s.add_argument("--file", required=True)
+    s.add_argument("--force", action="store_true",
+                   help="overwrite an existing run's DAG even if it has progress (resets node statuses)")
     s.set_defaults(func=cmd_load_dag)
 
     s = sub.add_parser("next"); s.add_argument("--run", required=True)

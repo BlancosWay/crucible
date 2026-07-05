@@ -16,6 +16,14 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
   `critic_verdict` events for the gate) and rejects any `--round` that isn't the next consecutive
   round. Previously the caller-asserted `--round` could skip straight to the cap (immediate
   `CAPPED`/`PROCEED_WITH_FLAGS`) or repeat a round forever, bypassing the round cap.
+- `load-dag` now refuses to overwrite a run whose DAG already has progress (which would reset
+  `done`/`in_progress` nodes to `pending`); pass `--force` to override. Previously an accidental
+  re-run silently wiped a run's node statuses.
+- `config` now rejects unknown nested keys under `builder`/`critic` (e.g. a misspelled `model`)
+  instead of silently keeping the typo and falling back to the default model/effort.
+- `show-plan` (and the settling-verdict echo) now render the plan that was actually approved — the
+  plan `builder_output` at or before the gate's consensus/proceed round, not a later edit — and
+  `show-plan` refuses to treat a capped (halted) plan gate as approved.
 
 ## [0.10.2] - 2026-07-04
 

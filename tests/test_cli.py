@@ -691,6 +691,67 @@ def test_show_plan_requires_plan_consensus(tmp_path):
     assert "consensus" in r.stderr.lower()
 
 
+def test_show_plan_renders_approved_not_latest(tmp_path):
+    # show-plan must render the plan approved at the consensus round, not a later edit.
+    run_dir = _init(tmp_path)
+    _load(run_dir, tmp_path, {"a": "pending"})
+    p1 = Path(tmp_path) / "p1.md"; p1.write_text("APPROVED PLAN v1")
+    _run(["log", "--run", run_dir, "--event", "builder_output", "--gate", "plan", "--round", "1", "--file", str(p1)])
+    vok = Path(tmp_path) / "vok.json"
+    vok.write_text(json.dumps({"gate": "plan", "round": 1, "verdict": "APPROVE", "summary": "ok", "findings": []}))
+    assert _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1", "--file", str(vok)]).stdout.strip() == "CONSENSUS"
+    p2 = Path(tmp_path) / "p2.md"; p2.write_text("UNAPPROVED PLAN v2")
+    _run(["log", "--run", run_dir, "--event", "builder_output", "--gate", "plan", "--round", "99", "--file", str(p2)])
+    out = _run(["show-plan", "--run", run_dir]).stdout
+    assert "APPROVED PLAN v1" in out and "UNAPPROVED PLAN v2" not in out
+
+
+def test_show_plan_refuses_capped_plan_gate(tmp_path):
+    # A CAPPED (halt) plan gate is not an approval — show-plan must refuse, not print "Approved".
+    run_dir = _init(tmp_path)
+    _load(run_dir, tmp_path, {"a": "pending"})
+    vcap = Path(tmp_path) / "vcap.json"
+    vcap.write_text(json.dumps({"gate": "plan", "round": 1, "verdict": "REQUEST_CHANGES",
+                    "summary": "blk", "findings": [{"id": "F1", "severity": "blocker",
+                    "location": "x", "claim": "c", "suggestion": "s"}]}))
+    assert "CAPPED" in _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1",
+                             "--max-rounds", "1", "--file", str(vcap)]).stdout
+    r = _run(["show-plan", "--run", run_dir])
+    assert r.returncode != 0
+    assert "Approved plan" not in r.stdout
+
+
+def test_show_plan_no_preconsensus_plan_does_not_show_later_edit(tmp_path):
+    # F1 edge case: consensus with a loaded DAG but NO pre-consensus builder_output, then a
+    # post-consensus round-99 edit -> show-plan must NOT print the later unapproved payload.
+    run_dir = _init(tmp_path)
+    _load(run_dir, tmp_path, {"a": "pending"})
+    vok = Path(tmp_path) / "vok.json"
+    vok.write_text(json.dumps({"gate": "plan", "round": 1, "verdict": "APPROVE", "summary": "ok", "findings": []}))
+    assert _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1", "--file", str(vok)]).stdout.strip() == "CONSENSUS"
+    p2 = Path(tmp_path) / "p2.md"; p2.write_text("UNAPPROVED LATE PLAN")
+    _run(["log", "--run", run_dir, "--event", "builder_output", "--gate", "plan", "--round", "99", "--file", str(p2)])
+    out = _run(["show-plan", "--run", run_dir]).stdout
+    assert "UNAPPROVED LATE PLAN" not in out and "no plan artifact logged" in out
+
+
+def test_show_plan_allowed_after_proceed_with_flags(tmp_path):
+    # proceed-with-flags is an advance terminal, so show-plan must succeed and render its plan.
+    cfg = Path(tmp_path) / "c.json"; cfg.write_text(json.dumps({"on_cap": "proceed_with_flags"}))
+    run_dir = _run(["init-run", "--goal", "g", "--base-dir", str(tmp_path), "--config", str(cfg)]).stdout.strip()
+    _load(run_dir, tmp_path, {"a": "pending"})
+    plan = Path(tmp_path) / "plan.md"; plan.write_text("PROCEEDED PLAN")
+    _run(["log", "--run", run_dir, "--event", "builder_output", "--gate", "plan", "--round", "1", "--file", str(plan)])
+    vpf = Path(tmp_path) / "vpf.json"
+    vpf.write_text(json.dumps({"gate": "plan", "round": 1, "verdict": "REQUEST_CHANGES", "summary": "x",
+                   "findings": [{"id": "F1", "severity": "blocker", "location": "x", "claim": "c", "suggestion": "s"}]}))
+    assert "PROCEED_WITH_FLAGS" in _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1",
+                                         "--max-rounds", "1", "--file", str(vpf)]).stdout
+    r = _run(["show-plan", "--run", run_dir])
+    assert r.returncode == 0, r.stderr
+    assert "PROCEEDED PLAN" in r.stdout
+
+
 def test_verdict_echoes_plan_and_dag_to_stderr_on_plan_consensus(tmp_path):
     # Bug repro: when the PLAN gate settles, `crucible verdict` must deterministically echo the
     # approved plan + dependency tree to the terminal (stderr) so the final plan/DAG is always
@@ -996,6 +1057,44 @@ def test_load_dag_accepts_all_pending(tmp_path):
     r = _load(run_dir, tmp_path, {"a": "pending", "b": "pending"},
               edges=[{"from": "b", "depends_on": "a"}])
     assert r.returncode == 0, r.stderr
+
+
+# --- G2b: load-dag refuses to overwrite a run that already has progress ---------
+
+def _pending_dag_file(tmp_path, ids):
+    f = Path(tmp_path) / "reload.json"
+    f.write_text(json.dumps({"nodes": [{"id": i, "title": i.upper(), "description": "", "files": [],
+                             "test_plan": "", "status": "pending"} for i in ids], "edges": []}))
+    return f
+
+
+def test_load_dag_refuses_to_overwrite_progress(tmp_path):
+    run_dir = _init(tmp_path)
+    _load(run_dir, tmp_path, {"a": "done"})              # a is done (via _load --force)
+    r = _run(["load-dag", "--run", run_dir, "--file", str(_pending_dag_file(tmp_path, ["a"]))])
+    assert r.returncode != 0
+    assert "progress" in r.stderr.lower() and "--force" in r.stderr
+    assert json.loads(_run(["status", "--run", run_dir]).stdout)["done"] == 1   # NOT wiped
+
+
+def test_load_dag_force_overwrites_progress(tmp_path):
+    run_dir = _init(tmp_path)
+    _load(run_dir, tmp_path, {"a": "done"})
+    r = _run(["load-dag", "--run", run_dir, "--file", str(_pending_dag_file(tmp_path, ["a"])), "--force"])
+    assert r.returncode == 0, r.stderr
+    assert json.loads(_run(["status", "--run", run_dir]).stdout)["pending"] == 1
+    loaded = [e for e in _events(run_dir) if e["event"] == "dag_loaded"]
+    assert loaded[-1].get("forced") is True   # the override is recorded
+
+
+def test_load_dag_reload_all_pending_still_allowed(tmp_path):
+    # PLAN-loop re-run: existing DAG is all-pending, so reload is NOT blocked (no --force needed).
+    run_dir = _init(tmp_path)
+    _load(run_dir, tmp_path, {"a": "pending", "b": "pending"})
+    r = _run(["load-dag", "--run", run_dir, "--file", str(_pending_dag_file(tmp_path, ["a", "b"]))])
+    assert r.returncode == 0, r.stderr
+    loaded = [e for e in _events(run_dir) if e["event"] == "dag_loaded"]
+    assert loaded[-1].get("forced") is False   # a normal (non-forced) load records forced=false
 
 
 # --- G3: gate names must be plan | final | dep:<id> --------------------------

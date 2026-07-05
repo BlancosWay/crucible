@@ -28,7 +28,7 @@ is the path `init-run` printed.
 | Command | Arguments | Behavior |
 |---------|-----------|----------|
 | `init-run` | `--goal GOAL` (required), `--config FILE`, `--base-dir DIR` | Create a run directory (seeding its `config.json` from `--config`, or defaults) and print its path to stdout. |
-| `load-dag` | `--run RUN` (required), `--file FILE` (required) | Import the plan's dependency tree from a JSON file. Rejects an empty tree and any node not `pending` (fresh plans start all-`pending`; statuses change only via `set-status`). Prints the node count and the tree. |
+| `load-dag` | `--run RUN` (required), `--file FILE` (required); `--force` (optional) | Import the plan's dependency tree from a JSON file. Rejects an empty tree and any node not `pending` (fresh plans start all-`pending`; statuses change only via `set-status`). Also refuses to overwrite a run whose existing DAG already has progress (non-`pending` nodes), which would reset it — pass `--force` to replace it (discards current node statuses). Prints the node count and the tree. |
 
 ## Schedule & track progress
 
@@ -60,7 +60,7 @@ eyeballing it. All take `--run RUN` (required).
 
 | Command | Arguments | Behavior |
 |---------|-----------|----------|
-| `show-plan` | `--run RUN` (required) | Print the approved plan + dependency tree. Refuses until the PLAN gate has reached consensus, so the operator sees exactly what was approved before any implementation. |
+| `show-plan` | `--run RUN` (required) | Print the approved plan + dependency tree — specifically the plan `builder_output` at or before the gate's consensus/proceed round, never a later edit. Refuses until the PLAN gate has reached consensus (or proceeded with flags) — a capped (halted) plan gate is not treated as approved — so the operator sees exactly what was approved before any implementation. |
 | `report` | `--run RUN` (required), `--html`, `--open` | Render the run report from the log (Markdown, or HTML with `--html`), print it, and write it into the run dir. `--open` also opens it in a browser (best-effort). |
 | `clean` | `--run RUN` (required), `--force` | Delete a finished run's directory. Refuses any path that isn't a run dir (must contain `runlog.jsonl`) and any run still in progress unless `--force` is given. |
 
