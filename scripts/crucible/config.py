@@ -72,6 +72,9 @@ class Config:
             elif not isinstance(override, dict):
                 raise ValueError(f"{role} must be an object")
             else:
+                unknown_nested = set(override) - set(DEFAULTS[role])
+                if unknown_nested:
+                    raise ValueError(f"unknown {role} keys: {sorted(unknown_nested)}")
                 merged[role] = {**DEFAULTS[role], **override}
         for role in ("builder", "critic"):
             for key in ("model", "effort"):

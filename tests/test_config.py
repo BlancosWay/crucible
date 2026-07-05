@@ -128,6 +128,22 @@ def test_critic_effort_only_override_keeps_default_model():
     assert cfg.critic == {"model": "gpt-5.5", "effort": "high"}
 
 
+def test_config_rejects_unknown_nested_builder_key():
+    with pytest.raises(ValueError, match="unknown builder keys"):
+        Config.from_dict({"builder": {"modle": "x"}})
+
+
+def test_config_rejects_unknown_nested_critic_key():
+    with pytest.raises(ValueError, match="unknown critic keys"):
+        Config.from_dict({"critic": {"reasoning_effort": "low"}})
+
+
+def test_config_partial_nested_override_still_allowed():
+    cfg = Config.from_dict({"builder": {"model": "custom-model"}})
+    assert cfg.builder["model"] == "custom-model"
+    assert cfg.builder["effort"] == "max"   # sibling default preserved
+
+
 def test_non_dict_builder_raises():
     with pytest.raises(ValueError, match="builder must be an object"):
         Config.from_dict({"builder": "oops"})

@@ -19,6 +19,8 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
 - `load-dag` now refuses to overwrite a run whose DAG already has progress (which would reset
   `done`/`in_progress` nodes to `pending`); pass `--force` to override. Previously an accidental
   re-run silently wiped a run's node statuses.
+- `config` now rejects unknown nested keys under `builder`/`critic` (e.g. a misspelled `model`)
+  instead of silently keeping the typo and falling back to the default model/effort.
 
 ## [0.10.2] - 2026-07-04
 
