@@ -1022,6 +1022,8 @@ def test_load_dag_force_overwrites_progress(tmp_path):
     r = _run(["load-dag", "--run", run_dir, "--file", str(_pending_dag_file(tmp_path, ["a"])), "--force"])
     assert r.returncode == 0, r.stderr
     assert json.loads(_run(["status", "--run", run_dir]).stdout)["pending"] == 1
+    loaded = [e for e in _events(run_dir) if e["event"] == "dag_loaded"]
+    assert loaded[-1].get("forced") is True   # the override is recorded
 
 
 def test_load_dag_reload_all_pending_still_allowed(tmp_path):
@@ -1030,6 +1032,8 @@ def test_load_dag_reload_all_pending_still_allowed(tmp_path):
     _load(run_dir, tmp_path, {"a": "pending", "b": "pending"})
     r = _run(["load-dag", "--run", run_dir, "--file", str(_pending_dag_file(tmp_path, ["a", "b"]))])
     assert r.returncode == 0, r.stderr
+    loaded = [e for e in _events(run_dir) if e["event"] == "dag_loaded"]
+    assert loaded[-1].get("forced") is False   # a normal (non-forced) load records forced=false
 
 
 # --- G3: gate names must be plan | final | dep:<id> --------------------------
