@@ -16,6 +16,9 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
   `critic_verdict` events for the gate) and rejects any `--round` that isn't the next consecutive
   round. Previously the caller-asserted `--round` could skip straight to the cap (immediate
   `CAPPED`/`PROCEED_WITH_FLAGS`) or repeat a round forever, bypassing the round cap.
+- `load-dag` now refuses to overwrite a run whose DAG already has progress (which would reset
+  `done`/`in_progress` nodes to `pending`); pass `--force` to override. Previously an accidental
+  re-run silently wiped a run's node statuses.
 
 ## [0.10.2] - 2026-07-04
 

@@ -196,8 +196,25 @@ def cmd_load_dag(args) -> int:
     if non_pending:
         raise SystemExit(f"load-dag: a freshly imported plan must have every node 'pending'; "
                          f"these are not: {non_pending}. Node statuses change only via set-status.")
+    # G2b: refuse to clobber an existing run that already has progress. The incoming file is
+    # all-`pending` (checked above), but blindly overwriting would reset a run mid-implementation
+    # (done/in_progress -> pending). The PLAN loop re-runs load-dag while everything is still
+    # pending, so that path is unaffected; only a real in-flight run is protected. --force overrides.
+    if not args.force:
+        try:
+            existing = DAG.from_dict(run.load_dag())
+        except FileNotFoundError:
+            existing = None
+        if existing is not None:
+            progressed = [nid for nid in existing.order if existing.nodes[nid].status != "pending"]
+            if progressed:
+                raise SystemExit(
+                    f"load-dag: this run already has a dependency tree with progress (non-pending "
+                    f"nodes: {progressed}); refusing to overwrite and reset it. Pass --force to "
+                    f"replace it (discards current node statuses)."
+                )
     run.save_dag(dag.to_dict())
-    run.append("dag_loaded", gate="plan", nodes=len(dag.nodes))
+    run.append("dag_loaded", gate="plan", nodes=len(dag.nodes), forced=bool(args.force))
     print(f"loaded {len(dag.nodes)} nodes")
     print()
     _print_dependency_tree(dag)
@@ -505,6 +522,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_init_run)
 
     s = sub.add_parser("load-dag"); s.add_argument("--run", required=True); s.add_argument("--file", required=True)
+    s.add_argument("--force", action="store_true",
+                   help="overwrite an existing run's DAG even if it has progress (resets node statuses)")
     s.set_defaults(func=cmd_load_dag)
 
     s = sub.add_parser("next"); s.add_argument("--run", required=True)

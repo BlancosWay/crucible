@@ -28,7 +28,7 @@ is the path `init-run` printed.
 | Command | Arguments | Behavior |
 |---------|-----------|----------|
 | `init-run` | `--goal GOAL` (required), `--config FILE`, `--base-dir DIR` | Create a run directory (seeding its `config.json` from `--config`, or defaults) and print its path to stdout. |
-| `load-dag` | `--run RUN` (required), `--file FILE` (required) | Import the plan's dependency tree from a JSON file. Rejects an empty tree and any node not `pending` (fresh plans start all-`pending`; statuses change only via `set-status`). Prints the node count and the tree. |
+| `load-dag` | `--run RUN` (required), `--file FILE` (required); `--force` (optional) | Import the plan's dependency tree from a JSON file. Rejects an empty tree and any node not `pending` (fresh plans start all-`pending`; statuses change only via `set-status`). Also refuses to overwrite a run whose existing DAG already has progress (non-`pending` nodes), which would reset it — pass `--force` to replace it (discards current node statuses). Prints the node count and the tree. |
 
 ## Schedule & track progress
 

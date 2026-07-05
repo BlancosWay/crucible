@@ -998,6 +998,40 @@ def test_load_dag_accepts_all_pending(tmp_path):
     assert r.returncode == 0, r.stderr
 
 
+# --- G2b: load-dag refuses to overwrite a run that already has progress ---------
+
+def _pending_dag_file(tmp_path, ids):
+    f = Path(tmp_path) / "reload.json"
+    f.write_text(json.dumps({"nodes": [{"id": i, "title": i.upper(), "description": "", "files": [],
+                             "test_plan": "", "status": "pending"} for i in ids], "edges": []}))
+    return f
+
+
+def test_load_dag_refuses_to_overwrite_progress(tmp_path):
+    run_dir = _init(tmp_path)
+    _load(run_dir, tmp_path, {"a": "done"})              # a is done (via _load --force)
+    r = _run(["load-dag", "--run", run_dir, "--file", str(_pending_dag_file(tmp_path, ["a"]))])
+    assert r.returncode != 0
+    assert "progress" in r.stderr.lower() and "--force" in r.stderr
+    assert json.loads(_run(["status", "--run", run_dir]).stdout)["done"] == 1   # NOT wiped
+
+
+def test_load_dag_force_overwrites_progress(tmp_path):
+    run_dir = _init(tmp_path)
+    _load(run_dir, tmp_path, {"a": "done"})
+    r = _run(["load-dag", "--run", run_dir, "--file", str(_pending_dag_file(tmp_path, ["a"])), "--force"])
+    assert r.returncode == 0, r.stderr
+    assert json.loads(_run(["status", "--run", run_dir]).stdout)["pending"] == 1
+
+
+def test_load_dag_reload_all_pending_still_allowed(tmp_path):
+    # PLAN-loop re-run: existing DAG is all-pending, so reload is NOT blocked (no --force needed).
+    run_dir = _init(tmp_path)
+    _load(run_dir, tmp_path, {"a": "pending", "b": "pending"})
+    r = _run(["load-dag", "--run", run_dir, "--file", str(_pending_dag_file(tmp_path, ["a", "b"]))])
+    assert r.returncode == 0, r.stderr
+
+
 # --- G3: gate names must be plan | final | dep:<id> --------------------------
 
 def test_verdict_rejects_invalid_gate_name(tmp_path):
