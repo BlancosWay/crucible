@@ -735,6 +735,23 @@ def test_show_plan_no_preconsensus_plan_does_not_show_later_edit(tmp_path):
     assert "UNAPPROVED LATE PLAN" not in out and "no plan artifact logged" in out
 
 
+def test_show_plan_allowed_after_proceed_with_flags(tmp_path):
+    # proceed-with-flags is an advance terminal, so show-plan must succeed and render its plan.
+    cfg = Path(tmp_path) / "c.json"; cfg.write_text(json.dumps({"on_cap": "proceed_with_flags"}))
+    run_dir = _run(["init-run", "--goal", "g", "--base-dir", str(tmp_path), "--config", str(cfg)]).stdout.strip()
+    _load(run_dir, tmp_path, {"a": "pending"})
+    plan = Path(tmp_path) / "plan.md"; plan.write_text("PROCEEDED PLAN")
+    _run(["log", "--run", run_dir, "--event", "builder_output", "--gate", "plan", "--round", "1", "--file", str(plan)])
+    vpf = Path(tmp_path) / "vpf.json"
+    vpf.write_text(json.dumps({"gate": "plan", "round": 1, "verdict": "REQUEST_CHANGES", "summary": "x",
+                   "findings": [{"id": "F1", "severity": "blocker", "location": "x", "claim": "c", "suggestion": "s"}]}))
+    assert "PROCEED_WITH_FLAGS" in _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1",
+                                         "--max-rounds", "1", "--file", str(vpf)]).stdout
+    r = _run(["show-plan", "--run", run_dir])
+    assert r.returncode == 0, r.stderr
+    assert "PROCEEDED PLAN" in r.stdout
+
+
 def test_verdict_echoes_plan_and_dag_to_stderr_on_plan_consensus(tmp_path):
     # Bug repro: when the PLAN gate settles, `crucible verdict` must deterministically echo the
     # approved plan + dependency tree to the terminal (stderr) so the final plan/DAG is always
