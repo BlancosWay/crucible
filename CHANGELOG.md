@@ -7,6 +7,8 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-07-05
+
 ### Fixed
 - the PLAN settling-echo and dep-node validation no longer crash on a corrupt/malformed
   `dag.json`: a concluded gate never reports failure (exit 1) because of a bad `dag.json`, and a
