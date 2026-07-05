@@ -148,14 +148,16 @@ def _require_dep_node_in_dag(run: RunLog, gate: str) -> None:
         return
     node_id = gate[len("dep:"):]
     try:
-        dag = run.load_dag()
+        dag = DAG.from_dict(run.load_dag())
     except FileNotFoundError:
         raise ValueError(f"gate {gate!r} targets a dependency node, but this run has no "
                          f"dependency tree yet; run load-dag first")
-    known = {n.get("id") for n in dag.get("nodes", [])}
-    if node_id not in known:
+    # DAG.from_dict validates the shape, so a malformed dag.json surfaces as a clean `crucible:`
+    # error (a ValueError, or an "invalid JSON"/"missing required field" message) — never an
+    # AttributeError traceback.
+    if node_id not in dag.nodes:
         raise ValueError(f"gate {gate!r} targets unknown node {node_id!r}; known nodes: "
-                         f"{sorted(i for i in known if isinstance(i, str))}")
+                         f"{sorted(dag.nodes)}")
 
 
 def _require_gate_not_terminal(run: RunLog, gate: str) -> None:
@@ -415,7 +417,11 @@ def cmd_verdict(args) -> int:
     if args.gate == "plan" and decision.outcome in ("CONSENSUS", "PROCEED_WITH_FLAGS"):
         try:
             settled_dag = DAG.from_dict(run.load_dag())
-        except FileNotFoundError:
+        except (FileNotFoundError, json.JSONDecodeError, ValueError, KeyError, OSError):
+            # Best-effort echo: a missing OR corrupt/invalid/malformed dag.json must never turn a
+            # concluded gate into a failure. The outcome token + gate_consensus are already emitted;
+            # skip the echo. (CycleError is a ValueError; a node/edge missing a required key such as
+            # "id" raises KeyError.)
             settled_dag = None
         if settled_dag is not None:
             _print_approved_plan(run, settled_dag, sys.stderr)
