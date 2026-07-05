@@ -110,10 +110,25 @@ def _run_summary_lines(events: list[dict[str, Any]], dag: dict[str, Any]) -> lis
     nodes = dag.get("nodes", [])
     dag_done = bool(nodes) and all(n.get("status") == "done" for n in nodes)
 
+    # A `done` node is only legitimately complete if its OWN dep:<id> gate reached an advance
+    # terminal (consensus/proceed). A node marked done without that — e.g. `set-status --force` —
+    # bypassed review, so an otherwise-CLEAN run is flagged (not CLEAN) and the node(s) are named.
+    advance_gates = {
+        gate for gate, evs in gates.items()
+        if any(e["event"] in ("gate_consensus", "gate_proceeded_with_flags") for e in evs)
+    }
+    unreviewed_done = [n.get("id") for n in nodes
+                       if n.get("status") == "done" and f"dep:{n.get('id')}" not in advance_gates]
+    clean_but_unreviewed = (not capped and not flagged and bool(total) and consensus == total
+                            and dag_done and bool(unreviewed_done))
+
     if capped:
         status = f"BLOCKED — {capped} of {total} gate(s) capped with unresolved findings"
     elif flagged:
         status = f"FLAGGED — {flagged} of {total} gate(s) proceeded with unresolved findings"
+    elif clean_but_unreviewed:
+        status = (f"FLAGGED — {len(unreviewed_done)} node(s) marked done without an accepted "
+                  f"review gate")
     elif total and consensus == total and dag_done:
         status = f"CLEAN — all {total} gate(s) reached consensus"
     else:
@@ -124,6 +139,9 @@ def _run_summary_lines(events: list[dict[str, Any]], dag: dict[str, Any]) -> lis
         counts += f" \u00b7 {undecided} undecided"
 
     lines = ["## Summary", "", f"**Status:** {status}", "", f"**Gates:** {counts}"]
+    if clean_but_unreviewed:
+        ids = ", ".join(_san(n) for n in unreviewed_done)
+        lines.append(f"**Nodes done without an accepted review gate:** {len(unreviewed_done)} ({ids})")
 
     total_open = sum(len(ids) for _, ids in findings)
     if total_open:

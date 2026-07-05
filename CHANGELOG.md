@@ -8,6 +8,12 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
 ## [Unreleased]
 
 ### Fixed
+- the PLAN settling-echo and dep-node validation no longer crash on a corrupt/malformed
+  `dag.json`: a concluded gate never reports failure (exit 1) because of a bad `dag.json`, and a
+  malformed `dag.json` gives a clean `crucible:` error instead of an `AttributeError` traceback.
+- the run report no longer renders `CLEAN` when a `done` node lacks an accepted (consensus/proceed)
+  `dep` gate — e.g. a `set-status --force`d node that bypassed review — such an otherwise-`CLEAN`
+  run is instead `FLAGGED` and the node(s) are named.
 - `set-status` now refuses to mark a node `done` unless its own `dep:<node>` gate reached
   consensus (or proceeded with flags); pass `--force` to override for recovery (recorded in the
   run-log). Previously a node whose gate was capped — or never reviewed at all — could be marked

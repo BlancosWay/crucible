@@ -293,6 +293,32 @@ def test_summary_clean_when_all_gates_consensus_and_dag_done(tmp_path):
     assert "Unresolved blocking findings" not in block  # none, so line omitted
 
 
+def test_summary_flagged_when_done_node_lacks_review_gate(tmp_path):
+    # A node marked done without an accepted dep gate (e.g. --force) must NOT render CLEAN.
+    cfg = Config.from_dict({})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    run.save_dag({"nodes": [_node("a", status="done"), _node("b", status="done")], "edges": []})
+    run.append("gate_consensus", gate="plan", round=1)
+    run.append("gate_consensus", gate="dep:a", round=1)          # a reviewed
+    # b is done but has NO dep:b advance gate (forced / un-gated)
+    block = _summary_block(render_markdown(run))
+    assert "Status:** FLAGGED" in block
+    assert "without an accepted review gate" in block and "b" in block
+    assert "CLEAN" not in block
+
+
+def test_summary_clean_when_every_done_node_reviewed(tmp_path):
+    # Regression: every done node HAS an accepted dep gate -> still CLEAN.
+    cfg = Config.from_dict({})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    run.save_dag({"nodes": [_node("a", status="done"), _node("b", status="done")], "edges": []})
+    run.append("gate_consensus", gate="plan", round=1)
+    run.append("gate_consensus", gate="dep:a", round=1)
+    run.append("gate_consensus", gate="dep:b", round=1)
+    block = _summary_block(render_markdown(run))
+    assert "Status:** CLEAN" in block
+
+
 def test_summary_blocked_when_a_gate_capped(tmp_path):
     cfg = Config.from_dict({})
     run = init_run("g", cfg, base_dir=tmp_path)

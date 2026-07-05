@@ -858,6 +858,47 @@ def test_verdict_plan_consensus_without_dag_does_not_crash_or_echo(tmp_path):
     assert "no dependency tree" not in (r.stdout + r.stderr).lower()  # no masking placeholder
 
 
+# --- robust dag.json reads: the echo/validator never crash on a bad dag.json ---
+
+def test_verdict_plan_echo_survives_corrupt_dag(tmp_path):
+    # #6: a corrupt dag.json at settlement must NOT turn a concluded plan gate into a failure.
+    run_dir = _init(tmp_path)
+    _load(run_dir, tmp_path, {"a": "pending"})
+    (Path(run_dir) / "dag.json").write_text("CORRUPT{{{")          # break it after load
+    v = Path(tmp_path) / "v.json"
+    v.write_text(json.dumps({"gate": "plan", "round": 1, "verdict": "APPROVE", "summary": "ok", "findings": []}))
+    r = _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1", "--file", str(v)])
+    assert r.returncode == 0, r.stderr           # concluded gate does not report failure
+    assert r.stdout.strip() == "CONSENSUS"
+    assert [e["event"] for e in _events(run_dir)].count("gate_consensus") == 1
+
+
+def test_verdict_plan_echo_survives_malformed_dag_missing_id(tmp_path):
+    # #6/F1: a malformed-but-valid-JSON dag.json (node missing "id" -> KeyError in DAG.from_dict)
+    # must also not fail a concluded plan gate.
+    run_dir = _init(tmp_path)
+    _load(run_dir, tmp_path, {"a": "pending"})
+    (Path(run_dir) / "dag.json").write_text(json.dumps({"nodes": [{"title": "x"}], "edges": []}))
+    v = Path(tmp_path) / "v.json"
+    v.write_text(json.dumps({"gate": "plan", "round": 1, "verdict": "APPROVE", "summary": "ok", "findings": []}))
+    r = _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1", "--file", str(v)])
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "CONSENSUS"
+
+
+def test_verdict_dep_gate_clean_error_on_malformed_dag(tmp_path):
+    # #7: a malformed dag.json must give a clean crucible: error, not an AttributeError traceback.
+    run_dir = _init(tmp_path)
+    _load(run_dir, tmp_path, {"a": "pending"})
+    (Path(run_dir) / "dag.json").write_text(json.dumps({"nodes": [1, 2], "edges": []}))
+    v = Path(tmp_path) / "v.json"
+    v.write_text(json.dumps({"gate": "dep:a", "round": 1, "verdict": "APPROVE", "summary": "ok", "findings": []}))
+    r = _run(["verdict", "--run", run_dir, "--gate", "dep:a", "--round", "1", "--file", str(v)])
+    assert r.returncode != 0
+    assert "Traceback" not in r.stderr and "AttributeError" not in r.stderr
+    assert r.stderr.startswith("crucible:")
+
+
 # --- load-dag echoes the dependency tree on the terminal ---------------------
 
 def test_load_dag_echoes_tree_in_build_order(tmp_path):
