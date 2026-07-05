@@ -48,10 +48,20 @@ def _print_approved_plan(run, dag, stream=None) -> None:
     """Render the approved plan artifact + a given (already-loaded) dependency tree to
     ``stream``. Shared by `show-plan` (stdout) and the automatic echo when the PLAN gate
     settles (stderr). The caller loads the DAG, so each caller owns its strict-vs-tolerant
-    policy; this renderer never loads the DAG and never prints a masking placeholder."""
+    policy; this renderer never loads the DAG. The *approved* plan is the last plan
+    ``builder_output`` at or before the plan gate's advance-terminal (consensus/proceed) round —
+    never a later, un-reviewed edit; if nothing qualifies, the ``(no plan artifact logged)``
+    placeholder is shown rather than a post-consensus payload."""
     stream = sys.stdout if stream is None else stream
-    plans = [e for e in run.read_events()
-             if e.get("gate") == "plan" and e.get("event") == "builder_output"]
+    events = run.read_events()
+    advance = [e for e in events if e.get("gate") == "plan"
+               and e.get("event") in ("gate_consensus", "gate_proceeded_with_flags")]
+    approved_round = advance[-1].get("round") if advance else None
+    plans = [e for e in events if e.get("gate") == "plan" and e.get("event") == "builder_output"]
+    if approved_round is not None:
+        # Bound to the approved round; if nothing qualifies, do NOT fall back to a later
+        # (post-consensus) edit — render the no-artifact placeholder instead.
+        plans = [e for e in plans if isinstance(e.get("round"), int) and e["round"] <= approved_round]
     print("=== Approved plan ===", file=stream)
     print(plans[-1].get("payload", "(no plan artifact logged)") if plans else "(no plan artifact logged)",
           file=stream)
@@ -461,9 +471,11 @@ def cmd_show_plan(args) -> int:
     """
     run = RunLog(args.run)
     concluded = [e for e in run.read_events()
-                 if e.get("gate") == "plan" and e.get("event") in _TERMINAL_EVENTS]
+                 if e.get("gate") == "plan"
+                 and e.get("event") in ("gate_consensus", "gate_proceeded_with_flags")]
     if not concluded:
-        raise SystemExit("show-plan: the plan gate has not reached consensus yet; nothing to show")
+        raise SystemExit("show-plan: the plan gate has not reached consensus (or proceeded with "
+                         "flags) yet; nothing to show")
     dag = DAG.from_dict(run.load_dag())
     _print_approved_plan(run, dag, sys.stdout)
     return 0

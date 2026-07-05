@@ -691,6 +691,50 @@ def test_show_plan_requires_plan_consensus(tmp_path):
     assert "consensus" in r.stderr.lower()
 
 
+def test_show_plan_renders_approved_not_latest(tmp_path):
+    # show-plan must render the plan approved at the consensus round, not a later edit.
+    run_dir = _init(tmp_path)
+    _load(run_dir, tmp_path, {"a": "pending"})
+    p1 = Path(tmp_path) / "p1.md"; p1.write_text("APPROVED PLAN v1")
+    _run(["log", "--run", run_dir, "--event", "builder_output", "--gate", "plan", "--round", "1", "--file", str(p1)])
+    vok = Path(tmp_path) / "vok.json"
+    vok.write_text(json.dumps({"gate": "plan", "round": 1, "verdict": "APPROVE", "summary": "ok", "findings": []}))
+    assert _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1", "--file", str(vok)]).stdout.strip() == "CONSENSUS"
+    p2 = Path(tmp_path) / "p2.md"; p2.write_text("UNAPPROVED PLAN v2")
+    _run(["log", "--run", run_dir, "--event", "builder_output", "--gate", "plan", "--round", "99", "--file", str(p2)])
+    out = _run(["show-plan", "--run", run_dir]).stdout
+    assert "APPROVED PLAN v1" in out and "UNAPPROVED PLAN v2" not in out
+
+
+def test_show_plan_refuses_capped_plan_gate(tmp_path):
+    # A CAPPED (halt) plan gate is not an approval — show-plan must refuse, not print "Approved".
+    run_dir = _init(tmp_path)
+    _load(run_dir, tmp_path, {"a": "pending"})
+    vcap = Path(tmp_path) / "vcap.json"
+    vcap.write_text(json.dumps({"gate": "plan", "round": 1, "verdict": "REQUEST_CHANGES",
+                    "summary": "blk", "findings": [{"id": "F1", "severity": "blocker",
+                    "location": "x", "claim": "c", "suggestion": "s"}]}))
+    assert "CAPPED" in _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1",
+                             "--max-rounds", "1", "--file", str(vcap)]).stdout
+    r = _run(["show-plan", "--run", run_dir])
+    assert r.returncode != 0
+    assert "Approved plan" not in r.stdout
+
+
+def test_show_plan_no_preconsensus_plan_does_not_show_later_edit(tmp_path):
+    # F1 edge case: consensus with a loaded DAG but NO pre-consensus builder_output, then a
+    # post-consensus round-99 edit -> show-plan must NOT print the later unapproved payload.
+    run_dir = _init(tmp_path)
+    _load(run_dir, tmp_path, {"a": "pending"})
+    vok = Path(tmp_path) / "vok.json"
+    vok.write_text(json.dumps({"gate": "plan", "round": 1, "verdict": "APPROVE", "summary": "ok", "findings": []}))
+    assert _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1", "--file", str(vok)]).stdout.strip() == "CONSENSUS"
+    p2 = Path(tmp_path) / "p2.md"; p2.write_text("UNAPPROVED LATE PLAN")
+    _run(["log", "--run", run_dir, "--event", "builder_output", "--gate", "plan", "--round", "99", "--file", str(p2)])
+    out = _run(["show-plan", "--run", run_dir]).stdout
+    assert "UNAPPROVED LATE PLAN" not in out and "no plan artifact logged" in out
+
+
 def test_verdict_echoes_plan_and_dag_to_stderr_on_plan_consensus(tmp_path):
     # Bug repro: when the PLAN gate settles, `crucible verdict` must deterministically echo the
     # approved plan + dependency tree to the terminal (stderr) so the final plan/DAG is always

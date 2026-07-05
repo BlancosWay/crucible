@@ -21,6 +21,9 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
   re-run silently wiped a run's node statuses.
 - `config` now rejects unknown nested keys under `builder`/`critic` (e.g. a misspelled `model`)
   instead of silently keeping the typo and falling back to the default model/effort.
+- `show-plan` (and the settling-verdict echo) now render the plan that was actually approved — the
+  plan `builder_output` at or before the gate's consensus/proceed round, not a later edit — and
+  `show-plan` refuses to treat a capped (halted) plan gate as approved.
 
 ## [0.10.2] - 2026-07-04
 
