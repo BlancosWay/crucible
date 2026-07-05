@@ -165,6 +165,15 @@ def _max_rounds_for_gate(cfg: Config, gate: str) -> int:
     return cfg.max_rounds_plan if gate in ("plan", "reproduce") else cfg.max_rounds_dep
 
 
+def _expected_round(run: RunLog, gate: str) -> int:
+    """The next review round for a gate, DERIVED from run history: one past the number of
+    ``critic_verdict`` events already logged for that gate. This makes round counting CLI-owned
+    (F1b) so a caller cannot skip to the cap or repeat a round to dodge it."""
+    prior = sum(1 for e in run.read_events()
+                if e.get("gate") == gate and e.get("event") == "critic_verdict")
+    return prior + 1
+
+
 def cmd_init_run(args) -> int:
     cfg = load_config(args.config) if args.config else Config.from_dict({})
     base = args.base_dir or os.environ.get("CRUCIBLE_RUNS_DIR") or str(Path.home() / ".crucible" / "runs")
@@ -234,9 +243,28 @@ def cmd_set_status(args) -> int:
         if unmet:
             raise SystemExit(f"set-status: cannot set {args.node!r} to {args.status!r} while these "
                              f"dependencies are not done: {unmet}")
+    # H2: a node may only be marked `done` once its OWN review gate (dep:<node>) reached a terminal
+    # ADVANCE outcome — gate_consensus or gate_proceeded_with_flags. A gate_capped (halt) does NOT
+    # qualify. Use LAST-terminal-event semantics (matching report.py) so a runlog where an earlier
+    # consensus is followed by a later gate_capped is correctly treated as capped. Without this,
+    # `next` would schedule dependents of a node whose review the CLI decided must halt (or that
+    # was never reviewed), advancing past a gate without consensus. `--force` is the explicit,
+    # logged human recovery override.
+    if args.status == "done" and not args.force:
+        node_gate = f"dep:{args.node}"
+        terminal = [e.get("event") for e in run.read_events()
+                    if e.get("gate") == node_gate
+                    and e.get("event") in ("gate_consensus", "gate_proceeded_with_flags", "gate_capped")]
+        accepted = bool(terminal) and terminal[-1] in ("gate_consensus", "gate_proceeded_with_flags")
+        if not accepted:
+            raise SystemExit(
+                f"set-status: refusing to mark {args.node!r} done — its review gate {node_gate!r} "
+                f"has not reached consensus (or proceeded with flags). Run the gate to a terminal "
+                f"advance first, or pass --force to override (recorded)."
+            )
     dag.set_status(args.node, args.status)
     run.save_dag(dag.to_dict())
-    run.append("node_status_change", node=args.node, status=args.status)
+    run.append("node_status_change", node=args.node, status=args.status, forced=bool(args.force))
     print(f"{args.node} -> {args.status}")
     return 0
 
@@ -282,6 +310,18 @@ def cmd_verdict(args) -> int:
     # node — both before anything is logged or decided.
     _require_gate_not_terminal(run, args.gate)
     _require_dep_node_in_dag(run, args.gate)
+
+    # F1b: the round is DERIVED from run history, not trusted from the caller. It must be exactly
+    # one past the number of prior review rounds for this gate — closing the bypass where a caller
+    # asserts round=max (immediate cap) or repeats a round to never cap. Checked after C3/C1 so a
+    # concluded/ghost gate is still rejected for its own reason first.
+    expected = _expected_round(run, args.gate)
+    if args.round != expected:
+        raise SystemExit(
+            f"verdict --round {args.round} does not match the expected round {expected} for gate "
+            f"{args.gate!r} ({expected - 1} prior review round(s) logged); rounds are derived from "
+            f"run history and must be consecutive starting at 1."
+        )
 
     # H1: reject a Critic verdict whose APPROVE/REQUEST_CHANGES label contradicts its
     # findings under the run's blocking_severities, before logging or deciding.
@@ -472,6 +512,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("set-status"); s.add_argument("--run", required=True)
     s.add_argument("--node", required=True); s.add_argument("--status", required=True)
+    s.add_argument("--force", action="store_true",
+                   help="override the node-gate-consensus requirement when marking done (recovery; logged)")
     s.set_defaults(func=cmd_set_status)
 
     s = sub.add_parser("log"); s.add_argument("--run", required=True); s.add_argument("--event", required=True)

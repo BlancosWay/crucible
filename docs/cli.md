@@ -35,7 +35,7 @@ is the path `init-run` printed.
 | Command | Arguments | Behavior |
 |---------|-----------|----------|
 | `next` | `--run RUN` (required) | Print the next ready node id on stdout (empty line when every node is `done`). If no node can be scheduled: exit **4** when work is still in flight, exit **3** when the run is STUCK — both with the unfinished nodes and their unmet deps on stderr. |
-| `set-status` | `--run RUN`, `--node NODE`, `--status STATUS` (all required) | Set a node's status. Refuses to move a node to a work status (`in_progress`/`in_review`/`done`) while any dependency is not `done`. |
+| `set-status` | `--run RUN`, `--node NODE`, `--status STATUS` (all required); `--force` (optional) | Set a node's status. Refuses to move a node to a work status (`in_progress`/`in_review`/`done`) while any dependency is not `done`. Also refuses to mark a node `done` unless its own `dep:<node>` gate reached consensus (or proceeded with flags) — a capped or never-reviewed node is rejected. `--force` overrides that gate requirement for recovery; the override is recorded only in run-log provenance (the `node_status_change` `forced` flag), so a `--force`d/un-gated node can still render `CLEAN` in the report. |
 | `status` | `--run RUN` (required) | Print run progress as JSON (node counts by status). |
 
 ## Record gates & adjudicate verdicts
@@ -43,7 +43,7 @@ is the path `init-run` printed.
 | Command | Arguments | Behavior |
 |---------|-----------|----------|
 | `log` | `--run RUN`, `--event EVENT`, `--gate GATE`, `--round ROUND` (required), `--file FILE` | Append a Builder or Critic transcript to the run log. `--event` is `builder_output` or `critic_output` (other events are written by their own commands). `--file` supplies the payload; omit it for an empty payload. |
-| `verdict` | `--run RUN`, `--gate GATE`, `--round ROUND` (required), `--max-rounds M`, `--resolutions FILE`, `--file FILE` (required) | Adjudicate the Critic's verdict deterministically into `CONSENSUS`, `CHANGES`, `PROCEED_WITH_FLAGS`, or `CAPPED`, honoring `blocking_severities`, `defer_severities`, and `strict_rebuttal`. `--resolutions` is the Builder's per-finding map (`id` → `fixed` / `deferred` / `wontfix`); `--max-rounds` overrides the cap (defaults to `max_rounds_plan`/`max_rounds_dep` by gate). Prints the outcome, the findings the Builder will fix, and any unresolved blocking findings; when the PLAN gate settles it also echoes the approved plan + DAG. |
+| `verdict` | `--run RUN`, `--gate GATE`, `--round ROUND` (required), `--max-rounds M`, `--resolutions FILE`, `--file FILE` (required) | Adjudicate the Critic's verdict deterministically into `CONSENSUS`, `CHANGES`, `PROCEED_WITH_FLAGS`, or `CAPPED`, honoring `blocking_severities`, `defer_severities`, and `strict_rebuttal`. `--round` must equal the CLI-derived next round for the gate (one past the number of prior `critic_verdict` events, i.e. consecutive starting at 1); a mismatch is rejected, so the round cap cannot be bypassed by skipping to the cap or repeating a round. `--resolutions` is the Builder's per-finding map (`id` → `fixed` / `deferred` / `wontfix`); `--max-rounds` overrides the cap (defaults to `max_rounds_plan`/`max_rounds_dep` by gate). Prints the outcome, the findings the Builder will fix, and any unresolved blocking findings; when the PLAN gate settles it also echoes the approved plan + DAG. |
 
 ## Config-driven gate switches
 
