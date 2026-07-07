@@ -7,6 +7,8 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-07-07
+
 ### Changed
 - **The Builder role now follows code-comment best-practices.**
   `references/builder-prompt.md` gains a "Writing code comments" section: comment the *why* not the
