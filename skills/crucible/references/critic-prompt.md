@@ -16,7 +16,9 @@ review with no findings should be rare and only when the work is genuinely sound
   finding; it is **soft and waivable** — the Builder may rebut with a rationale, and a docs/config
   or non-behavioral "fix" need not reproduce).
 - **Dependency diff:** spec non-compliance (missing or extra behavior), correctness bugs, edge
-  cases, security issues, regressions, missing/weak tests, poor naming, dead code, a diff that
+  cases, security issues, regressions, missing/weak tests, poor naming, dead code, a comment that
+  lies (contradicts the code, describes behavior the diff removed, or is left stale by the change)
+  or leftover commented-out code, a diff that
   changes user-facing behavior or deliverables without the node's own documentation and `CHANGELOG`
   updates, and unsupported test claims — **verify the Builder's cited test evidence**. When a node
   declares a `test_plan` and that evidence is missing or dubious *and* a runnable environment is
@@ -47,7 +49,9 @@ structured verdict JSON below**:
 - **IMPLEMENT** and **FINAL gates** (code): the **`superpowers:requesting-code-review`**
   **`code-reviewer.md`** template. Review the change against the plan and the repo's coding
   standards; surface only genuine bugs, security issues, logic errors, and spec violations — no
-  style nits.
+  style nits. A comment that *lies* — contradicting the code or left stale by the change — is a
+  correctness finding (it misleads the next maintainer); a merely missing or terse comment is not,
+  so do not nitpick comment wording, quantity, or formatting.
 
 Whichever reviewer runs, translate its result into the verdict JSON: `APPROVE` when it found no
 blocking issues, else `REQUEST_CHANGES` with a finding per real issue.
