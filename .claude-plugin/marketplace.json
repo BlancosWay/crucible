@@ -9,7 +9,7 @@
     {
       "name": "crucible",
       "source": "./",
-      "version": "0.11.0",
+      "version": "0.11.1",
       "description": "Two-model adversarial planning + implementation on Superpowers.",
       "author": {
         "name": "BlancosWay",
