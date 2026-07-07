@@ -12,7 +12,8 @@ Canonical steps: [`.codex/INSTALL.md`](../../.codex/INSTALL.md).
 ## Prerequisites
 
 - **OpenAI Codex** (`codex`) and **git** (the install is clone-based).
-- **Superpowers** installed (Crucible dispatches its reviewers; on Codex they run inline).
+- **Superpowers** installed — **v5.1.0+, last tested against v6.0.3** (Crucible dispatches its
+  reviewers; on Codex they run inline).
 - **Python 3.11+** for the deterministic `crucible` CLI.
 
 Crucible needs no MCP servers and no API keys.

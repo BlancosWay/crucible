@@ -7,6 +7,13 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
 
 ## [Unreleased]
 
+### Changed
+- **Documented the Superpowers version Crucible targets.** README Install and every prerequisite
+  surface (`docs/install/*.md`, `.codex/INSTALL.md`, `CLAUDE.md`, `AGENTS.md`, `NOTICE`) now state
+  Crucible needs **Superpowers v5.1.0+** and is **last tested against v6.0.3**; the Copilot/Claude
+  install docs and `CLAUDE.md` now call the code-review reviewer the **`requesting-code-review`
+  reviewer template** (not the `superpowers:code-reviewer` named agent Superpowers removed in v5.1.0).
+
 ## [0.11.1] - 2026-07-07
 
 ### Changed
