@@ -7,6 +7,13 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
 
 ## [Unreleased]
 
+### Changed
+- **The Builder role now follows code-comment best-practices.**
+  `references/builder-prompt.md` gains a "Writing code comments" section: comment the *why* not the
+  *what*, keep comments concise, document assumptions/edge-cases and workarounds, use
+  `TODO`/`FIXME`/`NOTE`/`HACK` tags, prefer docstrings for public APIs, avoid obvious/brace/
+  commented-out-code noise, and never let a comment lie (update comments when the code changes).
+
 ## [0.11.0] - 2026-07-05
 
 ### Fixed
