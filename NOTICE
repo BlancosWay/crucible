@@ -11,8 +11,9 @@ Crucible is a workflow that runs on top of Superpowers
 (https://github.com/obra/superpowers). It does not vendor or redistribute
 Superpowers; it invokes Superpowers skills (writing-plans, brainstorming,
 subagent-driven-development, using-git-worktrees, finishing-a-development-branch)
-and the plan-document-reviewer / spec-document-reviewer / code-reviewer agents
-at runtime. Superpowers must be installed separately. Crucible is not
+and the plan-document-reviewer / spec-document-reviewer / code-reviewer templates
+at runtime. Superpowers must be installed separately (Crucible needs Superpowers
+v5.1.0+, last tested against v6.0.3). Crucible is not
 affiliated with or endorsed by the Superpowers project.
 
 ------------------------------------------------------------------------

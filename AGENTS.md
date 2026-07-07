@@ -16,7 +16,8 @@ Crucible is a **two-model adversarial planning + implementation** workflow built
 3. **Realize roles from prompt files.** Codex has no native sub-agents, so run the Critic as a
    clearly delimited "Acting as Critic now" pass using `references/critic-prompt.md`, capture its
    JSON verdict, and feed it to `crucible verdict` (see the no-subagent fallback in
-   `references/platform-notes.md`). Superpowers must be installed.
+   `references/platform-notes.md`). Superpowers must be installed — **v5.1.0+, last tested against
+   v6.0.3**.
 
 ## Defaults & determinism
 

@@ -10,8 +10,9 @@ Crucible is a **two-model adversarial planning + implementation** plugin built o
 - **Marketplace (no clone):** `/plugin marketplace add BlancosWay/crucible` then `/plugin install crucible`
 - **Local clone (for development):** `claude --plugin-dir /path/to/crucible` (picks up edits immediately)
 
-Superpowers must also be installed (Crucible dispatches its `writing-plans`,
-`subagent-driven-development`, and `code-reviewer` reviewers). Once loaded, the workflow is the
+Superpowers must also be installed — **v5.1.0+, last tested against v6.0.3** (Crucible uses
+Superpowers `writing-plans` and `subagent-driven-development`, and dispatches the
+`requesting-code-review` reviewer template). Once loaded, the workflow is the
 `crucible:crucible` skill with `crucible:crucible` as a slash command.
 
 ## Run

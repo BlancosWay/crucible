@@ -10,8 +10,8 @@ Follow the option that fits you: **[A — just run it](#option-a-just-run-it)** 
 ## Prerequisites
 
 - **Claude Code** (`claude`).
-- **Superpowers** installed (Crucible dispatches its `writing-plans` / `brainstorming` reviewers
-  and the `code-reviewer` reviewer).
+- **Superpowers** installed — **v5.1.0+, last tested against v6.0.3** (Crucible dispatches its
+  `writing-plans` / `brainstorming` reviewers and the `requesting-code-review` reviewer template).
 - **Python 3.11+** for the deterministic `crucible` CLI.
 
 Crucible needs **no MCP servers and no API keys**.

@@ -63,6 +63,12 @@ copilot plugin install crucible@crucible-marketplace
 Then `/crucible <goal>`. Full per-platform steps: **[Copilot CLI](docs/install/copilot-cli.md)** ·
 **[Claude Code](docs/install/claude-code.md)** · **[Codex](docs/install/codex.md)**.
 
+> **Superpowers compatibility.** Crucible needs **Superpowers v5.1.0+** and is **last tested
+> against v6.0.3**. It drives Superpowers reviewer *templates* (e.g. `requesting-code-review`'s
+> `code-reviewer.md`) rather than the `superpowers:code-reviewer` named agent that Superpowers
+> removed in v5.1.0 — dispatched as general-purpose subagents on subagent-capable runtimes, and run
+> inline on Codex. Re-validate Crucible after a major Superpowers upgrade.
+
 ## Usage
 
 In an agent runtime with Superpowers installed, run the skill:
