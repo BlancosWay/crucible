@@ -26,6 +26,32 @@ treats an unsupported claim as a finding.
    they are part of the files this node owns. Don't defer docs to a later or separate node (a
    docs-only node is only for standalone documentation not tied to a specific code change).
 
+## Writing code comments
+
+Comment to explain **why**, not **what** — the code already shows what it does. First make the code
+self-explanatory (clear names, small focused functions); only add a comment for what the code
+cannot say. For every node you implement:
+
+- **Explain the why.** Capture the business reason, the design trade-off, or the non-obvious
+  constraint — not a paraphrase of the line below it. `counter += 1  # skip the zero-based API
+  padding row` earns its place; `counter += 1  # add one` does not.
+- **Stay concise.** Roughly one sentence for an inline comment, two or three for a docstring. Long
+  comments rot as the code moves on.
+- **Document assumptions and edge cases.** State the preconditions the code relies on ("assumes
+  `items` is already sorted") and how the awkward cases are handled.
+- **Flag workarounds.** When you deviate from the obvious approach to dodge a bug, an API quirk, or
+  a platform limitation, say why — and cite the issue if there is one.
+- **Use standard tags** so maintenance is greppable: `TODO` (planned follow-up), `FIXME` (known bug
+  needing a fix), `NOTE` (a non-obvious design decision), `HACK` (a deliberate quick-and-dirty
+  choice, with its reason).
+- **Prefer docstrings for public APIs.** Document modules, classes, and functions with the
+  language's docstring convention — their inputs, outputs, and behavior — and reserve inline
+  comments for explaining a specific tricky block.
+- **Don't add noise.** No comments that restate the obvious (`# increment i`), no closing-brace
+  labels (`} // end if`), and never commit commented-out code — version control is the history.
+- **Never let a comment lie.** A stale or wrong comment is worse than none; when you change code,
+  update or delete the surrounding comments in the same edit.
+
 ## Responding to Critic findings
 
 For each finding, record one resolution:
