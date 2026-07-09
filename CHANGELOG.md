@@ -14,6 +14,10 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
   rejected by `crucible verdict --resolutions`), and `crucible set-status --force` now requires a
   new `--rationale` argument recorded on the `node_status_change` event. `references/builder-prompt.md`
   and `docs/cli.md` document the requirement.
+- **The run report Summary now surfaces audited overrides.** `report.py`'s `## Summary` gains an
+  **Overrides** line listing every `set-status --force` node advance and every `wontfix`/`deferred`
+  rebuttal (across all rounds) with its recorded rationale — derived purely from the run log and
+  sanitized — so a low-effort or missing reason is visible at a glance.
 
 ## [0.11.1] - 2026-07-07
 

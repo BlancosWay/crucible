@@ -154,6 +154,49 @@ def test_report_renders_builder_resolution_plain_string_value(tmp_path):
     assert "F1" in md and "deferred" in md
 
 
+def _summary_block(md):
+    return md.split("## Summary", 1)[1].split("## Dependency tree", 1)[0]
+
+
+def test_summary_lists_forced_node_rationale(tmp_path):
+    run = init_run("g", Config.from_dict({}), base_dir=tmp_path)
+    run.save_dag({"nodes": [{"id": "auth-model", "title": "Auth", "description": "",
+                             "files": [], "test_plan": "", "status": "done"}], "edges": []})
+    run.append("node_status_change", node="auth-model", status="done", forced=True,
+               rationale="manual recovery: CI outage")
+    summary = _summary_block(render_markdown(run))
+    assert "manual recovery: CI outage" in summary and "auth-model" in summary
+
+
+def test_summary_lists_wontfix_rationale(tmp_path):
+    run = _provenance_run(tmp_path)
+    run.append("builder_resolution", gate="dep:a", round=1,
+               payload={"F1": {"resolution": "wontfix", "rationale": "false positive"}})
+    summary = _summary_block(render_markdown(run))
+    assert "F1" in summary and "false positive" in summary
+
+
+def test_summary_surfaces_earlier_round_override(tmp_path):
+    # An override from round 1 must still surface even when a later round of the same gate
+    # logs a different resolution payload (scan all builder_resolution events, not last-per-gate).
+    run = _provenance_run(tmp_path)
+    run.append("builder_resolution", gate="dep:a", round=1,
+               payload={"F1": {"resolution": "wontfix", "rationale": "early rebuttal"}})
+    run.append("builder_resolution", gate="dep:a", round=2,
+               payload={"F2": {"resolution": "deferred", "rationale": "later defer"}})
+    summary = _summary_block(render_markdown(run))
+    assert "early rebuttal" in summary and "later defer" in summary
+
+
+def test_summary_skips_bare_string_resolution_without_rationale(tmp_path):
+    # A historical/hand-built bare-string payload carries no rationale; it must not crash the
+    # scan and must not appear as an audited override in the Summary.
+    run = _provenance_run(tmp_path)
+    run.append("builder_resolution", gate="dep:a", round=1, payload={"F1": "deferred"})
+    summary = _summary_block(render_markdown(run))
+    assert "Overrides" not in summary
+
+
 def test_report_renders_critic_verdict_raw(tmp_path):
     run = _provenance_run(tmp_path)
     run.append("critic_verdict", gate="plan", round=1,

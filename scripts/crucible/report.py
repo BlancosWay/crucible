@@ -187,6 +187,40 @@ def _run_summary_lines(events: list[dict[str, Any]], dag: dict[str, Any]) -> lis
             # escape) inside an f-string '{...}' is a SyntaxError before Python 3.12.
             detail = " \u00b7 ".join(parts)
             lines.append(f"**Unresolved by severity:** {detail}")
+
+    # Audited overrides — every point where the adversarial loop was bypassed carries a recorded
+    # reason: a `set-status --force` node advance, or a `wontfix`/`deferred` rebuttal that cleared a
+    # finding. Surface them here (derived purely from the run log, `_san`-sanitized, no backticks —
+    # same non-injection convention as the findings block above) so a low-effort rationale is visible.
+    overrides: list[str] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for e in events:
+        ev = e.get("event")
+        if ev == "node_status_change" and e.get("forced"):
+            reason = e.get("rationale")
+            if isinstance(reason, str) and reason.strip():
+                key = ("force", str(e.get("node")), "", reason)
+                if key not in seen:
+                    seen.add(key)
+                    overrides.append(f"forced node {_san(e.get('node'))} done \u2014 {_san(reason)}")
+        elif ev == "builder_resolution":
+            payload = e.get("payload")
+            if isinstance(payload, dict):
+                gate = e.get("gate")
+                for fid, info in payload.items():
+                    if not isinstance(info, dict):
+                        continue  # bare-string payloads carry no rationale — nothing to audit
+                    res = info.get("resolution")
+                    reason = info.get("rationale")
+                    if res in ("wontfix", "deferred") and isinstance(reason, str) and reason.strip():
+                        key = (str(gate), str(fid), str(res), reason)
+                        if key not in seen:
+                            seen.add(key)
+                            overrides.append(
+                                f"{_san(res)} {_san(fid)} ({_san(gate)}) \u2014 {_san(reason)}"
+                            )
+    if overrides:
+        lines.append(f"**Overrides:** {len(overrides)} (" + "; ".join(overrides) + ")")
     lines.append("")
     return lines
 
