@@ -57,8 +57,11 @@ cannot say. For every node you implement:
 For each finding, record one resolution:
 
 - `fixed` — you addressed it; it will be re-reviewed next round.
-- `deferred` — only allowed for `minor`/`nit` (per config `defer_severities`); state why.
+- `deferred` — only allowed for `minor`/`nit` (per config `defer_severities`); state why. **Requires a
+  non-empty `rationale`** — use the object form `{"resolution": "deferred", "rationale": "…"}`.
 - `wontfix` — a **rebuttal**: explain precisely why the finding is wrong or out of scope. Be
-  specific; the rebuttal is logged and surfaced to the human.
+  specific; the rebuttal is logged and surfaced to the human. **Requires a non-empty `rationale`**
+  — use the object form `{"resolution": "wontfix", "rationale": "…"}`. Because `wontfix`/`deferred`
+  clear a finding without a fix, the CLI rejects a bare `"wontfix"`/`"deferred"` that records no reason.
 
 Do not mark `fixed` unless you actually changed something. Do not silently drop a finding.

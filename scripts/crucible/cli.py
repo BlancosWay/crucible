@@ -88,6 +88,17 @@ def _load_resolutions(path):
         if res not in VALID_RESOLUTIONS:
             raise ValueError(f"invalid resolution {res!r} for {fid}; must be one of "
                              f"{VALID_RESOLUTIONS} (omit the id to leave a finding unresolved)")
+        # `wontfix` (a rebuttal) and `deferred` clear a blocking finding without a fix — the loop
+        # advances past it — so each must carry a non-empty rationale for the audit trail. `fixed`
+        # is re-reviewed next round, so it needs none.
+        if res in ("wontfix", "deferred"):
+            rationale = raw[fid].get("rationale")
+            if not (isinstance(rationale, str) and rationale.strip()):
+                raise ValueError(
+                    f"resolution {res!r} for {fid} requires a non-empty 'rationale' "
+                    f'(use the object form {{"resolution": {res!r}, "rationale": "…"}}); '
+                    f"a bare {res!r} that clears a finding without a recorded reason is not allowed"
+                )
         norm[fid] = res
     return norm, raw
 
@@ -291,9 +302,18 @@ def cmd_set_status(args) -> int:
                 f"has not reached consensus (or proceeded with flags). Run the gate to a terminal "
                 f"advance first, or pass --force to override (recorded)."
             )
+    # A --force bypasses the review gate above (an explicit human override), so it must carry a
+    # non-empty rationale — recorded in provenance and surfaced in the report — for the audit trail.
+    rationale = (args.rationale or "").strip()
+    if args.force and not rationale:
+        raise SystemExit(
+            "set-status: --force requires --rationale explaining the override "
+            "(it bypasses the node's review gate; the reason is recorded in the run log)."
+        )
     dag.set_status(args.node, args.status)
     run.save_dag(dag.to_dict())
-    run.append("node_status_change", node=args.node, status=args.status, forced=bool(args.force))
+    run.append("node_status_change", node=args.node, status=args.status,
+               forced=bool(args.force), rationale=rationale)
     print(f"{args.node} -> {args.status}")
     return 0
 
@@ -551,6 +571,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--node", required=True); s.add_argument("--status", required=True)
     s.add_argument("--force", action="store_true",
                    help="override the node-gate-consensus requirement when marking done (recovery; logged)")
+    s.add_argument("--rationale", default="",
+                   help="reason for --force; required with --force and recorded in run-log provenance")
     s.set_defaults(func=cmd_set_status)
 
     s = sub.add_parser("log"); s.add_argument("--run", required=True); s.add_argument("--event", required=True)

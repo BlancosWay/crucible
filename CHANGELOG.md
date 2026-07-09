@@ -7,6 +7,14 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
 
 ## [Unreleased]
 
+### Changed
+- **Loop-bypass overrides now require an audited rationale.** A `wontfix` or `deferred` resolution
+  must use the object form `{"resolution": "wontfix", "rationale": "…"}` with a non-empty
+  `rationale` (a bare `"wontfix"`/`"deferred"` that clears a finding without a recorded reason is
+  rejected by `crucible verdict --resolutions`), and `crucible set-status --force` now requires a
+  new `--rationale` argument recorded on the `node_status_change` event. `references/builder-prompt.md`
+  and `docs/cli.md` document the requirement.
+
 ## [0.11.1] - 2026-07-07
 
 ### Changed

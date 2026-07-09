@@ -63,6 +63,32 @@ def test_load_resolutions_dict_and_scalar_forms(tmp_path):
     assert raw["F1"] == {"resolution": "fixed"} and raw["F2"]["rationale"] == "r"
 
 
+def test_load_resolutions_requires_rationale_for_wontfix(tmp_path):
+    # A bare wontfix clears a blocking finding without a recorded reason — now rejected.
+    path = _write(tmp_path, "res.json", {"F1": "wontfix"})
+    with pytest.raises(ValueError, match="rationale"):
+        _load_resolutions(path)
+
+
+def test_load_resolutions_requires_rationale_for_deferred(tmp_path):
+    # Whitespace-only rationale does not count.
+    path = _write(tmp_path, "res.json", {"F1": {"resolution": "deferred", "rationale": "  "}})
+    with pytest.raises(ValueError, match="rationale"):
+        _load_resolutions(path)
+
+
+def test_load_resolutions_fixed_needs_no_rationale(tmp_path):
+    path = _write(tmp_path, "res.json", {"F1": "fixed"})
+    norm, _ = _load_resolutions(path)
+    assert norm == {"F1": "fixed"}
+
+
+def test_load_resolutions_wontfix_with_rationale_ok(tmp_path):
+    path = _write(tmp_path, "res.json", {"F1": {"resolution": "wontfix", "rationale": "out of scope"}})
+    norm, raw = _load_resolutions(path)
+    assert norm == {"F1": "wontfix"} and raw["F1"]["rationale"] == "out of scope"
+
+
 # --- main() error branches (caught -> exit 1; guards -> SystemExit) -----------
 
 def test_main_load_dag_empty_exits(tmp_path):
@@ -199,7 +225,7 @@ def test_verdict_wontfix_default_clears_prints_no_sections(tmp_path, capsys):
     run = _init(tmp_path)
     capsys.readouterr()
     rc = _run_verdict(tmp_path, run, [_find("F1", "blocker")], "REQUEST_CHANGES",
-                      resolutions={"F1": "wontfix"})
+                      resolutions={"F1": {"resolution": "wontfix", "rationale": "r"}})
     out = capsys.readouterr()
     assert rc == 0
     assert out.out.strip() == "CONSENSUS"  # default strict_rebuttal=false -> wontfix clears
@@ -220,7 +246,7 @@ def test_verdict_strict_rebuttal_wontfix_shows_in_unresolved_with_tag(tmp_path, 
     run = _init_cfg(tmp_path, {"strict_rebuttal": True})
     capsys.readouterr()
     rc = _run_verdict(tmp_path, run, [_find("F1", "blocker")], "REQUEST_CHANGES",
-                      resolutions={"F1": "wontfix"})
+                      resolutions={"F1": {"resolution": "wontfix", "rationale": "r"}})
     out = capsys.readouterr()
     assert rc == 0
     assert out.out.strip() == "CHANGES"  # strict: wontfix stays open, round < cap

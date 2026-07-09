@@ -291,7 +291,7 @@ def test_verdict_resolutions_and_raw_are_logged(tmp_path):
         "findings": [{"id": "F1", "severity": "major", "location": "x", "claim": "c", "suggestion": "s"}],
     }))
     res = Path(tmp_path) / "res.json"
-    res.write_text(json.dumps({"F1": "wontfix"}))
+    res.write_text(json.dumps({"F1": {"resolution": "wontfix", "rationale": "r"}}))
     r = _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1", "--file", str(vfile), "--resolutions", str(res)])
     assert "CONSENSUS" in r.stdout, r.stdout + r.stderr
     events = [json.loads(l) for l in (Path(run_dir) / "runlog.jsonl").read_text().splitlines() if l.strip()]
@@ -380,7 +380,8 @@ def _load(run_dir, tmp_path, nodes, edges=None):
             if st != "pending":
                 # Fixture scaffolding fabricates arbitrary states; --force bypasses the
                 # done-gate requirement (H2). Assert it applied so setup can't silently no-op.
-                sr = _run(["set-status", "--run", run_dir, "--node", nid, "--status", st, "--force"])
+                sr = _run(["set-status", "--run", run_dir, "--node", nid, "--status", st, "--force",
+                           "--rationale", "fixture scaffolding"])
                 assert sr.returncode == 0, sr.stderr
     return r
 
@@ -977,10 +978,32 @@ def test_clean_allows_finished_run(tmp_path):
     run_dir = _init(tmp_path)
     df = Path(tmp_path) / "d.json"; df.write_text(json.dumps(_two_node_dag()))
     _run(["load-dag", "--run", run_dir, "--file", str(df)])
-    _run(["set-status", "--run", run_dir, "--node", "a", "--status", "done", "--force"])
+    _run(["set-status", "--run", run_dir, "--node", "a", "--status", "done", "--force",
+          "--rationale", "test scaffolding"])
     r = _run(["clean", "--run", run_dir])
     assert r.returncode == 0, r.stderr
     assert not Path(run_dir).exists()
+
+
+def test_set_status_force_requires_rationale(tmp_path):
+    run_dir = _init(tmp_path)
+    df = Path(tmp_path) / "d.json"; df.write_text(json.dumps(_two_node_dag()))
+    _run(["load-dag", "--run", run_dir, "--file", str(df)])
+    r = _run(["set-status", "--run", run_dir, "--node", "a", "--status", "done", "--force"])
+    assert r.returncode != 0
+    assert "rationale" in r.stderr
+
+
+def test_set_status_force_with_rationale_records_it(tmp_path):
+    run_dir = _init(tmp_path)
+    df = Path(tmp_path) / "d.json"; df.write_text(json.dumps(_two_node_dag()))
+    _run(["load-dag", "--run", run_dir, "--file", str(df)])
+    r = _run(["set-status", "--run", run_dir, "--node", "a", "--status", "done",
+              "--force", "--rationale", "manual recovery: gate flaked"])
+    assert r.returncode == 0, r.stderr
+    events = [json.loads(l) for l in (Path(run_dir) / "runlog.jsonl").read_text().splitlines() if l.strip()]
+    nsc = [e for e in events if e["event"] == "node_status_change" and e.get("forced")][-1]
+    assert nsc.get("rationale") == "manual recovery: gate flaked"
 
 
 def test_verdict_rejects_round_below_one(tmp_path):
@@ -1031,7 +1054,7 @@ def test_verdict_rejects_resolution_for_unknown_finding_id(tmp_path):
         "gate": "plan", "round": 1, "verdict": "REQUEST_CHANGES", "summary": "x",
         "findings": [{"id": "F1", "severity": "major", "location": "x", "claim": "c", "suggestion": "s"}]}))
     res = Path(tmp_path) / "res.json"
-    res.write_text(json.dumps({"F2": "wontfix"}))  # F2 is not a finding
+    res.write_text(json.dumps({"F2": {"resolution": "wontfix", "rationale": "r"}}))  # F2 is not a finding
     r = _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1",
               "--file", str(vfile), "--resolutions", str(res)])
     assert r.returncode != 0
@@ -1308,8 +1331,10 @@ def test_set_status_done_allowed_when_deps_done(tmp_path):
     run_dir = _init(tmp_path)
     _load(run_dir, tmp_path, {"a": "pending", "b": "pending"},
           edges=[{"from": "b", "depends_on": "a"}])
-    assert _run(["set-status", "--run", run_dir, "--node", "a", "--status", "done", "--force"]).returncode == 0
-    r = _run(["set-status", "--run", run_dir, "--node", "b", "--status", "done", "--force"])
+    assert _run(["set-status", "--run", run_dir, "--node", "a", "--status", "done", "--force",
+                 "--rationale", "test setup"]).returncode == 0
+    r = _run(["set-status", "--run", run_dir, "--node", "b", "--status", "done", "--force",
+              "--rationale", "test setup"])
     assert r.returncode == 0, r.stderr
 
 
@@ -1374,7 +1399,8 @@ def test_set_status_done_refused_after_gate_capped(tmp_path):
 def test_set_status_force_overrides_and_is_recorded(tmp_path):
     run_dir = _init(tmp_path)
     _load(run_dir, tmp_path, {"a": "pending"})
-    r = _run(["set-status", "--run", run_dir, "--node", "a", "--status", "done", "--force"])
+    r = _run(["set-status", "--run", run_dir, "--node", "a", "--status", "done", "--force",
+              "--rationale", "manual recovery"])
     assert r.returncode == 0, r.stderr
     forced = [e for e in _events(run_dir)
               if e["event"] == "node_status_change" and e.get("forced")]
@@ -1435,7 +1461,7 @@ def test_verdict_rejects_defer_of_blocking_finding(tmp_path):
         "gate": "plan", "round": 1, "verdict": "REQUEST_CHANGES", "summary": "x",
         "findings": [{"id": "F1", "severity": "major", "location": "x", "claim": "c", "suggestion": "s"}]}))
     res = Path(tmp_path) / "res.json"
-    res.write_text(json.dumps({"F1": "deferred"}))
+    res.write_text(json.dumps({"F1": {"resolution": "deferred", "rationale": "r"}}))
     r = _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1",
               "--file", str(vfile), "--resolutions", str(res)])
     assert r.returncode != 0
@@ -1451,7 +1477,7 @@ def test_verdict_defer_of_minor_finding_is_allowed(tmp_path):
         "gate": "plan", "round": 1, "verdict": "APPROVE", "summary": "x",
         "findings": [{"id": "F1", "severity": "minor", "location": "x", "claim": "c", "suggestion": "s"}]}))
     res = Path(tmp_path) / "res.json"
-    res.write_text(json.dumps({"F1": "deferred"}))
+    res.write_text(json.dumps({"F1": {"resolution": "deferred", "rationale": "r"}}))
     r = _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1",
               "--file", str(vfile), "--resolutions", str(res)])
     assert r.returncode == 0, r.stderr
