@@ -20,12 +20,17 @@ review with no findings should be rare and only when the work is genuinely sound
   lies (contradicts the code, describes behavior the diff removed, or is left stale by the change)
   or leftover commented-out code, a diff that
   changes user-facing behavior or deliverables without the node's own documentation and `CHANGELOG`
-  updates, and unsupported test claims — **verify the Builder's cited test evidence**. When a node
+  updates, and unsupported test claims — **verify the Builder's cited test evidence**. First check
+  each node-declared test's **existence**: a test's presence is checkable by reading the diff/repo
+  (grep) even when no runnable environment is available, so a `test_plan` that names a test which was
+  never written is a **blocker** — not merely "unverified". Then verify its **result**: when a node
   declares a `test_plan` and that evidence is missing or dubious *and* a runnable environment is
   available, run the focused `test_plan` and cite the observed result; treat a claimed-but-unrun or
   failing test as a finding. If no runnable environment is available, say so — mark the test
   evidence **unverified** in the finding's `claim` (keeping a valid `severity`) — and **never
-  fabricate a pass**. (Do not blanket-re-run tests the Builder already evidenced.) A genuinely
+  fabricate a pass**. Reserve **unverified** for the pass/fail of a test that *provably exists*; a
+  declared-but-absent test stays a blocker regardless of the environment. (Do not blanket-re-run
+  tests the Builder already evidenced.) A genuinely
   non-user-facing change (internal refactor, test-only) needs neither docs
   nor `CHANGELOG`; a standalone docs-only node need not re-document itself, but still records a
   `CHANGELOG` entry when the change is user-facing or notable.

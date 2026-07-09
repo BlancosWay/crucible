@@ -16,6 +16,14 @@ def test_critic_prompt_defines_verdict_schema():
     assert "blocker" in text and "major" in text
 
 
+def test_critic_prompt_requires_declared_test_existence():
+    # A node-declared test that was never written must be a blocker (existence is grep-checkable
+    # without a runnable env), not merely "unverified".
+    text = (REF / "critic-prompt.md").read_text()
+    assert "existence" in text
+    assert "declared-but-absent" in text
+
+
 def test_consensus_rubric_lists_stop_criteria():
     text = (REF / "consensus-rubric.md").read_text()
     assert "max_rounds" in text

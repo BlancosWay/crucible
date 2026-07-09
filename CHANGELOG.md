@@ -18,6 +18,11 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
   **Overrides** line listing every `set-status --force` node advance and every `wontfix`/`deferred`
   rebuttal (across all rounds) with its recorded rationale — derived purely from the run log and
   sanitized — so a low-effort or missing reason is visible at a glance.
+- **The Critic now treats a declared-but-absent test as a blocker.** `references/critic-prompt.md`
+  splits test verification into *existence* (grep-checkable even with no runnable environment — a
+  `test_plan` naming a test that was never written is a blocker) and *result* (needs a runnable
+  environment — `unverified` if it cannot be run), reserving `unverified` for the pass/fail of a
+  test that provably exists.
 
 ## [0.11.1] - 2026-07-07
 
