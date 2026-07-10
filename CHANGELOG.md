@@ -7,6 +7,8 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-07-10
+
 ### Changed
 - **The Builder must reconcile completeness claims against a fresh tool run.**
   `references/builder-prompt.md`'s "Ground every claim" now requires any universal claim
