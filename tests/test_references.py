@@ -24,6 +24,14 @@ def test_critic_prompt_requires_declared_test_existence():
     assert "declared-but-absent" in text
 
 
+def test_builder_prompt_requires_completeness_reconciliation():
+    # A universal/completeness claim must be reconciled against a fresh tool run, not asserted
+    # from memory — closes the enumeration-miss class.
+    text = (REF / "builder-prompt.md").read_text()
+    assert "completeness" in text.lower()
+    assert "reconcile" in text.lower()
+
+
 def test_consensus_rubric_lists_stop_criteria():
     text = (REF / "consensus-rubric.md").read_text()
     assert "max_rounds" in text
