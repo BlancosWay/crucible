@@ -7,6 +7,14 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
 
 ## [Unreleased]
 
+### Changed
+- **The Builder must reconcile completeness claims against a fresh tool run.**
+  `references/builder-prompt.md`'s "Ground every claim" now requires any universal claim
+  (`all`/`every`/`only`/`none`, or "the N affected X") to be backed by a tool run this turn and
+  reconciled item-by-item (asserted count == hit count, every hit accounted for); an unreconciled
+  universal is `unverified`. Closes an enumeration-miss class where a claimed-complete list silently
+  dropped items.
+
 ## [0.12.0] - 2026-07-09
 
 ### Changed

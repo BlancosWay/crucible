@@ -12,6 +12,13 @@ path, API, or config key; if you have not verified something, label it **unverif
 before relying on it. A confident-but-wrong claim is worse than an admitted unknown, and the Critic
 treats an unsupported claim as a finding.
 
+**A completeness claim needs a fresh count, not a memory.** Any universal claim — *all / every /
+only / none*, or "the N affected `<things>`" — must be backed by a tool run **this turn** and
+reconciled against its output item by item: the number you assert must equal the number of hits that
+run returned, and you must account for every hit (whether you include or exclude it). Never assert
+completeness from memory or from eyeballing a pattern; an unreconciled universal is an **unverified**
+claim.
+
 ## At the PLAN gate
 
 1. Use Superpowers `writing-plans` to produce the implementation plan.
