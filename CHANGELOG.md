@@ -7,7 +7,24 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-07-09
+
 ### Changed
+- **Loop-bypass overrides now require an audited rationale.** A `wontfix` or `deferred` resolution
+  must use the object form `{"resolution": "wontfix", "rationale": "…"}` with a non-empty
+  `rationale` (a bare `"wontfix"`/`"deferred"` that clears a finding without a recorded reason is
+  rejected by `crucible verdict --resolutions`), and `crucible set-status --force` now requires a
+  new `--rationale` argument recorded on the `node_status_change` event. `references/builder-prompt.md`
+  and `docs/cli.md` document the requirement.
+- **The run report Summary now surfaces audited overrides.** `report.py`'s `## Summary` gains an
+  **Overrides** line listing every `set-status --force` node advance and every `wontfix`/`deferred`
+  rebuttal (across all rounds) with its recorded rationale — derived purely from the run log and
+  sanitized — so a low-effort or missing reason is visible at a glance.
+- **The Critic now treats a declared-but-absent test as a blocker.** `references/critic-prompt.md`
+  splits test verification into *existence* (grep-checkable even with no runnable environment — a
+  `test_plan` naming a test that was never written is a blocker) and *result* (needs a runnable
+  environment — `unverified` if it cannot be run), reserving `unverified` for the pass/fail of a
+  test that provably exists.
 - **Documented the Superpowers version Crucible targets.** README Install and every prerequisite
   surface (`docs/install/*.md`, `.codex/INSTALL.md`, `CLAUDE.md`, `AGENTS.md`, `NOTICE`) now state
   Crucible needs **Superpowers v5.1.0+** and is **last tested against v6.0.3**; the Copilot/Claude
