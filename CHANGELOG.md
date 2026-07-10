@@ -7,6 +7,8 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-07-09
+
 ### Changed
 - **Loop-bypass overrides now require an audited rationale.** A `wontfix` or `deferred` resolution
   must use the object form `{"resolution": "wontfix", "rationale": "…"}` with a non-empty
@@ -23,6 +25,11 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
   `test_plan` naming a test that was never written is a blocker) and *result* (needs a runnable
   environment — `unverified` if it cannot be run), reserving `unverified` for the pass/fail of a
   test that provably exists.
+- **Documented the Superpowers version Crucible targets.** README Install and every prerequisite
+  surface (`docs/install/*.md`, `.codex/INSTALL.md`, `CLAUDE.md`, `AGENTS.md`, `NOTICE`) now state
+  Crucible needs **Superpowers v5.1.0+** and is **last tested against v6.0.3**; the Copilot/Claude
+  install docs and `CLAUDE.md` now call the code-review reviewer the **`requesting-code-review`
+  reviewer template** (not the `superpowers:code-reviewer` named agent Superpowers removed in v5.1.0).
 
 ## [0.11.1] - 2026-07-07
 

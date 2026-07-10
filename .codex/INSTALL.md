@@ -34,5 +34,6 @@ ls -l ~/.agents/skills/crucible
 ```
 
 The clone is also your dev tree — edits to `~/.codex/crucible` are picked up directly, no
-reinstall. Superpowers must be installed separately (Crucible dispatches its reviewers). Run the
+reinstall. Superpowers must be installed separately — **v5.1.0+, last tested against v6.0.3**
+(Crucible dispatches its reviewers). Run the
 test gate with `cd ~/.codex/crucible && python3 scripts/check.py`.
