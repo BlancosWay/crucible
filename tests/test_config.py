@@ -7,8 +7,8 @@ from crucible.config import Config, DEFAULTS, load_config
 
 def test_defaults_match_spec():
     cfg = Config.from_dict({})
-    assert cfg.builder == {"model": "claude-opus-4.8", "effort": "max"}
-    assert cfg.critic == {"model": "gpt-5.5", "effort": "xhigh"}
+    assert cfg.builder == {"model": "gpt-5.6-sol", "effort": "max"}
+    assert cfg.critic == {"model": "claude-opus-4.8", "effort": "max"}
     assert cfg.max_rounds_plan == 5
     assert cfg.max_rounds_dep == 5
     assert cfg.on_cap == "halt"
@@ -120,12 +120,12 @@ def test_partial_builder_override_keeps_default_effort():
 
 def test_partial_critic_override_keeps_default_effort():
     cfg = Config.from_dict({"critic": {"model": "gpt-x"}})
-    assert cfg.critic == {"model": "gpt-x", "effort": "xhigh"}
+    assert cfg.critic == {"model": "gpt-x", "effort": "max"}
 
 
 def test_critic_effort_only_override_keeps_default_model():
     cfg = Config.from_dict({"critic": {"effort": "high"}})
-    assert cfg.critic == {"model": "gpt-5.5", "effort": "high"}
+    assert cfg.critic == {"model": "claude-opus-4.8", "effort": "high"}
 
 
 def test_config_rejects_unknown_nested_builder_key():
@@ -146,12 +146,12 @@ def test_config_partial_nested_override_still_allowed():
 
 def test_config_empty_nested_object_keeps_defaults():
     cfg = Config.from_dict({"builder": {}})
-    assert cfg.builder == {"model": "claude-opus-4.8", "effort": "max"}
+    assert cfg.builder == {"model": "gpt-5.6-sol", "effort": "max"}
 
 
 def test_config_null_nested_override_keeps_defaults():
     cfg = Config.from_dict({"builder": None})
-    assert cfg.builder == {"model": "claude-opus-4.8", "effort": "max"}
+    assert cfg.builder == {"model": "gpt-5.6-sol", "effort": "max"}
 
 
 def test_non_dict_builder_raises():

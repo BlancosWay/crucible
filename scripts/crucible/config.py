@@ -8,8 +8,8 @@ from pathlib import Path
 from typing import Any
 
 DEFAULTS: dict[str, Any] = {
-    "builder": {"model": "claude-opus-4.8", "effort": "max"},
-    "critic": {"model": "gpt-5.5", "effort": "xhigh"},
+    "builder": {"model": "gpt-5.6-sol", "effort": "max"},
+    "critic": {"model": "claude-opus-4.8", "effort": "max"},
     "max_rounds_plan": 5,
     "max_rounds_dep": 5,
     "on_cap": "halt",

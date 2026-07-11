@@ -31,8 +31,8 @@ def test_report_includes_goal_and_config(tmp_path):
     run = _build_run(tmp_path)
     md = render_markdown(run)
     assert "Add rate limiter" in md
+    assert "gpt-5.6-sol" in md
     assert "claude-opus-4.8" in md
-    assert "gpt-5.5" in md
 
 
 def test_report_includes_dag_status(tmp_path):
