@@ -32,22 +32,23 @@ marks a node `done` without that — recorded only in run-log provenance, not no
 
 ## Configuration
 
-Every setting has a default, so a config file is optional. Override any subset via a JSON file
-(`--config`, see [`config.example.json`](config.example.json)); unset keys keep their defaults.
+Every setting has a shipped default in [`config.defaults.json`](config.defaults.json). Override any
+subset via `--config`; `init-run` writes the fully resolved values to `RUN/config.json`.
+The defaults file is also a complete valid `--config` template.
 
-| Key | Default | Meaning |
-|-----|---------|---------|
-| `builder` | `{"model": "gpt-5.6-sol", "effort": "max"}` | Model + effort that plans and implements. Only `model`/`effort` are accepted — an unknown nested key (e.g. a misspelled `model`) is rejected. |
-| `critic` | `{"model": "claude-opus-4.8", "effort": "max"}` | Model + effort that adversarially reviews every gate. Only `model`/`effort` are accepted — an unknown nested key is rejected. |
-| `max_rounds_plan` | `5` | Round cap for the PLAN gate before `on_cap` applies. |
-| `max_rounds_dep` | `5` | Round cap for **each** IMPLEMENT gate. |
-| `on_cap` | `halt` | At a round cap without consensus: `halt`, or `proceed_with_flags` (advance and record the open findings). |
-| `blocking_severities` | `["blocker", "major"]` | Severities that keep a gate from reaching consensus. |
-| `defer_severities` | `["minor", "nit"]` | Severities the Builder may defer (acknowledge without fixing) without blocking. |
-| `strict_rebuttal` | `false` | `false`: a Builder `wontfix` rebuttal clears the finding. `true`: it stays blocking until the Critic explicitly accepts it. |
-| `final_review` | `true` | Run the Stage 3 FINAL gate (whole-diff review). |
-| `human_approval` | `false` | Pause after PLAN consensus for your explicit OK before any implementation. |
-| `reproduce_gate` | `false` | Run the Stage 0 REPRODUCE gate (failing-test-first) before PLAN — for bug fixes. |
+| Key | Meaning |
+|-----|---------|
+| `builder` | Model + effort that plans and implements. Only `model`/`effort` are accepted; an unknown nested key is rejected. |
+| `critic` | Model + effort that adversarially reviews every gate. Only `model`/`effort` are accepted; an unknown nested key is rejected. |
+| `max_rounds_plan` | Round cap for the PLAN gate before `on_cap` applies. |
+| `max_rounds_dep` | Round cap for each IMPLEMENT gate. |
+| `on_cap` | At a round cap without consensus: `halt`, or `proceed_with_flags` to advance and record open findings. |
+| `blocking_severities` | Severities that keep a gate from reaching consensus. |
+| `defer_severities` | Severities the Builder may defer without blocking. |
+| `strict_rebuttal` | Whether a Builder `wontfix` rebuttal stays blocking until the Critic accepts it. |
+| `final_review` | Whether to run the Stage 3 FINAL gate. |
+| `human_approval` | Whether to pause after PLAN consensus before implementation. |
+| `reproduce_gate` | Whether bug-fix runs start with the Stage 0 REPRODUCE gate. |
 
 ## Install
 
@@ -104,7 +105,7 @@ defaults.
   ```
 - **Override defaults** — e.g. a lighter Critic, advance past a stuck gate, or skip FINAL:
   ```json
-  {"critic": {"model": "gpt-5.5", "effort": "high"}, "on_cap": "proceed_with_flags", "final_review": false}
+  {"critic": {"effort": "high"}, "on_cap": "proceed_with_flags", "final_review": false}
   ```
 - **Inspect / clean up** — `crucible status --run "$RUN"` (JSON progress), `crucible show-plan --run
   "$RUN"` (approved plan + DAG), `crucible report --run "$RUN" --open` (render + open in a browser),

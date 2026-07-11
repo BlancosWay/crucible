@@ -21,9 +21,10 @@ Crucible is a **two-model adversarial planning + implementation** workflow built
 
 ## Defaults & determinism
 
-Defaults: Builder = GPT-5.6 Sol (max), Critic = Opus 4.8 (max), 5 rounds per gate, `on_cap: halt`. All
-bookkeeping (DAG walk, round counting, consensus, provenance, report) is decided by the
-`crucible` CLI — never eyeballed. Override via `--config config.json` (see `config.example.json`).
+Shipped values live in `config.defaults.json`; each run records its resolved values in
+`RUN/config.json`. Use the resolved run config because `--config` may override the shipped values.
+All bookkeeping (DAG walk, round counting, consensus, provenance, report) is decided by the
+`crucible` CLI — never eyeballed.
 
 ## Safety
 

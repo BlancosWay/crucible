@@ -2,29 +2,61 @@ import json
 
 import pytest
 
-from crucible.config import Config, DEFAULTS, load_config
+from crucible.config import Config, DEFAULTS, DEFAULTS_PATH, load_config, load_defaults
 
 
-def test_defaults_match_spec():
+def test_defaults_match_shipped_file():
     cfg = Config.from_dict({})
-    assert cfg.builder == {"model": "gpt-5.6-sol", "effort": "max"}
-    assert cfg.critic == {"model": "claude-opus-4.8", "effort": "max"}
-    assert cfg.max_rounds_plan == 5
-    assert cfg.max_rounds_dep == 5
-    assert cfg.on_cap == "halt"
-    assert cfg.defer_severities == ["minor", "nit"]
-    assert cfg.blocking_severities == ["blocker", "major"]
-    assert cfg.strict_rebuttal is False
-    assert cfg.final_review is True
-    assert cfg.human_approval is False
-    assert cfg.reproduce_gate is False
+    assert cfg.to_dict() == DEFAULTS
+    assert DEFAULTS_PATH.name == "config.defaults.json"
+    assert load_defaults() == DEFAULTS
+
+
+def test_load_defaults_surfaces_missing_and_malformed_files(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        load_defaults(tmp_path / "missing.json")
+
+    p = tmp_path / "malformed.json"
+    p.write_text("{")
+    with pytest.raises(json.JSONDecodeError):
+        load_defaults(p)
+
+
+def test_load_defaults_rejects_non_object(tmp_path):
+    p = tmp_path / "defaults.json"
+    p.write_text("[]")
+    with pytest.raises(ValueError, match="JSON object"):
+        load_defaults(p)
+
+
+def test_load_defaults_rejects_missing_or_unknown_keys(tmp_path):
+    missing = dict(DEFAULTS)
+    missing.pop("on_cap")
+    p = tmp_path / "missing.json"
+    p.write_text(json.dumps(missing))
+    with pytest.raises(ValueError, match="missing default config keys"):
+        load_defaults(p)
+
+    extra = {**DEFAULTS, "surprise": True}
+    p = tmp_path / "extra.json"
+    p.write_text(json.dumps(extra))
+    with pytest.raises(ValueError, match="unknown default config keys"):
+        load_defaults(p)
+
+
+def test_load_defaults_rejects_invalid_role_shape(tmp_path):
+    data = {**DEFAULTS, "critic": {"model": "x"}}
+    p = tmp_path / "role.json"
+    p.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="critic default keys"):
+        load_defaults(p)
 
 
 def test_partial_override_keeps_other_defaults():
     cfg = Config.from_dict({"max_rounds_dep": 3, "on_cap": "proceed_with_flags"})
     assert cfg.max_rounds_dep == 3
     assert cfg.on_cap == "proceed_with_flags"
-    assert cfg.max_rounds_plan == 5
+    assert cfg.max_rounds_plan == DEFAULTS["max_rounds_plan"]
 
 
 def test_invalid_on_cap_raises():
@@ -115,17 +147,20 @@ def test_real_booleans_are_accepted():
 
 def test_partial_builder_override_keeps_default_effort():
     cfg = Config.from_dict({"builder": {"model": "claude-x"}})
-    assert cfg.builder == {"model": "claude-x", "effort": "max"}
+    assert cfg.builder == {
+        "model": "claude-x",
+        "effort": DEFAULTS["builder"]["effort"],
+    }
 
 
 def test_partial_critic_override_keeps_default_effort():
     cfg = Config.from_dict({"critic": {"model": "gpt-x"}})
-    assert cfg.critic == {"model": "gpt-x", "effort": "max"}
+    assert cfg.critic == {"model": "gpt-x", "effort": DEFAULTS["critic"]["effort"]}
 
 
 def test_critic_effort_only_override_keeps_default_model():
     cfg = Config.from_dict({"critic": {"effort": "high"}})
-    assert cfg.critic == {"model": "claude-opus-4.8", "effort": "high"}
+    assert cfg.critic == {"model": DEFAULTS["critic"]["model"], "effort": "high"}
 
 
 def test_config_rejects_unknown_nested_builder_key():
@@ -141,17 +176,15 @@ def test_config_rejects_unknown_nested_critic_key():
 def test_config_partial_nested_override_still_allowed():
     cfg = Config.from_dict({"builder": {"model": "custom-model"}})
     assert cfg.builder["model"] == "custom-model"
-    assert cfg.builder["effort"] == "max"   # sibling default preserved
+    assert cfg.builder["effort"] == DEFAULTS["builder"]["effort"]
 
 
 def test_config_empty_nested_object_keeps_defaults():
-    cfg = Config.from_dict({"builder": {}})
-    assert cfg.builder == {"model": "gpt-5.6-sol", "effort": "max"}
+    assert Config.from_dict({"builder": {}}).builder == DEFAULTS["builder"]
 
 
 def test_config_null_nested_override_keeps_defaults():
-    cfg = Config.from_dict({"builder": None})
-    assert cfg.builder == {"model": "gpt-5.6-sol", "effort": "max"}
+    assert Config.from_dict({"builder": None}).builder == DEFAULTS["builder"]
 
 
 def test_non_dict_builder_raises():
@@ -209,31 +242,8 @@ def test_empty_defer_severities_allowed():
     # Empty defer is legitimate (nothing is deferrable); only blocking must be non-empty.
     cfg = Config.from_dict({"defer_severities": []})
     assert cfg.defer_severities == []
-    assert cfg.blocking_severities == ["blocker", "major"]
+    assert cfg.blocking_severities == DEFAULTS["blocking_severities"]
 
 
-def test_example_config_file_is_valid():
-    import pathlib
-    root = pathlib.Path(__file__).resolve().parents[1]
-    cfg = load_config(root / "config.example.json")
-    assert cfg.on_cap in ("halt", "proceed_with_flags")
-
-
-def test_example_config_keys_match_defaults_exactly():
-    # #8: config.example.json must stay in lockstep with config.py DEFAULTS. `from_dict` already
-    # rejects an EXTRA example key, but a NEW `DEFAULTS` key the example omits would pass silently
-    # today. Assert bidirectional top-level parity, plus the nested builder/critic sub-object keys.
-    import pathlib
-    root = pathlib.Path(__file__).resolve().parents[1]
-    example = json.loads((root / "config.example.json").read_text())
-    assert set(example) == set(DEFAULTS), (
-        "config.example.json top-level keys drifted from config.py DEFAULTS: "
-        f"only in example={sorted(set(example) - set(DEFAULTS))}, "
-        f"only in DEFAULTS={sorted(set(DEFAULTS) - set(example))}"
-    )
-    for role in ("builder", "critic"):
-        assert set(example[role]) == set(DEFAULTS[role]), (
-            f"config.example.json '{role}' keys drifted from DEFAULTS['{role}']: "
-            f"only in example={sorted(set(example[role]) - set(DEFAULTS[role]))}, "
-            f"only in DEFAULTS={sorted(set(DEFAULTS[role]) - set(example[role]))}"
-        )
+def test_defaults_file_is_valid_config():
+    assert load_config(DEFAULTS_PATH).to_dict() == DEFAULTS

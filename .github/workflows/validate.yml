@@ -26,7 +26,7 @@ jobs:
 
       - name: Validate JSON manifests
         run: |
-          for f in .claude-plugin/plugin.json .claude-plugin/marketplace.json config.example.json; do
+          for f in .claude-plugin/plugin.json .claude-plugin/marketplace.json config.defaults.json; do
             echo "checking $f"
             python3 -c "import json,sys; json.load(open('$f'))"
           done
