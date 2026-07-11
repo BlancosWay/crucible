@@ -7,6 +7,8 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-07-11
+
 ### Changed
 - **Shipped defaults now come from one authoritative `config.defaults.json` file.** Runtime code
   and tests load or derive from it, eliminating synchronized model-value edits across Python,
