@@ -96,8 +96,12 @@ if market is not None:
         check(entry.get("version") == plugin_version,
               f"marketplace.json crucible version {entry.get('version')!r} != plugin.json {plugin_version!r}")
 
-# No secret hardcoded in any manifest.
-for rel in (".claude-plugin/plugin.json", ".claude-plugin/marketplace.json", "config.example.json"):
+defaults = load_json("config.defaults.json")
+check(isinstance(defaults, dict), "config.defaults.json must contain a JSON object")
+
+# No secret hardcoded in any manifest or the shipped defaults.
+for rel in (".claude-plugin/plugin.json", ".claude-plugin/marketplace.json",
+            "config.defaults.json"):
     p = ROOT / rel
     if p.exists():
         raw = p.read_text(encoding="utf-8").lower()

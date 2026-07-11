@@ -98,6 +98,13 @@ def _copilot_cli_section(text: str) -> str:
     return text.split("## Copilot CLI", 1)[1].split("\n## ", 1)[0]
 
 
+def test_platform_notes_dispatches_from_resolved_run_config():
+    section = _copilot_cli_section((REF / "platform-notes.md").read_text())
+    assert "config.json" in section
+    assert "critic.model" in section
+    assert "critic.effort" in section
+
+
 def test_platform_notes_copilot_surfaces_plan_in_response():
     # In the Copilot CLI, bash-tool output is collapsed, so the orchestrator must surface the
     # approved plan + dependency tree in its RESPONSE at PLAN settlement (not rely on terminal echo).

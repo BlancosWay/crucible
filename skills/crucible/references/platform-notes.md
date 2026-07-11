@@ -9,20 +9,22 @@ of these as a prompt template dispatched to a **general-purpose** subagent, not 
 
 ## Copilot CLI (primary)
 
-- **PLAN gate:** dispatch a `general-purpose` `task` subagent with `model` = the critic model id
-  (default `claude-opus-4.8`) and `reasoning_effort` = the critic effort (default `max`), seeded with the
-  `superpowers:writing-plans` **`plan-document-reviewer-prompt.md`** template (and the
-  `superpowers:brainstorming` **`spec-document-reviewer-prompt.md`** template for the design spec)
-  plus the plan + DAG. Require its result mapped into the `critic-prompt.md` verdict JSON.
+- **Resolve models first:** read `"$RUN"/config.json`. Dispatch with `model` =
+  `critic.model` and `reasoning_effort` = `critic.effort` from that resolved file. Do not read
+  shipped defaults from documentation; this run may contain explicit overrides.
+- **PLAN gate:** dispatch a `general-purpose` `task` subagent with those resolved Critic values,
+  seeded with the `superpowers:writing-plans` **`plan-document-reviewer-prompt.md`** template (and
+  the `superpowers:brainstorming` **`spec-document-reviewer-prompt.md`** template for the design
+  spec) plus the plan and DAG. Require its result mapped into the `critic-prompt.md` verdict JSON.
 - **Code-review gates (IMPLEMENT / FINAL):** dispatch a **`general-purpose`** subagent via the
-  `task` tool with `model` = the critic model id and `reasoning_effort` = the critic effort, seeded
-  with the **`superpowers:requesting-code-review`** skill's **`code-reviewer.md`** template plus the
-  node's diff (or the whole implementation) and the task/plan context; require its findings mapped
-  into the `critic-prompt.md` verdict JSON. The named `superpowers:code-reviewer` agent was removed in
-  superpowers v5.1.0, so dispatch the template on a general-purpose subagent — do not reintroduce an
-  `agent_type` for it. If the runtime cannot set a `model` on a general-purpose subagent, fall back
-  to the platform's built-in `code-review` agent on the critic model (or the **No-subagent fallback**
-  below) and note the substitution in the run-log.
+  `task` tool with those resolved Critic values, seeded with the
+  **`superpowers:requesting-code-review`** skill's **`code-reviewer.md`** template plus the node's
+  diff (or the whole implementation) and the task/plan context; require its findings mapped into
+  the `critic-prompt.md` verdict JSON. The named `superpowers:code-reviewer` agent was removed in
+  superpowers v5.1.0, so dispatch the template on a general-purpose subagent — do not reintroduce
+  an `agent_type` for it. If the runtime cannot set a `model` on a general-purpose subagent, fall
+  back to the platform's built-in `code-review` agent on the critic model (or the **No-subagent
+  fallback** below) and note the substitution in the run-log.
 - **Surfacing output to the human:** the Copilot CLI renders bash-tool output **collapsed/truncated**
   in the transcript, so anything `crucible` prints — the **approved plan + dependency tree** that
   `verdict` echoes at PLAN settlement, `show-plan`, gate outcomes, unresolved-finding lists, the run

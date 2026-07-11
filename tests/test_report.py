@@ -1,4 +1,4 @@
-from crucible.config import Config
+from crucible.config import Config, DEFAULTS
 from crucible.runlog import init_run
 from crucible.report import render_markdown
 
@@ -31,8 +31,9 @@ def test_report_includes_goal_and_config(tmp_path):
     run = _build_run(tmp_path)
     md = render_markdown(run)
     assert "Add rate limiter" in md
-    assert "gpt-5.6-sol" in md
-    assert "claude-opus-4.8" in md
+    for role in ("builder", "critic"):
+        assert DEFAULTS[role]["model"] in md
+        assert DEFAULTS[role]["effort"] in md
 
 
 def test_report_includes_dag_status(tmp_path):

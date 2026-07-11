@@ -74,5 +74,5 @@ it green. See [`CONTRIBUTING.md`](../../CONTRIBUTING.md).
 
 ---
 
-Next: [Usage](../../README.md#usage) · [Defaults](../../README.md#defaults) ·
+Next: [Usage](../../README.md#usage) · [Defaults](../../config.defaults.json) ·
 [Layout](../../README.md#layout).

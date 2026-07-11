@@ -7,19 +7,45 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-DEFAULTS: dict[str, Any] = {
-    "builder": {"model": "gpt-5.6-sol", "effort": "max"},
-    "critic": {"model": "claude-opus-4.8", "effort": "max"},
-    "max_rounds_plan": 5,
-    "max_rounds_dep": 5,
-    "on_cap": "halt",
-    "defer_severities": ["minor", "nit"],
-    "blocking_severities": ["blocker", "major"],
-    "strict_rebuttal": False,
-    "final_review": True,
-    "human_approval": False,
-    "reproduce_gate": False,
-}
+DEFAULTS_PATH = Path(__file__).resolve().parents[2] / "config.defaults.json"
+DEFAULT_CONFIG_KEYS = frozenset({
+    "builder",
+    "critic",
+    "max_rounds_plan",
+    "max_rounds_dep",
+    "on_cap",
+    "defer_severities",
+    "blocking_severities",
+    "strict_rebuttal",
+    "final_review",
+    "human_approval",
+    "reproduce_gate",
+})
+ROLE_KEYS = frozenset({"model", "effort"})
+
+
+def load_defaults(path: str | Path = DEFAULTS_PATH) -> dict[str, Any]:
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("default config must be a JSON object")
+    missing = DEFAULT_CONFIG_KEYS - set(data)
+    unknown = set(data) - DEFAULT_CONFIG_KEYS
+    if missing:
+        raise ValueError(f"missing default config keys: {sorted(missing)}")
+    if unknown:
+        raise ValueError(f"unknown default config keys: {sorted(unknown)}")
+    for role in ("builder", "critic"):
+        value = data[role]
+        if not isinstance(value, dict):
+            raise ValueError(f"{role} default must be an object")
+        if set(value) != ROLE_KEYS:
+            raise ValueError(
+                f"{role} default keys must be {sorted(ROLE_KEYS)}, got {sorted(value)}"
+            )
+    return data
+
+
+DEFAULTS: dict[str, Any] = load_defaults()
 
 VALID_ON_CAP = ("halt", "proceed_with_flags")
 VALID_SEVERITIES = ("blocker", "major", "minor", "nit")
