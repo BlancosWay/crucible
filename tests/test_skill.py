@@ -18,6 +18,12 @@ def test_skill_references_the_two_roles_and_gates():
     assert "dependency tree" in text
 
 
+def test_skill_requires_resolved_run_config():
+    text = SKILL.read_text()
+    assert "RUN/config.json" in text or '"$RUN"/config.json' in text
+    assert "authoritative for this run" in text
+
+
 def test_skill_invokes_superpowers_subskills():
     text = SKILL.read_text()
     assert "writing-plans" in text

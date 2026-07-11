@@ -68,5 +68,5 @@ cd ~/.codex/crucible && python3 scripts/check.py
 
 ---
 
-Next: [Usage](../../README.md#usage) · [Defaults](../../README.md#defaults) ·
+Next: [Usage](../../README.md#usage) · [Defaults](../../config.defaults.json) ·
 [Layout](../../README.md#layout).

@@ -11,6 +11,9 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
 - **Shipped defaults now come from one authoritative `config.defaults.json` file.** Runtime code
   and tests load or derive from it, eliminating synchronized model-value edits across Python,
   examples, and reports.
+- **Orchestration now reads each run's resolved `config.json`.** Model dispatch honors overrides
+  without duplicating shipped model identifiers in skills, platform notes, commands, or install
+  documentation.
 
 ## [0.13.0] - 2026-07-10
 

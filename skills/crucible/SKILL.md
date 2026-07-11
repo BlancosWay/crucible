@@ -26,6 +26,11 @@ Start a run:
 RUN=$(PYTHONPATH=scripts python3 -m crucible init-run --goal "<the user's goal>")   # add --config config.json to override defaults
 ```
 
+**Read the resolved run config.** Immediately read `"$RUN"/config.json`.
+It is authoritative for this run, including `--config` overrides. Use its `builder` and `critic`
+model/effort values for role realization and provenance. Never infer shipped defaults from prose
+or hardcode them.
+
 When Crucible runs as an installed plugin over **someone else's** project, runs already stay out of
 their tree: `init-run` defaults its base to `~/.crucible/runs` (override with `--base-dir` or
 `$CRUCIBLE_RUNS_DIR`), so neither a `runs/` dir nor any scratch lands in the target repo.

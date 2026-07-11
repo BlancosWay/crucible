@@ -48,7 +48,8 @@ copilot
 copilot --allow-all-tools --allow-all-paths -p "/crucible add a rate limiter"
 ```
 
-Defaults: Builder = GPT-5.6 Sol (max), Critic = Opus 4.8 (max), 5 rounds per gate, `on_cap: halt`.
+Shipped values live in `config.defaults.json`; `init-run` records the resolved values (including
+`--config` overrides) in `RUN/config.json`.
 
 ---
 
@@ -83,5 +84,5 @@ See [`CONTRIBUTING.md`](../../CONTRIBUTING.md).
 
 ---
 
-Next: [Usage](../../README.md#usage) · [Defaults](../../README.md#defaults) ·
+Next: [Usage](../../README.md#usage) · [Defaults](../../config.defaults.json) ·
 [Layout](../../README.md#layout).
