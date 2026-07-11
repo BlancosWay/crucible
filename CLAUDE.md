@@ -21,9 +21,9 @@ Superpowers `writing-plans` and `subagent-driven-development`, and dispatches th
 - Natural language: "use crucible to add a rate limiter."
 
 The skill drives PLAN → IMPLEMENT (one gate per dependency) → optional FINAL → run report, and
-calls the deterministic `crucible` CLI for every decision. Defaults: Builder = Opus 4.8, Critic =
-GPT-5.5 (xhigh), 5 rounds per gate. On Claude Code, set per-gate model overrides where the runtime
-allows; otherwise the most capable available model is used and the substitution is logged.
+calls the deterministic `crucible` CLI for every decision. Defaults: Builder = GPT-5.6 Sol (max),
+Critic = Opus 4.8 (max), 5 rounds per gate. On Claude Code, set per-gate model overrides where the
+runtime allows; otherwise the most capable available model is used and the substitution is logged.
 
 ## Safety
 

@@ -21,7 +21,7 @@ Crucible is a **two-model adversarial planning + implementation** workflow built
 
 ## Defaults & determinism
 
-Builder = Opus 4.8 (max), Critic = GPT-5.5 (xhigh), 5 rounds per gate, `on_cap: halt`. All
+Defaults: Builder = GPT-5.6 Sol (max), Critic = Opus 4.8 (max), 5 rounds per gate, `on_cap: halt`. All
 bookkeeping (DAG walk, round counting, consensus, provenance, report) is decided by the
 `crucible` CLI — never eyeballed. Override via `--config config.json` (see `config.example.json`).
 

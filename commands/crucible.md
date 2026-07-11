@@ -10,6 +10,6 @@ Usage: `/crucible <goal>` — e.g. `/crucible add a Redis-backed rate limiter to
 
 Follow `skills/crucible/SKILL.md` exactly: PLAN gate (plan + dependency tree, Critic-reviewed to
 consensus) -> one IMPLEMENT gate per dependency (Builder implements, Critic reviews, loop to
-consensus or cap) -> optional FINAL gate -> run report. Defaults: Builder = Opus 4.8, Critic =
-GPT-5.5 (xhigh), 5 rounds per gate. **Engineering tool — never proceed past a gate without
+consensus or cap) -> optional FINAL gate -> run report. Defaults: Builder = GPT-5.6 Sol (max),
+Critic = Opus 4.8 (max), 5 rounds per gate. **Engineering tool — never proceed past a gate without
 consensus unless `on_cap: proceed_with_flags`.**

@@ -48,7 +48,7 @@ copilot
 copilot --allow-all-tools --allow-all-paths -p "/crucible add a rate limiter"
 ```
 
-Defaults: Builder = Opus 4.8 (max), Critic = GPT-5.5 (xhigh), 5 rounds per gate, `on_cap: halt`.
+Defaults: Builder = GPT-5.6 Sol (max), Critic = Opus 4.8 (max), 5 rounds per gate, `on_cap: halt`.
 
 ---
 

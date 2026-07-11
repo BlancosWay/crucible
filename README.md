@@ -37,8 +37,8 @@ Every setting has a default, so a config file is optional. Override any subset v
 
 | Key | Default | Meaning |
 |-----|---------|---------|
-| `builder` | `{"model": "claude-opus-4.8", "effort": "max"}` | Model + effort that plans and implements. Only `model`/`effort` are accepted — an unknown nested key (e.g. a misspelled `model`) is rejected. |
-| `critic` | `{"model": "gpt-5.5", "effort": "xhigh"}` | Model + effort that adversarially reviews every gate. Only `model`/`effort` are accepted — an unknown nested key is rejected. |
+| `builder` | `{"model": "gpt-5.6-sol", "effort": "max"}` | Model + effort that plans and implements. Only `model`/`effort` are accepted — an unknown nested key (e.g. a misspelled `model`) is rejected. |
+| `critic` | `{"model": "claude-opus-4.8", "effort": "max"}` | Model + effort that adversarially reviews every gate. Only `model`/`effort` are accepted — an unknown nested key is rejected. |
 | `max_rounds_plan` | `5` | Round cap for the PLAN gate before `on_cap` applies. |
 | `max_rounds_dep` | `5` | Round cap for **each** IMPLEMENT gate. |
 | `on_cap` | `halt` | At a round cap without consensus: `halt`, or `proceed_with_flags` (advance and record the open findings). |

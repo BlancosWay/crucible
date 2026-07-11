@@ -10,7 +10,7 @@ of these as a prompt template dispatched to a **general-purpose** subagent, not 
 ## Copilot CLI (primary)
 
 - **PLAN gate:** dispatch a `general-purpose` `task` subagent with `model` = the critic model id
-  (default `gpt-5.5`) and `reasoning_effort` = the critic effort (default `xhigh`), seeded with the
+  (default `claude-opus-4.8`) and `reasoning_effort` = the critic effort (default `max`), seeded with the
   `superpowers:writing-plans` **`plan-document-reviewer-prompt.md`** template (and the
   `superpowers:brainstorming` **`spec-document-reviewer-prompt.md`** template for the design spec)
   plus the plan + DAG. Require its result mapped into the `critic-prompt.md` verdict JSON.
