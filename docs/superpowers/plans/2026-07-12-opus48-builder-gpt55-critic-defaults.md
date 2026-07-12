@@ -104,7 +104,7 @@ Expected: exit 0 with no output.
 Run:
 
 ```bash
-.venv/bin/python -m pytest -q tests/test_config.py tests/test_report.py tests/test_docs.py
+python3 -m pytest -q tests/test_config.py tests/test_report.py tests/test_docs.py
 ```
 
 Expected: exit 0 with every selected test passing.
