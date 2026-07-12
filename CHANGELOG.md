@@ -7,6 +7,8 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-07-12
+
 ### Changed
 - **The default model roles are Claude Opus 4.8 max for Builder and GPT-5.5 xhigh for Critic.**
   Explicit configuration overrides remain supported, and existing runs keep their resolved
