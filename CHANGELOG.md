@@ -7,6 +7,8 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-07-13
+
 ### Added
 - **Existing-owner discipline in the Builder and Critic prompts.** The Builder now searches for an
   established owner of a responsibility before placing new logic and prefers extending it over a new
