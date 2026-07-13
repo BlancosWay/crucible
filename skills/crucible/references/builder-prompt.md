@@ -24,6 +24,14 @@ claim.
 1. Use Superpowers `writing-plans` to produce the implementation plan.
 2. Emit a **dependency tree** as JSON (see `dependency-tree.md`): nodes = implementation tasks,
    edges = `depends_on`. Keep nodes small and independently testable.
+3. **Find the existing owner before adding logic.** Before choosing where a responsibility lives
+   (which component, module, class, or function), grep for how the codebase already handles that
+   class of responsibility — by role, name, or location — and prefer **extending the established
+   owner** over a new or inline home. Cite the owner's `file:line` and reuse it, or record
+   `no owner found (searched: <terms>)` as an explicit, justified deviation in the plan. A negative
+   search is best-effort, **not proof of absence** — label it `unverified` (it is a negative
+   existence claim, not a `completeness` claim reconciled against a hit count). Trace an existing
+   example end-to-end **only when a plausible owner surfaces**.
 
 ## At each IMPLEMENT gate (one dependency / node)
 
