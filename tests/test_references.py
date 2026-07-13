@@ -192,3 +192,37 @@ def test_platform_notes_copilot_requires_full_untruncated_plan_paste():
     low = section.lower()
     assert "truncate" in low
     assert "tail" in low
+
+
+def test_builder_prompt_requires_owner_discovery():
+    # Existing-owner discipline: before placing new logic the Builder must search for how the
+    # codebase already handles that responsibility and prefer reusing/extending the existing owner;
+    # a negative owner search is best-effort (unverified), never proof of absence.
+    low = " ".join((REF / "builder-prompt.md").read_text().lower().split())
+    assert "owner" in low
+    assert "reuse" in low or "extend" in low
+    assert "proof of absence" in low
+    assert "unverified" in low
+
+
+def test_critic_prompt_reviews_placement_at_both_gates():
+    # The existing-owner/placement dimension must be attacked at BOTH the plan and the diff gate,
+    # and the diff-side must be scoped so it never re-opens the terminal PLAN placement.
+    text = (REF / "critic-prompt.md").read_text()
+    assert "## What to attack" in text
+    attack = text.split("## What to attack", 1)[1].split("\n## ", 1)[0]
+    plan_part, diff_part = attack.split("Dependency diff:", 1)
+    assert "owner" in plan_part.lower(), "plan attack bullet must review existing-owner placement"
+    assert "owner" in diff_part.lower(), "diff attack bullet must review existing-owner placement"
+    # diff-gate placement review is scoped: it must not re-litigate a placement the terminal PLAN blessed
+    assert "terminal" in diff_part.lower()
+    assert "approved plan" in diff_part.lower()
+
+
+def test_critic_prompt_calibrates_placement_severity():
+    # Placement severity is evidence-calibrated: blocking only when the bypassed owner/convention can
+    # be cited in the repo; a placement objection with no cited owner is taste and is never blocking.
+    low = " ".join((REF / "critic-prompt.md").read_text().lower().split())
+    assert "cite" in low          # "cite in the repo" / "cited owner"
+    assert "taste" in low
+    assert "never" in low and "blocking" in low

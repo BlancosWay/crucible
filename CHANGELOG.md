@@ -7,6 +7,14 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
 
 ## [Unreleased]
 
+### Added
+- **Existing-owner discipline in the Builder and Critic prompts.** The Builder now searches for an
+  established owner of a responsibility before placing new logic and prefers extending it over a new
+  or inline home (recording a negative search as `unverified`, never proof of absence). The Critic
+  now attacks reuse-bypass / misplaced ownership at both gates — scoped at the diff gate so it never
+  re-opens a placement the terminal PLAN already blessed — with severity calibrated so a placement
+  objection blocks only when the bypassed owner can be cited in the repo (taste is never blocking).
+
 ## [0.15.0] - 2026-07-12
 
 ### Changed
