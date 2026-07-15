@@ -18,8 +18,9 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
   source or surfaced as a flagged unresolved dispute with both positions). It **reuses the existing,
   unmodified `crucible` CLI** with no config-schema change; the existing `crucible` skill, CLI, and
   tests are unchanged. `tests/test_docs.py` was extended **additively** (its no-default-model-id /
-  run-config guards now also cover the second skill's docs) with no existing crucible assertion
-  weakened.
+  run-config guards now also cover the second skill's docs), and `tests/validate_structure.py` was
+  refactored **additively** into an importable `main()` with a per-skill `REQUIRED_REFS` map (so each
+  skill's own references are validated) — with no existing crucible assertion weakened.
 
 ## [0.16.0] - 2026-07-13
 
