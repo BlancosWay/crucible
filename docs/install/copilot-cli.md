@@ -32,6 +32,10 @@ copilot plugin install crucible@crucible-marketplace
 Confirm it loaded with `copilot plugin list`. The workflow appears as the `crucible:crucible`
 skill with `crucible:crucible` as a slash command.
 
+> The same plugin also ships the independent **`deep-dive`** skill (`deep-dive:deep-dive`, slash
+> command `/deep-dive <question>`) — a symmetric two-peer investigation of the actual code/data that
+> reuses the same `crucible` CLI. See [`skills/deep-dive/SKILL.md`](../../skills/deep-dive/SKILL.md).
+
 **Run — interactive.** Start a session, then use the slash command (or natural language):
 
 ```bash

@@ -9,6 +9,10 @@ Codex has **no plugin marketplace**: it discovers **skills** from `~/.agents/ski
 way — by cloning and symlinking. The only difference between options is whether you also develop.
 Canonical steps: [`.codex/INSTALL.md`](../../.codex/INSTALL.md).
 
+> The repo also ships an independent second skill, **`deep-dive`** — a symmetric two-peer
+> investigation of the actual code/data that reuses the same `crucible` CLI (on Codex, the second
+> peer runs inline). Symlink `skills/deep-dive` alongside `skills/crucible` to enable `/deep-dive`.
+
 ## Prerequisites
 
 - **OpenAI Codex** (`codex`) and **git** (the install is clone-based).

@@ -9,6 +9,7 @@ SOURCE_REFERENCE_DOCS = [
     ROOT / "AGENTS.md",
     ROOT / "CLAUDE.md",
     ROOT / "commands" / "crucible.md",
+    ROOT / "commands" / "deep-dive.md",
     ROOT / "docs" / "install" / "copilot-cli.md",
     ROOT / "docs" / "install" / "claude-code.md",
     ROOT / "docs" / "install" / "codex.md",
@@ -16,6 +17,8 @@ SOURCE_REFERENCE_DOCS = [
 RUN_CONFIG_DOCS = [
     ROOT / "skills" / "crucible" / "SKILL.md",
     ROOT / "skills" / "crucible" / "references" / "platform-notes.md",
+    ROOT / "skills" / "deep-dive" / "SKILL.md",
+    ROOT / "skills" / "deep-dive" / "references" / "platform-notes.md",
 ]
 LIVE_DEFAULT_DOCS = [*SOURCE_REFERENCE_DOCS, *RUN_CONFIG_DOCS]
 NO_MODEL_LITERAL_FILES = [
@@ -23,11 +26,17 @@ NO_MODEL_LITERAL_FILES = [
     ROOT / "tests" / "test_config.py",
     ROOT / "tests" / "test_report.py",
     *LIVE_DEFAULT_DOCS,
+    # deep-dive references not already covered via the config-referencing doc sets above
+    # (platform-notes is covered via RUN_CONFIG_DOCS).
+    ROOT / "skills" / "deep-dive" / "references" / "peer-prompt.md",
+    ROOT / "skills" / "deep-dive" / "references" / "consensus-rubric.md",
+    ROOT / "skills" / "deep-dive" / "references" / "investigation-thread.md",
 ]
 
 # Docs that contain runnable workflow examples a user might copy/paste.
 WORKFLOW_DOCS = [
     ROOT / "skills" / "crucible" / "SKILL.md",
+    ROOT / "skills" / "deep-dive" / "SKILL.md",
     ROOT / "README.md",
     ROOT / "docs" / "superpowers" / "plans" / "2026-06-22-crucible-implementation.md",
 ]

@@ -91,6 +91,18 @@ Scratch files (`dag.json`, `plan.md`, `verdict.json`, …) live under `"$RUN"/`,
 `~/.crucible/runs` (override `--base-dir`/`$CRUCIBLE_RUNS_DIR`), so nothing is written into the
 target repo. Delete a finished run with `crucible clean --run "$RUN"` (refuses in-progress runs).
 
+### Companion skill: `deep-dive`
+
+The repo also ships an independent second skill, **`deep-dive`** (`/deep-dive <question>`) — a
+two-model **symmetric** adversarial *investigation* rather than construction. Two **equal peers**
+(no Builder/Critic asymmetry) each interrogate the actual code or data independently, cross-examine
+each other, and converge on an **evidence-grounded consensus finding set** (each finding cites a
+re-verifiable `file:line` / data locator; disputes are settled by returning to the source, never by a
+vote or an average). It **reuses the same deterministic `crucible` CLI** with no config-schema change
+— each round both peers review the merged set and the recorded verdict is the union of their
+findings. See [`skills/deep-dive/SKILL.md`](skills/deep-dive/SKILL.md) and its design in
+[`docs/superpowers/specs/2026-07-15-deep-dive-skill-design.md`](docs/superpowers/specs/2026-07-15-deep-dive-skill-design.md).
+
 ### Usage patterns
 
 Same loop, different config — pass a JSON file with `--config` on `init-run`; unset keys keep their
@@ -148,7 +160,8 @@ release-dry-run gates — so a green `check.py` is necessary but not the whole C
 ## Layout
 
 - `skills/crucible/` — orchestrator skill + role prompts and rubric (`references/`).
-- `commands/crucible.md` — `/crucible` entry point.
+- `skills/deep-dive/` — companion symmetric two-peer investigation skill + peer prompt and rubric (`references/`).
+- `commands/crucible.md` — `/crucible` entry point; `commands/deep-dive.md` — `/deep-dive` entry point.
 - `scripts/crucible/` — deterministic helpers: `config`, `dag`, `verdict`, `runlog`, `report`, `cli`.
 - `.claude-plugin/` — plugin + marketplace manifests.
 - `docs/cli.md` — full CLI reference; `docs/install/` — per-platform install guides.

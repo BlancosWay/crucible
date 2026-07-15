@@ -64,15 +64,14 @@ def test_consensus_rubric_both_peers_review_every_round():
 
 
 def test_consensus_rubric_bans_wontfix_for_peer_disputes():
-    # F2: a blocking peer dispute is NEVER cleared by `--resolutions`/`wontfix`. Assert the canonical
-    # negative phrasing (never … within reach of the mechanism), and that no `crucible verdict`
-    # command EXAMPLE passes `--resolutions` (the ban may name it in prose, but never invoke it).
-    text = _read("consensus-rubric.md")
-    low = text.lower()
-    assert re.search(r"never[^.\n]{0,80}(--resolutions|wontfix)", low), \
-        "consensus-rubric must state a blocking peer dispute is NEVER cleared via --resolutions/wontfix"
-    assert "wontfix" in low and "--resolutions" in low
-    for line in text.splitlines():
+    # F2: a blocking peer dispute is NEVER CLEARED by `--resolutions`/`wontfix`. Assert the canonical
+    # ban phrasing (never CLEARED with the mechanism) on de-emphasized text so wrong text like "never
+    # forget to pass --resolutions" fails; and that no `crucible verdict` example passes `--resolutions`.
+    norm = _norm("consensus-rubric.md")
+    assert re.search(r"never\s+clear(?:ed|s)?[^.]{0,40}(--resolutions|wontfix)", norm), \
+        "consensus-rubric must state a blocking peer dispute is NEVER CLEARED via --resolutions/wontfix"
+    assert "wontfix" in norm and "--resolutions" in norm
+    for line in _read("consensus-rubric.md").splitlines():
         if "crucible verdict" in line and "--resolutions" in line:
             raise AssertionError(f"deep-dive must not invoke --resolutions in a verdict example: {line!r}")
 
