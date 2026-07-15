@@ -29,6 +29,10 @@ Crucible needs **no MCP servers and no API keys**.
 
 The workflow loads as the `crucible:crucible` skill with `crucible:crucible` as a slash command.
 
+> The same plugin also ships the independent **`deep-dive`** skill (`deep-dive:deep-dive`, slash
+> command `/deep-dive <question>`) — a symmetric two-peer investigation of the actual code/data that
+> reuses the same `crucible` CLI. See [`skills/deep-dive/SKILL.md`](../../skills/deep-dive/SKILL.md).
+
 …or read a local clone directly with `--plugin-dir` — edits apply immediately, with no marketplace
 cache to refresh:
 

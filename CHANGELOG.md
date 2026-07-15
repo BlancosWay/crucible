@@ -7,6 +7,21 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
 
 ## [Unreleased]
 
+### Added
+- **New independent `deep-dive` skill (`skills/deep-dive/`, `/deep-dive <question>`).** A two-model
+  **symmetric** adversarial *investigation* against actual code or data: two **equal peers** (no
+  Builder/Critic asymmetry) investigate independently, cross-examine, and converge on an
+  **evidence-grounded consensus finding set** — each round both peers review the merged candidate set
+  and the recorded verdict is the **union** of their findings (`APPROVE` iff neither peer has a
+  blocking finding), consensus is grounded in re-verifiable citations (never a vote or an average),
+  and a blocking peer dispute is never cleared with `--resolutions`/`wontfix` (resolved against the
+  source or surfaced as a flagged unresolved dispute with both positions). It **reuses the existing,
+  unmodified `crucible` CLI** with no config-schema change; the existing `crucible` skill, CLI, and
+  tests are unchanged. `tests/test_docs.py` was extended **additively** (its no-default-model-id /
+  run-config guards now also cover the second skill's docs), and `tests/validate_structure.py` was
+  refactored **additively** into an importable `main()` with a per-skill `REQUIRED_REFS` map (so each
+  skill's own references are validated) — with no existing crucible assertion weakened.
+
 ## [0.16.0] - 2026-07-13
 
 ### Added

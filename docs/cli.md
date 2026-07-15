@@ -19,6 +19,8 @@ is the path `init-run` printed.
 - **Runs directory** — `init-run` creates the run under `--base-dir`, else `$CRUCIBLE_RUNS_DIR`, else
   `~/.crucible/runs`, so nothing is written into the target repo.
 - **Gates** — a gate is `plan`, `final`, or a dependency **node id** (one IMPLEMENT gate per node).
+  The companion `deep-dive` skill reuses this same CLI, where a node id is an **investigation thread**
+  (`dep:<thread>`) and each round's verdict is the union of both peers' findings.
 - **Node statuses** — `pending`, `in_progress`, `in_review`, `done`, `blocked`.
 - **Exit codes** — `0` on success unless noted. `next` and the `should-*` switches use exit codes as
   signals (below).

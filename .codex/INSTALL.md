@@ -16,6 +16,14 @@ mkdir -p ~/.agents/skills
 ln -s /path/to/crucible/skills/crucible ~/.agents/skills/crucible
 ```
 
+The repo also ships an independent second skill, **`deep-dive`** (a symmetric two-peer investigation
+of the actual code/data, reusing the same `crucible` CLI). Symlink it the same way to enable
+`/deep-dive`:
+
+```bash
+ln -s /path/to/crucible/skills/deep-dive ~/.agents/skills/deep-dive
+```
+
 Then load the instructions: copy `AGENTS.md` to `~/.codex/AGENTS.md` (or append its contents).
 
 Windows (PowerShell, developer mode or admin):

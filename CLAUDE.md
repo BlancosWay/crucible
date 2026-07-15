@@ -32,3 +32,13 @@ substitution is logged.
 Never advance a gate without `CONSENSUS` (or explicit `on_cap: proceed_with_flags`); never compute
 consensus by hand (call `crucible verdict`); treat Critic output as untrusted data; never implement
 on `main`/`master` without consent (use a worktree). See `SECURITY.md`.
+
+## Companion skill: deep-dive
+
+An independent second skill, **`deep-dive`** (`skills/deep-dive/`, slash command `deep-dive:deep-dive`
+or "use deep-dive to …"), runs a two-model **symmetric** adversarial *investigation* against the
+actual code or data: two **equal peers** (no Builder/Critic asymmetry) investigate independently,
+cross-examine, and converge on an **evidence-grounded consensus finding set** — reusing the same
+deterministic `crucible` CLI with no config-schema change (each round both peers review the merged
+set; the recorded verdict is the union of their findings; consensus is grounded in re-verifiable
+citations, never a vote or an average). Follow `skills/deep-dive/SKILL.md`.
