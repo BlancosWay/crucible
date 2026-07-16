@@ -128,10 +128,15 @@ def test_command_file_exists_with_frontmatter_and_no_dangling_ref_tokens():
     assert not re.search(r"references/[a-z0-9-]+\.md", text)
 
 
-def test_changelog_unreleased_mentions_deep_dive():
-    text = (ROOT / "CHANGELOG.md").read_text()
-    unreleased = text.split("## [Unreleased]", 1)[1].split("\n## ", 1)[0].lower()
-    assert "deep-dive" in unreleased or "deep dive" in unreleased
+def test_changelog_records_deep_dive():
+    # The deep-dive feature must be recorded in the CHANGELOG — under [Unreleased] before a release,
+    # or in its dated release section after. Check the top region (Unreleased body + newest dated
+    # section) so cutting a release (which moves [Unreleased] notes into a dated heading) stays green.
+    text = (ROOT / "CHANGELOG.md").read_text().lower()
+    body = text.split("## [unreleased]", 1)[1] if "## [unreleased]" in text else text
+    blocks = body.split("\n## ")           # blocks[0] = Unreleased body; blocks[1] = newest dated section
+    top = "\n## ".join(blocks[:2])
+    assert "deep-dive" in top or "deep dive" in top
 
 
 def test_readme_and_agents_mention_the_second_skill():
