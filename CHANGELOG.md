@@ -7,6 +7,8 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-07-15
+
 ### Added
 - **New independent `deep-dive` skill (`skills/deep-dive/`, `/deep-dive <question>`).** A two-model
   **symmetric** adversarial *investigation* against actual code or data: two **equal peers** (no
