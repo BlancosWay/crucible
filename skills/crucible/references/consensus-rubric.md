@@ -32,3 +32,17 @@ The deterministic decision (`CONSENSUS` / `CHANGES` / `CAPPED` / `PROCEED_WITH_F
 by `crucible verdict` — the skill never eyeballs it. Pass the Builder's per-finding resolutions via
 `crucible verdict --resolutions "$RUN"/res.json` (`{"F1": "wontfix"}`); `decide()` then applies
 `defer_severities` and `strict_rebuttal` and records a `builder_resolution` event.
+
+## Undischarged load-bearing assumptions block consensus
+
+A **load-bearing analytical claim** — one that gates durable, cross-version, or concurrent state, or
+justifies *skipping* work or tests — that the Builder tagged `assumption`, or that the Critic flagged
+as unproven, is an **open blocking finding** (`blocker`/`major`, per the run's `blocking_severities`)
+until it is independently **derived** or confirmed. Because its severity is blocking it is **not
+deferrable** — `defer_severities` (default `minor`/`nit`) never clears it. A `wontfix` rebuttal is
+legitimate **only** when it *supplies the missing derivation* (turning the `assumption` into
+`derived`); the Critic must reject a bare "out of scope" / "trust me" `wontfix` of such a claim and
+re-raise it. Prose alone cannot override rebuttal semantics — under the default `strict_rebuttal:
+false` a `wontfix` still clears any finding — so for deterministic enforcement (a `wontfix` stays
+blocking until the Critic explicitly accepts it) run with `strict_rebuttal: true`. Since consensus
+requires no open blocking findings, the gate cannot settle while one remains.
