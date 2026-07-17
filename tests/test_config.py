@@ -247,3 +247,23 @@ def test_empty_defer_severities_allowed():
 
 def test_defaults_file_is_valid_config():
     assert load_config(DEFAULTS_PATH).to_dict() == DEFAULTS
+
+
+def test_critic_checklists_defaults_empty_and_round_trips():
+    assert Config.from_dict({}).critic_checklists == []
+    cfg = Config.from_dict({"critic_checklists": ["/abs/lens.md", "/abs/other.md"]})
+    assert cfg.critic_checklists == ["/abs/lens.md", "/abs/other.md"]
+    assert Config.from_dict(cfg.to_dict()).critic_checklists == ["/abs/lens.md", "/abs/other.md"]
+
+
+def test_critic_checklists_must_be_a_list_of_strings():
+    with pytest.raises(ValueError, match="critic_checklists must be a list"):
+        Config.from_dict({"critic_checklists": "/abs/lens.md"})  # a bare string, not a list
+    with pytest.raises(ValueError, match="critic_checklists must be a list"):
+        Config.from_dict({"critic_checklists": ["/abs/ok.md", 5]})  # a non-string element
+
+
+def test_critic_checklists_rejects_empty_or_whitespace_entries():
+    for bad in ([""], ["   "], ["/abs/ok.md", ""]):
+        with pytest.raises(ValueError, match="critic_checklists must be a list"):
+            Config.from_dict({"critic_checklists": bad})

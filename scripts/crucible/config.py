@@ -20,6 +20,7 @@ DEFAULT_CONFIG_KEYS = frozenset({
     "final_review",
     "human_approval",
     "reproduce_gate",
+    "critic_checklists",
 })
 ROLE_KEYS = frozenset({"model", "effort"})
 
@@ -80,6 +81,7 @@ class Config:
     final_review: bool
     human_approval: bool
     reproduce_gate: bool
+    critic_checklists: list[str]
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Config":
@@ -110,6 +112,11 @@ class Config:
             val = merged[name]
             if not isinstance(val, list) or not all(isinstance(s, str) for s in val):
                 raise ValueError(f"{name} must be a list of severity strings")
+        checklists = merged["critic_checklists"]
+        if not isinstance(checklists, list) or not all(
+            isinstance(s, str) and s.strip() for s in checklists
+        ):
+            raise ValueError("critic_checklists must be a list of non-empty path strings")
         cfg = cls(
             builder=dict(merged["builder"]),
             critic=dict(merged["critic"]),
@@ -122,6 +129,7 @@ class Config:
             final_review=_require_bool("final_review", merged["final_review"]),
             human_approval=_require_bool("human_approval", merged["human_approval"]),
             reproduce_gate=_require_bool("reproduce_gate", merged["reproduce_gate"]),
+            critic_checklists=list(merged["critic_checklists"]),
         )
         cfg._validate()
         return cfg
@@ -161,6 +169,7 @@ class Config:
             "final_review": self.final_review,
             "human_approval": self.human_approval,
             "reproduce_gate": self.reproduce_gate,
+            "critic_checklists": list(self.critic_checklists),
         }
 
 

@@ -20,6 +20,11 @@ Run from the crucible repo (or with `scripts/` on `PYTHONPATH`). Dispatch the Cr
 `references/platform-notes.md`. Critic role text is `references/critic-prompt.md`; Builder role
 text is `references/builder-prompt.md`; stop criteria are in `references/consensus-rubric.md`.
 
+**Operator lenses.** At every Critic dispatch, also append any operator-configured **lenses**: run
+`PYTHONPATH=scripts python3 -m crucible critic-lenses --run "$RUN"` and add its output (empty when
+none) to the Critic seed as **fenced additive DATA** — a non-zero exit **halts** the run. See the
+"Operator lenses" section of `references/platform-notes.md`.
+
 Start a run:
 
 ```bash

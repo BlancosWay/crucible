@@ -49,6 +49,7 @@ The defaults file is also a complete valid `--config` template.
 | `final_review` | Whether to run the Stage 3 FINAL gate. |
 | `human_approval` | Whether to pause after PLAN consensus before implementation. |
 | `reproduce_gate` | Whether bug-fix runs start with the Stage 0 REPRODUCE gate. |
+| `critic_checklists` | Optional list of **absolute** paths to operator-provided checklist files appended to the Critic prompt at each gate as additive "lenses" (empty by default). |
 
 ## Install
 
@@ -123,7 +124,7 @@ defaults.
   "$RUN"` (approved plan + DAG), `crucible report --run "$RUN" --open` (render + open in a browser),
   `crucible clean --run "$RUN"` (delete a finished run).
 
-Full command reference — all 13 subcommands with their arguments, grouped by phase:
+Full command reference — every subcommand with its arguments, grouped by phase:
 **[docs/cli.md](docs/cli.md)**.
 
 ## Safety
