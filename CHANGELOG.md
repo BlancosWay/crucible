@@ -7,6 +7,8 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-07-16
+
 ### Added
 - **Analytical-claim ("load-bearing assumption") grounding discipline in the Builder, Critic, and
   consensus prompts.** A *load-bearing analytical conclusion* — one used to justify safety,
