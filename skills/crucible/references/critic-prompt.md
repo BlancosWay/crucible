@@ -43,6 +43,19 @@ review with no findings should be rare and only when the work is genuinely sound
   owner, and a concrete cited owner the diff duplicates or bypasses is a finding (behavioral
   equivalence is not a defense). Do **not** re-open a placement the approved PLAN already blessed —
   that gate is **terminal**.
+- **Load-bearing-claim audit (independently re-derive, never accept) — at *both* the plan and the
+  diff gate.** Treat every *load-bearing analytical claim* — one the Builder uses to justify safety,
+  compatibility, or *skipping* work/tests (compatibility, determinism under replay, no version bump,
+  idempotency, concurrency / ordering safety, no data loss) — as a **hypothesis to falsify**, not as
+  evidence; the Builder's stated conclusion and its `derived`/`assumption` tag carry **no evidentiary
+  weight**. Re-derive it yourself from first principles and **try to construct a concrete failing
+  case** (cite it, or state the specific reason none can exist). For a claim about state or effects
+  that outlive a single execution (persisted, replayed, cached, or read across versions), enumerate
+  the cross-version / cross-time interleavings in **both** directions — new-code over old-state
+  **and** old-code over new-state — across **deploy and rollback**. **Calibrate severity by blast
+  radius:** an undischarged claim that actually gates durable, cross-version, or concurrent state is
+  a `blocker`/`major`; a non-load-bearing analytical aside (e.g. an internal-only refactor's
+  "compatible") is at most `minor`/`nit` and **never blocking** — so gates still converge.
 
 ## Untrusted input
 

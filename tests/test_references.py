@@ -226,3 +226,46 @@ def test_critic_prompt_calibrates_placement_severity():
     assert "cite" in low          # "cite in the repo" / "cited owner"
     assert "taste" in low
     assert "never" in low and "blocking" in low
+
+
+def test_builder_prompt_grounds_analytical_claims():
+    # Load-bearing analytical conclusions (compat / determinism-under-replay / no-version-bump /
+    # idempotent / ...) are arguments, not facts: the Builder must derive them or tag them
+    # `assumption`, and for state that outlives one execution must cover BOTH cross-version
+    # directions (the rolling-deploy miss), not just the forward path.
+    low = " ".join((REF / "builder-prompt.md").read_text().lower().split())
+    assert "analytical" in low
+    assert "load-bearing" in low
+    assert "assumption" in low
+    assert "outlive" in low
+    assert "both direction" in low and "old-code over new-state" in low
+
+
+def test_critic_prompt_audits_load_bearing_claims_at_both_gates():
+    # Inside "## What to attack", the Critic must independently re-derive every load-bearing
+    # analytical claim (the Builder's conclusion carries no evidentiary weight), enumerate both
+    # cross-version directions across deploy/rollback, and calibrate severity so a trivial claim
+    # never blocks — otherwise gates never converge.
+    text = (REF / "critic-prompt.md").read_text()
+    assert "## What to attack" in text
+    attack = text.split("## What to attack", 1)[1].split("\n## ", 1)[0]
+    low = " ".join(attack.lower().split())
+    assert "load-bearing" in low
+    assert "re-derive" in low or "first principles" in low
+    assert "no evidentiary weight" in low
+    assert "both" in low and "deploy and rollback" in low
+    assert "never blocking" in low
+
+
+def test_consensus_rubric_blocks_undischarged_assumptions():
+    # An undischarged load-bearing assumption is a non-deferrable (by severity) open blocking finding,
+    # and a legitimate wontfix must SUPPLY the derivation. The rubric is honest that prose does not
+    # override rebuttal semantics: under the default strict_rebuttal: false a wontfix still clears any
+    # finding, so strict_rebuttal: true is named as the deterministic enforcement lever.
+    low = " ".join((REF / "consensus-rubric.md").read_text().lower().split())
+    assert "load-bearing" in low
+    assert "not deferrable" in low
+    assert "derived" in low or "derivation" in low
+    assert "blocking finding" in low
+    assert "strict_rebuttal: false" in low and "still clears any finding" in low
+    assert "strict_rebuttal: true" in low

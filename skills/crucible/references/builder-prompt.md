@@ -19,6 +19,27 @@ run returned, and you must account for every hit (whether you include or exclude
 completeness from memory or from eyeballing a pattern; an unreconciled universal is an **unverified**
 claim.
 
+## Ground every *analytical* claim too
+
+A **load-bearing analytical claim** — a conclusion you use to justify safety, compatibility, scope,
+or *skipping* work or tests (e.g. *backward/forward-compatible, deterministic under retry/replay, no
+migration or version bump needed, idempotent, concurrency-safe, ordering-independent, no data loss,
+no breaking change*) — is an **argument, not a fact**: the grounding rules above don't cover it,
+because no grep or count proves it. For each such claim, either **(a)** show the step-by-step
+**derivation** that makes it true (citing evidence for any factual premise), or **(b)** label it
+`assumption — Critic must verify` (a load-bearing kind of `unverified`) and never silently rely on
+it. **Never state a safety conclusion bare.** Scope this to genuinely load-bearing claims — a
+conclusion that gates whether work, tests, or guards are needed — not every adjective; if you rely
+on none, say so.
+
+For any claim about **state or effects that outlive a single execution** (persisted, replayed,
+cached, or read across versions), the derivation must cover **both directions** — new-code over
+old-state **and** old-code over new-state — across a rolling **deploy and rollback**, not just the
+forward path. Example: "deterministic on replay / no version bump needed" for a persisted or
+replayed workflow must hold both when new code meets state written by old code **and** when old code
+meets state written by new code during a rolling deploy — deriving only the forward direction is the
+classic miss.
+
 ## At the PLAN gate
 
 1. Use Superpowers `writing-plans` to produce the implementation plan.
@@ -32,6 +53,11 @@ claim.
    search is best-effort, **not proof of absence** — label it `unverified` (it is a negative
    existence claim, not a `completeness` claim reconciled against a hit count). Trace an existing
    example end-to-end **only when a plausible owner surfaces**.
+4. **Emit a Load-Bearing Assumptions register.** List each load-bearing analytical claim the plan
+   relies on, tagged `derived` (with a one-line derivation) or `assumption` (Critic must verify).
+   Keep it to genuinely safety-relevant claims, not every adjective; if there are none, record
+   `Load-Bearing Assumptions: none`. For any claim about state that outlives one execution, state
+   **both** cross-version / cross-time directions explicitly.
 
 ## At each IMPLEMENT gate (one dependency / node)
 
@@ -40,6 +66,8 @@ claim.
 3. Include the documentation and `CHANGELOG` updates for *this node's* deliverable in this node —
    they are part of the files this node owns. Don't defer docs to a later or separate node (a
    docs-only node is only for standalone documentation not tied to a specific code change).
+4. If this node introduces or changes a load-bearing analytical claim, update the Load-Bearing
+   Assumptions register in your node output so the Critic can re-audit it.
 
 ## Writing code comments
 

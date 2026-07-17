@@ -7,6 +7,21 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
 
 ## [Unreleased]
 
+### Added
+- **Analytical-claim ("load-bearing assumption") grounding discipline in the Builder, Critic, and
+  consensus prompts.** A *load-bearing analytical conclusion* — one used to justify safety,
+  compatibility, scope, or *skipping* work/tests (e.g. backward/forward-compatible, deterministic
+  under replay, no version bump needed, idempotent, concurrency-safe, no data loss) — must now be
+  treated as an **argument, not a fact**: the Builder either shows its derivation or tags it
+  `assumption — Critic must verify`, and for state that outlives a single execution derives **both**
+  cross-version directions across a rolling deploy and rollback (a new **Load-Bearing Assumptions
+  register** at the PLAN gate). The Critic independently **re-derives** every such claim at **both**
+  the plan and diff gates (the Builder's conclusion carries no evidentiary weight), tries to
+  construct a concrete failing case, and is severity-calibrated so trivial claims never block. The
+  consensus rubric makes an undischarged load-bearing assumption a **non-deferrable** open blocking
+  finding and names `strict_rebuttal: true` as the deterministic lever for `wontfix`-blocking.
+  Guarded by new `tests/test_references.py` assertions; language is generic (no domain hardcoding).
+
 ## [0.17.0] - 2026-07-15
 
 ### Added
