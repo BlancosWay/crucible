@@ -129,14 +129,12 @@ def test_command_file_exists_with_frontmatter_and_no_dangling_ref_tokens():
 
 
 def test_changelog_records_deep_dive():
-    # The deep-dive feature must be recorded in the CHANGELOG — under [Unreleased] before a release,
-    # or in its dated release section after. Check the top region (Unreleased body + newest dated
-    # section) so cutting a release (which moves [Unreleased] notes into a dated heading) stays green.
+    # The deep-dive feature must be recorded in the CHANGELOG — under [Unreleased] before its
+    # release, or in its dated release section after. It is a permanent historical record, so a
+    # later release that does not touch deep-dive must not make this fail: assert it appears
+    # anywhere in the CHANGELOG.
     text = (ROOT / "CHANGELOG.md").read_text().lower()
-    body = text.split("## [unreleased]", 1)[1] if "## [unreleased]" in text else text
-    blocks = body.split("\n## ")           # blocks[0] = Unreleased body; blocks[1] = newest dated section
-    top = "\n## ".join(blocks[:2])
-    assert "deep-dive" in top or "deep dive" in top
+    assert "deep-dive" in text or "deep dive" in text
 
 
 def test_readme_and_agents_mention_the_second_skill():
