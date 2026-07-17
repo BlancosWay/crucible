@@ -78,8 +78,17 @@ cannot say. For every node you implement:
 - **Explain the why.** Capture the business reason, the design trade-off, or the non-obvious
   constraint — not a paraphrase of the line below it. `counter += 1  # skip the zero-based API
   padding row` earns its place; `counter += 1  # add one` does not.
-- **Stay concise.** Roughly one sentence for an inline comment, two or three for a docstring. Long
-  comments rot as the code moves on.
+- **Write for the next maintainer, not the reviewer.** State the reason plainly; never preface a
+  comment with the *category* of the safeguard — labels like `Defense-in-depth:`,
+  `Belt-and-suspenders:`, or `For safety:` — give the concrete reason instead. (The standard
+  `TODO`/`FIXME`/`NOTE`/`HACK` tags below are fine; it is the safeguard-genre editorializing that is
+  not.) Don't narrate the change or defend the decision to a reviewer in the source: a compatibility
+  / cross-version / rollback *justification* (your Load-Bearing Assumptions derivation) belongs in
+  the plan, commit message, or PR — the comment states only the constraint the code must honor, not
+  its proof.
+- **Stay concise.** Roughly one sentence for an inline comment, two or three for a docstring. When
+  the explanation wants to run longer, that's usually justification — which belongs in the commit /
+  PR / plan, not the source. Long comments rot as the code moves on.
 - **Document assumptions and edge cases.** State the preconditions the code relies on ("assumes
   `items` is already sorted") and how the awkward cases are handled.
 - **Flag workarounds.** When you deviate from the obvious approach to dodge a bug, an API quirk, or

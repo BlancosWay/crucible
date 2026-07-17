@@ -7,6 +7,14 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
 
 ## [Unreleased]
 
+### Changed
+- **Builder prompt: human-style code comments.** The "Writing code comments" guidance now bans
+  safeguard genre-label comment preambles (`Defense-in-depth:`, `Belt-and-suspenders:`, `For
+  safety:`) and directs compatibility / cross-version / rollback *justification* (the Load-Bearing
+  Assumptions derivation) to the commit / PR / plan rather than the source, and nudges long inline
+  explanations the same way. Standard `TODO`/`FIXME`/`NOTE`/`HACK` tags are unaffected. Prompt text
+  only; no CLI/behavior change. Guarded by `tests/test_references.py`.
+
 ## [0.18.0] - 2026-07-16
 
 ### Added
