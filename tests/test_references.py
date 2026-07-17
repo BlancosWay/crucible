@@ -32,6 +32,25 @@ def test_builder_prompt_requires_completeness_reconciliation():
     assert "reconcile" in text.lower()
 
 
+def test_builder_prompt_enforces_human_style_comments():
+    # Human-style code comments: no safeguard genre-label preambles, and cross-version/compatibility
+    # justification is redirected out of the source — closes the "Defense-in-depth:" essay-comment class.
+    low = " ".join((REF / "builder-prompt.md").read_text().lower().split())
+    # bans safeguard genre-label preambles (the standard TODO/FIXME/NOTE/HACK tags stay allowed)
+    assert "write for the next maintainer" in low
+    assert "not the reviewer" in low
+    assert "defense-in-depth" in low
+    assert "belt-and-suspenders" in low
+    assert "for safety" in low
+    # the standard tags are explicitly preserved (guards the F1 carve-out against regression)
+    assert "tags below are fine" in low
+    # redirects the load-bearing / compatibility justification to the commit / PR / plan, not the source
+    assert "commit message" in low
+    assert "not its proof" in low
+    # long inline explanations are nudged the same way
+    assert "that's usually justification" in low
+
+
 def test_consensus_rubric_lists_stop_criteria():
     text = (REF / "consensus-rubric.md").read_text()
     assert "max_rounds" in text
