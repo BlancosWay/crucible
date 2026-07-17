@@ -12,6 +12,7 @@ from pathlib import Path
 
 from crucible.config import Config, load_config
 from crucible.dag import DAG
+from crucible.lenses import read_critic_lenses
 from crucible.report import render_html, render_markdown
 from crucible.runlog import RunLog, RunLogCorruptError, init_run
 from crucible.verdict import VALID_RESOLUTIONS, Finding, Verdict, decide
@@ -550,6 +551,20 @@ def cmd_report(args) -> int:
     return 0
 
 
+def cmd_critic_lenses(args) -> int:
+    """Print the operator's configured Critic lenses (``critic_checklists``) as one fenced block.
+
+    Reads the resolved run config and emits each lens file's contents (labelled with its size + a
+    short sha256) for the orchestrator to append to the Critic seed as additive DATA. Fail-closed:
+    a missing / relative / symlink / oversized lens raises ``LensError`` (a ``ValueError``), which
+    ``main`` renders as ``crucible: ...`` on stderr with a non-zero exit — halting the dispatch.
+    An empty ``critic_checklists`` prints nothing.
+    """
+    cfg = load_config(RunLog(args.run).path / "config.json")
+    sys.stdout.write(read_critic_lenses(cfg.critic_checklists))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="crucible", description="Two-model adversarial workflow helper")
     sub = p.add_subparsers(dest="command", required=True)
@@ -609,6 +624,9 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("report"); s.add_argument("--run", required=True); s.add_argument("--html", action="store_true")
     s.add_argument("--open", action="store_true")
     s.set_defaults(func=cmd_report)
+
+    s = sub.add_parser("critic-lenses"); s.add_argument("--run", required=True)
+    s.set_defaults(func=cmd_critic_lenses)
 
     return p
 

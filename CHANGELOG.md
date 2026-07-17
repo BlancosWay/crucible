@@ -21,6 +21,15 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
   consensus rubric makes an undischarged load-bearing assumption a **non-deferrable** open blocking
   finding and names `strict_rebuttal: true` as the deterministic lever for `wontfix`-blocking.
   Guarded by new `tests/test_references.py` assertions; language is generic (no domain hardcoding).
+- **Config-driven Critic "lenses" (`critic_checklists`).** An optional list of **absolute** paths to
+  operator-provided checklist files, appended to the Critic prompt at each gate as additive "lenses"
+  — a generic hook for injecting domain risk priors (e.g. a replay/versioning checklist) without
+  hardcoding any domain into Crucible. A new `crucible critic-lenses` command reads them
+  **fail-closed** (rejecting a relative path, a symlink, a missing/non-regular file, or one over a
+  64 KiB cap) and emits them as fenced DATA that stays subordinate to `critic-prompt.md` and the
+  verdict schema. Empty by default; lenses are operator config, never sourced from the reviewed tree.
+  New `scripts/crucible/lenses.py` + `tests/test_lenses.py`, with `test_config.py`/`test_cli.py`
+  coverage.
 
 ## [0.17.0] - 2026-07-15
 

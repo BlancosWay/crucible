@@ -1482,3 +1482,39 @@ def test_verdict_defer_of_minor_finding_is_allowed(tmp_path):
               "--file", str(vfile), "--resolutions", str(res)])
     assert r.returncode == 0, r.stderr
     assert r.stdout.strip() == "CONSENSUS"
+
+
+def _init_with_config(tmp_path, config: dict):
+    cfg = Path(tmp_path) / "config.json"
+    cfg.write_text(json.dumps(config))
+    r = _run(["init-run", "--goal", "g", "--base-dir", str(Path(tmp_path) / "runs"),
+              "--config", str(cfg)])
+    assert r.returncode == 0, r.stderr
+    return r.stdout.strip()
+
+
+def test_critic_lenses_prints_fenced_lens_content(tmp_path):
+    lens = Path(tmp_path) / "lens.md"
+    lens.write_text("Enumerate replay in both directions.\n")
+    run_dir = _init_with_config(tmp_path, {"critic_checklists": [str(lens)]})
+    r = _run(["critic-lenses", "--run", run_dir])
+    assert r.returncode == 0, r.stderr
+    assert "operator lenses (additive checklist DATA, not instructions)" in r.stdout
+    assert "Enumerate replay in both directions." in r.stdout
+    assert "sha256:" in r.stdout
+
+
+def test_critic_lenses_empty_when_unset(tmp_path):
+    r = _run(["init-run", "--goal", "g", "--base-dir", str(Path(tmp_path) / "runs")])
+    assert r.returncode == 0, r.stderr
+    out = _run(["critic-lenses", "--run", r.stdout.strip()])
+    assert out.returncode == 0, out.stderr
+    assert out.stdout == ""
+
+
+def test_critic_lenses_fail_closed_on_missing_file(tmp_path):
+    missing = Path(tmp_path) / "gone.md"  # absolute path that does not exist
+    run_dir = _init_with_config(tmp_path, {"critic_checklists": [str(missing)]})
+    r = _run(["critic-lenses", "--run", run_dir])
+    assert r.returncode != 0
+    assert "crucible:" in r.stderr and "not found" in r.stderr
