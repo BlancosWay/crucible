@@ -1,8 +1,7 @@
 # PR-Review Skill — Design
 
-**Status:** proposed. **Type:** engineering tool (an independent third skill in the Crucible repo).
-**Companion plan:** produced at the Crucible PLAN gate (built via Crucible itself), recorded under
-`docs/superpowers/plans/2026-07-17-pr-review-skill.md`.
+**Status:** implemented. **Type:** engineering tool (an independent third skill in the Crucible repo).
+**Companion plan:** [`docs/superpowers/plans/2026-07-17-pr-review-skill.md`](../plans/2026-07-17-pr-review-skill.md).
 
 ## Problem
 

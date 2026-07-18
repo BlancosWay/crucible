@@ -12,6 +12,10 @@ Canonical steps: [`.codex/INSTALL.md`](../../.codex/INSTALL.md).
 > The repo also ships an independent second skill, **`deep-dive`** — a symmetric two-peer
 > investigation of the actual code/data that reuses the same `crucible` CLI (on Codex, the second
 > peer runs inline). Symlink `skills/deep-dive` alongside `skills/crucible` to enable `/deep-dive`.
+>
+> It also ships an independent third skill, **`pr-review`** — a symmetric two-peer review of a GitHub
+> PR or a local diff that reuses the same `crucible` CLI (on Codex, the second peer runs inline).
+> Symlink `skills/pr-review` alongside `skills/crucible` to enable `/pr-review`.
 
 ## Prerequisites
 

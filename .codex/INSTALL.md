@@ -24,6 +24,14 @@ of the actual code/data, reusing the same `crucible` CLI). Symlink it the same w
 ln -s /path/to/crucible/skills/deep-dive ~/.agents/skills/deep-dive
 ```
 
+The repo also ships an independent third skill, **`pr-review`** (a symmetric two-peer review of a
+GitHub PR or a local diff against the real code, reusing the same `crucible` CLI). Symlink it the same
+way to enable `/pr-review`:
+
+```bash
+ln -s /path/to/crucible/skills/pr-review ~/.agents/skills/pr-review
+```
+
 Then load the instructions: copy `AGENTS.md` to `~/.codex/AGENTS.md` (or append its contents).
 
 Windows (PowerShell, developer mode or admin):

@@ -41,3 +41,14 @@ set** (citations either peer can re-verify; disputes settled by returning to the
 or an average). It reuses the same deterministic `crucible` CLI with no config-schema change — each
 round both peers review the merged set and the recorded verdict is the union of their findings.
 Follow `skills/deep-dive/SKILL.md` and its `references/`.
+
+## Companion skill: pr-review
+
+This repo also ships an independent third skill, **`pr-review`** (`skills/pr-review/`, invoked as
+`/pr-review <pr-or-diff>` or "use pr-review to …"). It runs a two-model **symmetric** adversarial
+*review* of a pull request: two **equal peers** (no Builder/Critic asymmetry) review a GitHub PR (via
+`gh`) or a local diff independently against the real code, cross-examine, and converge on an
+**evidence-grounded consensus finding set** plus a **derived** Approve/Comment/Request-changes
+recommendation. It reuses the same deterministic `crucible` CLI with no config-schema change, and is
+read-only over the target by default (posting to the PR is a consented, per-run side effect). Follow
+`skills/pr-review/SKILL.md` and its `references/`.

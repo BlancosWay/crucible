@@ -14,7 +14,7 @@ def _load_vs():
     return mod
 
 
-def test_validate_structure_passes_with_two_skills():
+def test_validate_structure_passes_with_three_skills():
     assert _load_vs().main() == 0
 
 
@@ -23,6 +23,13 @@ def test_validate_registers_deep_dive_required_refs():
     assert "deep-dive" in vs.REQUIRED_REFS
     assert set(vs.REQUIRED_REFS["deep-dive"]) == {
         "peer-prompt.md", "consensus-rubric.md", "investigation-thread.md", "platform-notes.md"}
+
+
+def test_validate_registers_pr_review_required_refs():
+    vs = _load_vs()
+    assert "pr-review" in vs.REQUIRED_REFS
+    assert set(vs.REQUIRED_REFS["pr-review"]) == {
+        "peer-prompt.md", "consensus-rubric.md", "review-thread.md", "platform-notes.md"}
 
 
 def test_validate_keeps_crucible_required_refs():

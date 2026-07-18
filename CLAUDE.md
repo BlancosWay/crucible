@@ -42,3 +42,14 @@ cross-examine, and converge on an **evidence-grounded consensus finding set** �
 deterministic `crucible` CLI with no config-schema change (each round both peers review the merged
 set; the recorded verdict is the union of their findings; consensus is grounded in re-verifiable
 citations, never a vote or an average). Follow `skills/deep-dive/SKILL.md`.
+
+## Companion skill: pr-review
+
+An independent third skill, **`pr-review`** (`skills/pr-review/`, slash command `pr-review:pr-review`
+or "use pr-review to …"), runs a two-model **symmetric** adversarial *review* of a pull request: two
+**equal peers** (no Builder/Critic asymmetry) review a GitHub PR (via `gh`) or a local diff
+independently against the real code, cross-examine, and converge on an **evidence-grounded consensus
+finding set** plus a **derived** Approve/Comment/Request-changes recommendation — reusing the same
+deterministic `crucible` CLI with no config-schema change (consensus is grounded in re-verifiable
+citations, never a vote or an average). Read-only over the target by default; posting to the PR is a
+consented, per-run side effect. Follow `skills/pr-review/SKILL.md`.
