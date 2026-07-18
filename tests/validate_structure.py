@@ -44,6 +44,8 @@ REQUIRED_REFS = {
                  "dependency-tree.md", "platform-notes.md"),
     "deep-dive": ("peer-prompt.md", "consensus-rubric.md",
                   "investigation-thread.md", "platform-notes.md"),
+    "pr-review": ("peer-prompt.md", "consensus-rubric.md",
+                  "review-thread.md", "platform-notes.md"),
 }
 
 # A `references/<x>.md` token mentioned in a SHARED doc (README or a commands/*.md) resolves against

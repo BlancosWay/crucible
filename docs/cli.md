@@ -20,7 +20,8 @@ is the path `init-run` printed.
   `~/.crucible/runs`, so nothing is written into the target repo.
 - **Gates** — a gate is `plan`, `final`, or a dependency **node id** (one IMPLEMENT gate per node).
   The companion `deep-dive` skill reuses this same CLI, where a node id is an **investigation thread**
-  (`dep:<thread>`) and each round's verdict is the union of both peers' findings.
+  (`dep:<thread>`) and each round's verdict is the union of both peers' findings. The companion
+  `pr-review` skill likewise reuses it, where a node id is a **review thread** (`dep:<thread>`).
 - **Node statuses** — `pending`, `in_progress`, `in_review`, `done`, `blocked`.
 - **Exit codes** — `0` on success unless noted. `next` and the `should-*` switches use exit codes as
   signals (below).

@@ -32,6 +32,10 @@ The workflow loads as the `crucible:crucible` skill with `crucible:crucible` as 
 > The same plugin also ships the independent **`deep-dive`** skill (`deep-dive:deep-dive`, slash
 > command `/deep-dive <question>`) — a symmetric two-peer investigation of the actual code/data that
 > reuses the same `crucible` CLI. See [`skills/deep-dive/SKILL.md`](../../skills/deep-dive/SKILL.md).
+>
+> It also ships the independent **`pr-review`** skill (`pr-review:pr-review`, slash command
+> `/pr-review <pr-or-diff>`) — a symmetric two-peer review of a GitHub PR or a local diff that reuses
+> the same `crucible` CLI. See [`skills/pr-review/SKILL.md`](../../skills/pr-review/SKILL.md).
 
 …or read a local clone directly with `--plugin-dir` — edits apply immediately, with no marketplace
 cache to refresh:

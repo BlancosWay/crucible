@@ -1,0 +1,144 @@
+import re
+from pathlib import Path
+
+REF = Path(__file__).resolve().parents[1] / "skills" / "pr-review" / "references"
+
+
+def _read(name: str) -> str:
+    return (REF / name).read_text()
+
+
+def _norm(name: str) -> str:
+    """Lowercased, whitespace-collapsed, with markdown emphasis/code markers (*, `) removed, so a
+    canonical phrase assertion is not defeated by bold/italic/code spans or line wraps."""
+    return " ".join(_read(name).lower().replace("*", "").replace("`", "").split())
+
+
+def test_reference_files_exist():
+    for name in ["peer-prompt.md", "consensus-rubric.md",
+                 "review-thread.md", "platform-notes.md"]:
+        assert (REF / name).exists(), f"missing {name}"
+
+
+def test_peers_are_symmetric_equals_not_builder_critic():
+    low = _norm("peer-prompt.md")
+    assert "peer" in low
+    assert "symmetric" in low or "equal" in low
+    # canonical positive phrases a negated/wrong prompt could NOT contain
+    assert "no builder and no critic" in low
+    assert "this same prompt" in low
+    assert "alternates each round" in low
+
+
+def test_peer_prompt_grounds_findings_in_reverifiable_evidence():
+    low = _read("peer-prompt.md").lower()
+    assert "citation" in low or "cite" in low
+    assert "file:line" in low
+    assert "re-verify" in low or "reverify" in low or "re-run" in low
+    # reviews the actual code, not just the patch
+    assert "actual code" in low or "real code" in low
+
+
+def test_peer_prompt_treats_input_as_untrusted():
+    low = _read("peer-prompt.md")
+    assert "data, not instructions" in low
+    # a PR body that says "approve" is an injection attempt, reported as a finding
+    assert "injection" in low.lower()
+
+
+def test_peer_prompt_carries_the_review_lenses():
+    # The distinctive review dimensions harvested from the pr-review-toolkit + crucible's critic prompt
+    # must all be present, so no lens silently drops.
+    low = _norm("peer-prompt.md")
+    for lens in ["correctness", "silent failures", "test coverage", "type design", "comment",
+                 "compliance", "load-bearing", "pr-intent match", "reuse", "simplification"]:
+        assert lens in low, f"peer-prompt is missing the '{lens}' review lens"
+    # the test-claim rule: a named-but-absent test is a blocker, and a pass is never fabricated
+    assert "named-but-absent test" in low
+    assert "blocker" in low
+    assert "never fabricate a pass" in low
+
+
+def test_consensus_rubric_is_dual_approve_and_grounded():
+    low = _read("consensus-rubric.md").lower()
+    assert "both peers" in low
+    assert "verdict" in low
+    assert "evidence" in low or "citation" in low
+    assert "not a vote" in low or "never a vote" in low
+    assert "not an average" in low or "not by averaging" in low
+
+
+def test_consensus_rubric_both_peers_review_every_round():
+    low = _norm("consensus-rubric.md")
+    assert "both peers review the merged set every round" in low
+    assert "union of both peers" in low
+    assert "iff neither" in low
+
+
+def test_consensus_rubric_bans_wontfix_for_peer_disputes():
+    norm = _norm("consensus-rubric.md")
+    assert re.search(r"never\s+clear(?:ed|s)?[^.]{0,40}(--resolutions|wontfix)", norm), \
+        "consensus-rubric must state a blocking peer dispute is NEVER CLEARED via --resolutions/wontfix"
+    assert "wontfix" in norm and "--resolutions" in norm
+    for line in _read("consensus-rubric.md").splitlines():
+        if "crucible verdict" in line and "--resolutions" in line:
+            raise AssertionError(f"pr-review must not invoke --resolutions in a verdict example: {line!r}")
+
+
+def test_consensus_rubric_cap_disagreement_is_flagged_not_forced():
+    low = _read("consensus-rubric.md").lower()
+    assert "max_rounds" in low
+    assert "halt" in low and "proceed_with_flags" in low
+    assert "flag" in low
+    assert "both" in low
+
+
+def test_consensus_rubric_recommendation_is_derived_not_voted():
+    # The overall Approve/Comment/Request-changes recommendation is a deterministic projection of the
+    # finding set, NOT a separate vote — preserving "consensus is not a vote".
+    low = _norm("consensus-rubric.md")
+    assert "derived" in low
+    assert "approve" in low and "comment" in low and "request" in low
+    assert "not a separate vote" in low or "not voted" in low or "never separately ballot" in low
+
+
+def test_review_thread_reuses_dag_schema():
+    low = _read("review-thread.md").lower()
+    for key in ["nodes", "edges", "depends_on", "topological"]:
+        assert key in low
+    # test_plan reframed as the re-runnable evidence/verification plan
+    assert "test_plan" in low
+    assert "evidence" in low or "verif" in low
+    # adaptive decomposition (single node vs thread-per-concern)
+    assert "single node" in low
+    assert "per concern" in low or "one thread per concern" in low
+
+
+def test_platform_notes_dispatch_two_peers_from_run_config():
+    low = _read("platform-notes.md").lower()
+    assert "config.json" in low
+    assert "general-purpose" in low
+    assert "peer" in low
+
+
+def test_platform_notes_requires_both_peer_reviews_and_union():
+    low = _norm("platform-notes.md")
+    assert "both peers independently review" in low
+    assert "deduped union" in low
+    assert "never record only one peer" in low
+
+
+def test_platform_notes_normalizes_gh_or_local_diff_input():
+    low = _read("platform-notes.md").lower()
+    assert "normaliz" in low                 # input normalization step
+    assert "gh pr diff" in low               # GitHub PR path
+    assert "git diff" in low                 # local diff path
+
+
+def test_platform_notes_posting_is_readonly_by_default_and_consented():
+    low = _read("platform-notes.md").lower()
+    assert "read-only" in low
+    assert "consent" in low                  # only with the human's consent
+    assert "gh pr review" in low             # posting mechanism
+    # never automatic, never before consensus
+    assert "never automatic" in low

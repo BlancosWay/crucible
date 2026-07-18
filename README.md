@@ -104,6 +104,18 @@ vote or an average). It **reuses the same deterministic `crucible` CLI** with no
 findings. See [`skills/deep-dive/SKILL.md`](skills/deep-dive/SKILL.md) and its design in
 [`docs/superpowers/specs/2026-07-15-deep-dive-skill-design.md`](docs/superpowers/specs/2026-07-15-deep-dive-skill-design.md).
 
+### Companion skill: `pr-review`
+
+The repo also ships an independent third skill, **`pr-review`** (`/pr-review <pr-or-diff>`) — a
+two-model **symmetric** adversarial *review* of a pull request. Two **equal peers** (no Builder/Critic
+asymmetry) review a **GitHub PR** (via `gh`) or a **local diff** independently against the real code,
+cross-examine, and converge on an **evidence-grounded consensus finding set** plus a **derived**
+Approve/Comment/Request-changes recommendation. It **reuses the same deterministic `crucible` CLI**
+with no config-schema change, and is **read-only** over the target by default (posting the review to
+the PR happens only for a GitHub PR, only after consensus, and only with your explicit OK). See
+[`skills/pr-review/SKILL.md`](skills/pr-review/SKILL.md) and its design in
+[`docs/superpowers/specs/2026-07-17-pr-review-skill-design.md`](docs/superpowers/specs/2026-07-17-pr-review-skill-design.md).
+
 ### Usage patterns
 
 Same loop, different config — pass a JSON file with `--config` on `init-run`; unset keys keep their
@@ -162,7 +174,8 @@ release-dry-run gates — so a green `check.py` is necessary but not the whole C
 
 - `skills/crucible/` — orchestrator skill + role prompts and rubric (`references/`).
 - `skills/deep-dive/` — companion symmetric two-peer investigation skill + peer prompt and rubric (`references/`).
-- `commands/crucible.md` — `/crucible` entry point; `commands/deep-dive.md` — `/deep-dive` entry point.
+- `skills/pr-review/` — companion symmetric two-peer PR-review skill + peer prompt and rubric (`references/`).
+- `commands/crucible.md` — `/crucible` entry point; `commands/deep-dive.md` — `/deep-dive` entry point; `commands/pr-review.md` — `/pr-review` entry point.
 - `scripts/crucible/` — deterministic helpers: `config`, `dag`, `verdict`, `runlog`, `report`, `cli`.
 - `.claude-plugin/` — plugin + marketplace manifests.
 - `docs/cli.md` — full CLI reference; `docs/install/` — per-platform install guides.

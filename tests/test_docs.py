@@ -10,6 +10,7 @@ SOURCE_REFERENCE_DOCS = [
     ROOT / "CLAUDE.md",
     ROOT / "commands" / "crucible.md",
     ROOT / "commands" / "deep-dive.md",
+    ROOT / "commands" / "pr-review.md",
     ROOT / "docs" / "install" / "copilot-cli.md",
     ROOT / "docs" / "install" / "claude-code.md",
     ROOT / "docs" / "install" / "codex.md",
@@ -19,6 +20,8 @@ RUN_CONFIG_DOCS = [
     ROOT / "skills" / "crucible" / "references" / "platform-notes.md",
     ROOT / "skills" / "deep-dive" / "SKILL.md",
     ROOT / "skills" / "deep-dive" / "references" / "platform-notes.md",
+    ROOT / "skills" / "pr-review" / "SKILL.md",
+    ROOT / "skills" / "pr-review" / "references" / "platform-notes.md",
 ]
 LIVE_DEFAULT_DOCS = [*SOURCE_REFERENCE_DOCS, *RUN_CONFIG_DOCS]
 NO_MODEL_LITERAL_FILES = [
@@ -31,12 +34,17 @@ NO_MODEL_LITERAL_FILES = [
     ROOT / "skills" / "deep-dive" / "references" / "peer-prompt.md",
     ROOT / "skills" / "deep-dive" / "references" / "consensus-rubric.md",
     ROOT / "skills" / "deep-dive" / "references" / "investigation-thread.md",
+    # pr-review references not already covered via RUN_CONFIG_DOCS (platform-notes is covered there).
+    ROOT / "skills" / "pr-review" / "references" / "peer-prompt.md",
+    ROOT / "skills" / "pr-review" / "references" / "consensus-rubric.md",
+    ROOT / "skills" / "pr-review" / "references" / "review-thread.md",
 ]
 
 # Docs that contain runnable workflow examples a user might copy/paste.
 WORKFLOW_DOCS = [
     ROOT / "skills" / "crucible" / "SKILL.md",
     ROOT / "skills" / "deep-dive" / "SKILL.md",
+    ROOT / "skills" / "pr-review" / "SKILL.md",
     ROOT / "README.md",
     ROOT / "docs" / "superpowers" / "plans" / "2026-06-22-crucible-implementation.md",
 ]
