@@ -31,6 +31,20 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
   explanations the same way. Standard `TODO`/`FIXME`/`NOTE`/`HACK` tags are unaffected. Prompt text
   only; no CLI/behavior change. Guarded by `tests/test_references.py`.
 
+### Security
+- **`pr-review` gates reviewed-code execution on explicit consent (execution trust boundary).**
+  Reviewing a change is now separated from executing it: a **GitHub PR URL/number** and a
+  **diff-file** review are **static/CI-only** and never execute the reviewed code locally. Running
+  tests or builds is available only for a **trusted local checkout**, after a new **Execution Safety
+  Gate** (post-PLAN-consensus) shows the **exact commands**, warns they run **arbitrary code** with
+  your file/credential/environment/network access, and obtains explicit, exact-command **consent**.
+  Declining continues the review static-only with runtime results `unverified` (never a fabricated
+  pass); a new or changed command needs fresh consent; consent does not imply sandboxing; and
+  execution consent stays separate from posting consent. Instruction/policy change only — no
+  `scripts/crucible/` or `config.defaults.json` change. Guarded by
+  `tests/test_pr_review_execution_safety.py`. Design:
+  `docs/superpowers/specs/2026-07-18-pr-review-execution-safety-design.md`.
+
 ## [0.18.0] - 2026-07-16
 
 ### Added

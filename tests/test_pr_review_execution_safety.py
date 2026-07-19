@@ -181,3 +181,54 @@ def test_scanner_accepts_guarded_execution_prose():
     wrongly_flagged = [prose for prose in MUST_ACCEPT_GUARDED
                        if _unguarded_execution_directives(prose)]
     assert not wrongly_flagged, f"scanner wrongly flagged guarded prose: {wrongly_flagged}"
+
+
+# --- Public-policy drift guard ---------------------------------------------------
+# Every public/security/install/spec/plan surface that describes pr-review must state
+# the execution trust boundary. Discovery-based (glob) so a newly added install guide,
+# pr-review spec, or pr-review plan cannot silently omit the boundary.
+PUBLIC_POLICY_DOCS = {
+    ROOT / "README.md",
+    ROOT / "AGENTS.md",
+    ROOT / "CLAUDE.md",
+    ROOT / "SECURITY.md",
+    ROOT / "CHANGELOG.md",
+    ROOT / ".codex" / "INSTALL.md",
+    ROOT / "docs" / "cli.md",
+    *set((ROOT / "docs" / "install").glob("*.md")),
+    *set((ROOT / "docs" / "superpowers" / "specs").glob("*pr-review*.md")),
+    *set((ROOT / "docs" / "superpowers" / "plans").glob("*pr-review*.md")),
+}
+
+
+def test_all_public_policy_docs_state_execution_boundary():
+    for path in PUBLIC_POLICY_DOCS:
+        low = _norm(path)
+        assert "static" in low, f"{path} omits static-only behavior"
+        assert "trusted local" in low, f"{path} omits trusted-local scope"
+        assert "consent" in low, f"{path} omits execution consent"
+
+
+def test_pr_review_specs_do_not_retain_stale_execution_semantics():
+    original = _norm(
+        ROOT / "docs" / "superpowers" / "specs" /
+        "2026-07-17-pr-review-skill-design.md"
+    )
+    assert "when a runnable environment is available, that they pass" not in original
+    assert "static evidence" in original
+    assert "execution candidates" in original
+    assert "consent required" in original
+
+    safety_path = (
+        ROOT / "docs" / "superpowers" / "specs" /
+        "2026-07-18-pr-review-execution-safety-design.md"
+    )
+    safety = safety_path.read_text().lower()
+    peer_contract = safety.split("## peer contract", 1)[1].split(
+        "## target-specific behavior", 1
+    )[0]
+    peer_contract = " ".join(
+        peer_contract.replace("*", "").replace("`", "").split()
+    )
+    assert "interpreter over target modules" in peer_contract
+    assert "plugin hook" in peer_contract

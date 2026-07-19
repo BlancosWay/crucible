@@ -35,7 +35,11 @@ The workflow loads as the `crucible:crucible` skill with `crucible:crucible` as 
 >
 > It also ships the independent **`pr-review`** skill (`pr-review:pr-review`, slash command
 > `/pr-review <pr-or-diff>`) — a symmetric two-peer review of a GitHub PR or a local diff that reuses
-> the same `crucible` CLI. See [`skills/pr-review/SKILL.md`](../../skills/pr-review/SKILL.md).
+> the same `crucible` CLI. A PR-URL and a diff-file review are **static/CI-only** and never execute
+> locally; running tests or builds is available only for a **trusted local checkout**, after explicit
+> execution **consent** to the exact commands and an arbitrary-code warning (consent does not imply
+> sandboxing, and is separate from posting consent). See
+> [`skills/pr-review/SKILL.md`](../../skills/pr-review/SKILL.md).
 
 …or read a local clone directly with `--plugin-dir` — edits apply immediately, with no marketplace
 cache to refresh:

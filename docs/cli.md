@@ -21,7 +21,10 @@ is the path `init-run` printed.
 - **Gates** — a gate is `plan`, `final`, or a dependency **node id** (one IMPLEMENT gate per node).
   The companion `deep-dive` skill reuses this same CLI, where a node id is an **investigation thread**
   (`dep:<thread>`) and each round's verdict is the union of both peers' findings. The companion
-  `pr-review` skill likewise reuses it, where a node id is a **review thread** (`dep:<thread>`).
+  `pr-review` skill likewise reuses it, where a node id is a **review thread** (`dep:<thread>`); that
+  review is **static/CI-only** for a PR-URL or diff-file target and executes a reviewed change only
+  for a **trusted local checkout** after exact-command **consent** (a skill-level Execution Safety
+  Gate, not a CLI feature).
 - **Node statuses** — `pending`, `in_progress`, `in_review`, `done`, `blocked`.
 - **Exit codes** — `0` on success unless noted. `next` and the `should-*` switches use exit codes as
   signals (below).

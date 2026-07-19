@@ -1,6 +1,8 @@
 # PR-Review Execution Safety — Design
 
-**Status:** proposed. **Type:** security behavior change for the `pr-review` skill.
+**Status:** implemented. **Type:** security behavior change for the `pr-review` skill.
+**Companion plan:**
+[`docs/superpowers/plans/2026-07-18-pr-review-execution-safety.md`](../plans/2026-07-18-pr-review-execution-safety.md).
 
 ## Problem
 
@@ -130,8 +132,8 @@ Instead, every peer seed carries one of:
 Without the affirmative marker and exact command match, the peer must not:
 
 - run tests or builds;
-- import target modules;
-- invoke package managers or repository scripts;
+- import target modules or run the interpreter over target modules;
+- invoke package managers, repository scripts, or a plugin hook;
 - execute binaries produced by the target;
 - install target dependencies.
 

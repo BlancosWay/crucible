@@ -50,3 +50,15 @@ posting are skill-level actions (`gh`/`git`), not CLI features.
 Per-node focused tests + a whole-suite `python -m pytest -q` and `python3 scripts/check.py` at the
 FINAL gate. New tests: `test_pr_review_references.py`, `test_pr_review_skill.py`; additive registration
 in `validate_structure.py`, `test_validate_structure_multiskill.py`, `test_docs.py`.
+
+## Amendment (2026-07-18): execution trust boundary
+
+A follow-up plan —
+[`2026-07-18-pr-review-execution-safety.md`](2026-07-18-pr-review-execution-safety.md) (design:
+[`../specs/2026-07-18-pr-review-execution-safety-design.md`](../specs/2026-07-18-pr-review-execution-safety-design.md))
+— adds the execution trust boundary this plan's evidence model predates. A PR-URL and a diff-file
+review are now **static**/CI-only and never execute the reviewed code locally; running tests or builds
+is available only for a **trusted local** checkout, after explicit exact-command **consent** at a
+post-PLAN Execution Safety Gate (with an arbitrary-code warning). It changes only instructions, docs,
+and tests — no `scripts/crucible/` or `config.defaults.json` change — and keeps execution consent
+separate from posting consent.

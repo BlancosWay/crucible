@@ -14,8 +14,11 @@ Canonical steps: [`.codex/INSTALL.md`](../../.codex/INSTALL.md).
 > peer runs inline). Symlink `skills/deep-dive` alongside `skills/crucible` to enable `/deep-dive`.
 >
 > It also ships an independent third skill, **`pr-review`** — a symmetric two-peer review of a GitHub
-> PR or a local diff that reuses the same `crucible` CLI (on Codex, the second peer runs inline).
-> Symlink `skills/pr-review` alongside `skills/crucible` to enable `/pr-review`.
+> PR or a local diff that reuses the same `crucible` CLI (on Codex, the second peer runs inline). A
+> PR-URL and a diff-file review are **static/CI-only** and never execute locally; running tests or
+> builds is available only for a **trusted local checkout**, after explicit execution **consent** to
+> the exact commands and an arbitrary-code warning (consent does not imply sandboxing, and is separate
+> from posting consent). Symlink `skills/pr-review` alongside `skills/crucible` to enable `/pr-review`.
 
 ## Prerequisites
 
