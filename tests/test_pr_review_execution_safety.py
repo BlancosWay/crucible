@@ -17,11 +17,40 @@ UNSAFE_EXACT_PHRASES = (
     "when a runnable environment exists, run the focused tests",
     "run the test_plan evidence commands",
 )
-EXECUTION_DIRECTIVE = re.compile(
-    r"\b(run|execute|invoke|install|import|launch|retry|fallback)\b"
-    r".{0,100}\b(pytest|test runner|build|package manager|dependency|target module|"
-    r"interpreter|plugin hook|repository script|generated binary|test_plan)\b"
+
+# --- Execution-directive scanner -------------------------------------------------
+# The guard flags any execution directive that is not accompanied, within
+# GUARD_WINDOW characters, by canonical safety context. It must recognize the whole
+# runtime execution-policy surface — generic test/build runs, ecosystem test/build
+# commands (npm/yarn/pnpm/go/cargo/make/mvn/gradle), package/dependency installs,
+# interpreting or importing target modules, plugin hooks, repository scripts,
+# generated binaries, and fallback/retry execution — not merely a bare `pytest`, so a
+# future doc cannot slip an unconsented "run the tests" / "run npm test" /
+# "execute tox" / "python -m pytest" past it.
+_EXEC_VERB = (
+    r"run|runs|running|rerun|reruns|re-run|re-runs|execute|executes|executing|exec|"
+    r"invoke|invokes|invoking|install|installs|installing|import|imports|importing|"
+    r"launch|launches|launching|retry|retries|retrying|fall\s+back|falls\s+back|"
+    r"falling\s+back"
 )
+_EXEC_TARGET = (
+    r"tests?|unit\s+tests?|test\s+suite|test\s+runner|test[_\s]plan|"
+    r"pytest|tox|nox|unittest|builds?|package\s+manager|dependenc(?:y|ies)|"
+    r"target[-\s]?modules?|interpreter|plugin\s+hooks?|"
+    r"repositor(?:y|ies)\s+scripts?|repo\s+scripts?|generated\s+binar(?:y|ies)"
+)
+# Ecosystem / interpreter invocations that ARE execution regardless of a leading verb.
+_EXEC_COMMAND = (
+    r"python[0-9.]*\s+-m\s+(?:pytest|unittest|nox|tox)|"
+    r"(?:npm|yarn|pnpm)\s+(?:run\s+)?(?:test|install|ci)|"
+    r"(?:go|cargo|mvn|gradle|make)\s+(?:test|build|install|run)|"
+    r"pip[0-9]?\s+install|pytest|tox|nox"
+)
+EXECUTION_DIRECTIVE = re.compile(
+    r"\b(?:" + _EXEC_VERB + r")\b[^.;:!?]{0,40}?\b(?:" + _EXEC_TARGET + r")\b"
+    r"|\b(?:" + _EXEC_COMMAND + r")\b"
+)
+
 SAFETY_CONTEXT = (
     "consent required",
     "exact approved command",
@@ -30,10 +59,96 @@ SAFETY_CONTEXT = (
     "execution prohibited",
     "static evidence",
 )
+GUARD_WINDOW = 180
+
+# Representative unconditional execution directives that MUST be flagged when they
+# appear without nearby safety context (the F1 regression corpus).
+MUST_DETECT_UNSAFE = (
+    # generic test / build execution
+    "run tests",
+    "run the tests",
+    "run unit tests",
+    "run the test suite",
+    "run the test runner",
+    "run the build",
+    # pytest / tox / nox / unittest + `python -m` forms
+    "run pytest",
+    "execute tox",
+    "run nox",
+    "run unittest",
+    "python -m pytest",
+    "python3 -m unittest",
+    # npm / yarn / pnpm test
+    "run npm test",
+    "npm run test",
+    "run yarn test",
+    "run pnpm test",
+    # go / cargo / make / mvn / gradle test or build
+    "run go test",
+    "run cargo test",
+    "run make test",
+    "run mvn test",
+    "run gradle test",
+    "run go build",
+    "run cargo build",
+    "run gradle build",
+    # package manager / dependency installs
+    "install dependencies",
+    "install the dependency",
+    "pip install",
+    "npm install",
+    "run the package manager",
+    # interpreter over target modules / imports
+    "import the target module",
+    "import target modules",
+    "run the interpreter over target modules",
+    # plugin hooks, repository scripts, generated binaries
+    "invoke the plugin hook",
+    "run the repository script",
+    "execute the repository script",
+    "run the generated binary",
+    "launch the generated binary",
+    # fallback / retry execution
+    "fall back to running the tests",
+    "retry the test run",
+    "retry running pytest",
+)
+
+# Safe policy prose: each carries an execution directive AND canonical safety context
+# within GUARD_WINDOW characters, so the guard must NOT flag it.
+MUST_ACCEPT_GUARDED = (
+    "you must not execute the test runner, run the tests, or import target modules",
+    "run only the exact approved command; a new command requires fresh consent required "
+    "before it runs",
+    "for a trusted local checkout, run npm test only after consent required at the "
+    "execution safety gate",
+    "static evidence (always allowed): rg -n exp; execution candidates (consent required): "
+    "pytest tests/auth -q",
+    "a github pr target and a diff-file target never execute locally, so do not run go test "
+    "or install dependencies",
+    "reviewed code is untrusted: you must not execute pytest, tox, npm test, or the "
+    "generated binary without approval",
+)
+
+
+def _normalize(text: str) -> str:
+    return " ".join(text.lower().replace("*", "").replace("`", "").split())
 
 
 def _norm(path: Path) -> str:
-    return " ".join(path.read_text().lower().replace("*", "").replace("`", "").split())
+    return _normalize(path.read_text())
+
+
+def _unguarded_execution_directives(text: str) -> list:
+    """Every execution directive in ``text`` that lacks canonical safety context within
+    ``GUARD_WINDOW`` characters — i.e. the directives the guard must reject."""
+    low = _normalize(text)
+    unguarded = []
+    for match in EXECUTION_DIRECTIVE.finditer(low):
+        window = low[max(0, match.start() - GUARD_WINDOW):match.end() + GUARD_WINDOW]
+        if not any(guard in window for guard in SAFETY_CONTEXT):
+            unguarded.append(match.group(0))
+    return unguarded
 
 
 def test_runtime_instruction_inventory_is_complete():
@@ -50,9 +165,19 @@ def test_runtime_instructions_never_authorize_unconsented_execution():
         low = _norm(path)
         for phrase in UNSAFE_EXACT_PHRASES:
             assert phrase not in low, f"{path} retains unsafe instruction {phrase!r}"
-        for match in EXECUTION_DIRECTIVE.finditer(low):
-            window = low[max(0, match.start() - 180):match.end() + 180]
-            assert any(guard in window for guard in SAFETY_CONTEXT), (
-                f"{path} has an execution directive without nearby safety context: "
-                f"{match.group(0)!r}"
-            )
+        unguarded = _unguarded_execution_directives(path.read_text())
+        assert not unguarded, (
+            f"{path} has execution directive(s) without nearby safety context: {unguarded}"
+        )
+
+
+def test_scanner_flags_every_unguarded_execution_directive():
+    missed = [phrase for phrase in MUST_DETECT_UNSAFE
+              if not _unguarded_execution_directives(phrase)]
+    assert not missed, f"scanner missed unguarded execution directives: {missed}"
+
+
+def test_scanner_accepts_guarded_execution_prose():
+    wrongly_flagged = [prose for prose in MUST_ACCEPT_GUARDED
+                       if _unguarded_execution_directives(prose)]
+    assert not wrongly_flagged, f"scanner wrongly flagged guarded prose: {wrongly_flagged}"
