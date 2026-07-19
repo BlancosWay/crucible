@@ -32,6 +32,12 @@ way to enable `/pr-review`:
 ln -s /path/to/crucible/skills/pr-review ~/.agents/skills/pr-review
 ```
 
+`pr-review` is **read-only** over the target and treats a reviewed change as untrusted: a PR-URL and
+a diff-file review are **static/CI-only** and never execute locally; running tests or builds is
+available only for a **trusted local checkout**, after explicit execution **consent** to the exact
+commands and an arbitrary-code warning (consent does not imply sandboxing, and is separate from
+posting consent).
+
 Then load the instructions: copy `AGENTS.md` to `~/.codex/AGENTS.md` (or append its contents).
 
 Windows (PowerShell, developer mode or admin):

@@ -3,8 +3,9 @@
 The PR review plans the work as a graph of **review threads** and hands it to the *unmodified*
 `crucible` CLI as a single JSON object it validates. It is the **same DAG schema** the Crucible
 Builder emits — reused verbatim — but each node is a **slice of the PR to review** rather than an
-implementation task, and `test_plan` is the thread's **evidence / verification plan** (the focused,
-re-runnable commands that ground its findings).
+implementation task, and `test_plan` is the thread's **evidence / verification plan**, split into
+**static evidence** (reads/greps, always allowed) and **execution candidates (consent required)**
+(test/build commands that run only after the Execution Safety Gate authorizes them).
 
 ```json
 {
@@ -14,7 +15,7 @@ re-runnable commands that ground its findings).
       "title": "Review the auth/token changes",
       "description": "Review the login + token changes in src/auth/ against callers; check expiry, refresh, and authz edge cases.",
       "files": ["src/auth/login.py", "src/auth/tokens.py"],
-      "test_plan": "rg -n 'exp|refresh|authorize' src/auth/; pytest tests/auth/ -q — the exact commands/greps either peer re-runs to reproduce the evidence.",
+      "test_plan": "static evidence (always allowed): rg -n 'exp|refresh|authorize' src/auth/ tests/auth/ — the greps/reads either peer reproduces to confirm a claimed test exists. execution candidates (consent required): pytest tests/auth/ -q — a candidate only; it may execute solely for a trusted local checkout after Execution-Safety-Gate consent, and never for a GitHub PR or diff-file target.",
       "status": "pending"
     },
     {
@@ -22,7 +23,7 @@ re-runnable commands that ground its findings).
       "title": "Review the API route changes",
       "description": "Review the new/changed routes in src/api/ against the auth contract the auth-logic thread established.",
       "files": ["src/api/routes.py"],
-      "test_plan": "rg -n 'route|@app|def ' src/api/routes.py; pytest tests/api/ -q",
+      "test_plan": "static evidence (always allowed): rg -n 'route|@app|def ' src/api/routes.py. execution candidates (consent required): pytest tests/api/ -q — never executed for a GitHub PR or diff-file target, and for a trusted local checkout only after exact-command consent.",
       "status": "pending"
     }
   ],
@@ -37,9 +38,14 @@ re-runnable commands that ground its findings).
   surrounding code to interrogate).
 - `files` — the primary changed files this thread reviews (plus the nearby code the evidence lives
   in). Not exhaustive.
-- `test_plan` — the **evidence/verification plan**: the concrete, **re-runnable** commands, greps, or
-  focused tests that ground this thread's findings, so **either peer can independently reproduce**
-  them. Evidence over assertion — and the place to verify a claimed test actually exists and passes.
+- `test_plan` — the **evidence/verification plan**, written in two parts: **static evidence** (the
+  concrete, **re-runnable** reads/greps that ground this thread's findings, so **either peer can
+  independently reproduce** them) and **execution candidates (consent required)** (focused test/build
+  commands that are *candidates* only). Evidence over assertion — and the place to confirm a claimed
+  test actually **exists** statically. An execution candidate is never executed on its own: a GitHub
+  PR or diff-file target **never executes locally**, a trusted local checkout runs only the exact
+  commands approved at the Execution Safety Gate, and a **new command** or changed command requires
+  **fresh consent**.
 - `status` must be `pending` for every node in the emitted plan — `crucible load-dag` rejects a
   freshly imported tree with any non-`pending` node. The lifecycle states
   (`in_progress | in_review | done | blocked`) are set later via `crucible set-status`.

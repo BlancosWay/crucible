@@ -59,6 +59,34 @@ def test_peer_prompt_carries_the_review_lenses():
     assert "never fabricate a pass" in low
 
 
+def test_peer_prompt_requires_trusted_local_execution_consent():
+    low = _norm("peer-prompt.md")
+    assert "local_execution_approved" in low
+    assert "trusted local checkout" in low
+    assert "when a runnable environment exists, run the focused tests" not in low
+
+
+def test_peer_prompt_forbids_execution_without_exact_approval():
+    low = _norm("peer-prompt.md")
+    assert "local_execution_approved: yes" in low
+    assert "exact approved command" in low
+    assert "must not execute" in low
+    for category in (
+        "test runner", "build", "package manager", "target-module import",
+        "repository script", "generated binary", "dependency installation",
+        "interpreter over target modules", "plugin hook", "fallback", "retry",
+    ):
+        assert category in low
+
+
+def test_review_thread_separates_static_evidence_from_execution_candidates():
+    low = _norm("review-thread.md")
+    assert "static evidence" in low
+    assert "execution candidates" in low
+    assert "consent required" in low
+    assert "new command" in low and "fresh consent" in low
+
+
 def test_consensus_rubric_is_dual_approve_and_grounded():
     low = _read("consensus-rubric.md").lower()
     assert "both peers" in low
@@ -142,3 +170,12 @@ def test_platform_notes_posting_is_readonly_by_default_and_consented():
     assert "gh pr review" in low             # posting mechanism
     # never automatic, never before consensus
     assert "never automatic" in low
+
+
+def test_platform_notes_requires_trusted_local_exact_command_consent():
+    low = _norm("platform-notes.md")
+    assert "trusted local checkout" in low
+    assert "exact commands" in low
+    assert "local_execution_approved" in low
+    assert "github pr" in low and "diff file" in low
+    assert "never execute locally" in low

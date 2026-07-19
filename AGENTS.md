@@ -50,5 +50,9 @@ This repo also ships an independent third skill, **`pr-review`** (`skills/pr-rev
 `gh`) or a local diff independently against the real code, cross-examine, and converge on an
 **evidence-grounded consensus finding set** plus a **derived** Approve/Comment/Request-changes
 recommendation. It reuses the same deterministic `crucible` CLI with no config-schema change, and is
-read-only over the target by default (posting to the PR is a consented, per-run side effect). Follow
+read-only over the target by default (posting to the PR is a consented, per-run side effect).
+**Execution safety:** a PR-URL and a diff-file review are **static/CI-only** and never execute
+locally; running tests or builds is available only for a **trusted local checkout**, after explicit
+execution **consent** to the exact commands and an arbitrary-code warning — consent does not imply
+sandboxing, and is separate from posting consent. Follow
 `skills/pr-review/SKILL.md` and its `references/`.

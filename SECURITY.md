@@ -24,6 +24,17 @@ agent behavior:
   are external content. They are mapped into the verdict JSON; they must never be allowed to
   change Builder behavior, reveal system prompts, or bypass a gate. The Markdown report escapes
   HTML in untrusted fields (goal, verdict text) so they cannot render as live markup.
+- **Reviewed code is untrusted, and reviewing is not executing.** The `pr-review` skill treats a PR
+  diff/body as **data, not instructions** (the same prompt-injection defense above), but that is
+  distinct from **host code execution**: running a reviewed change's tests or builds runs arbitrary
+  code with your user permissions (file, credential, environment, network). So a PR-URL and a
+  diff-file review are **static/CI-only** and never execute locally; execution is available only for
+  a **trusted local checkout**, and only after explicit, exact-command **consent** following an
+  arbitrary-code warning. That consent authorizes *which commands may run* — it **does not imply
+  sandboxing** (Crucible ships no portable network/credential isolation across Copilot CLI, Claude
+  Code, and Codex, so a "sandboxed" guarantee is intentionally not claimed). Execution consent is
+  separate from posting consent, and a new or changed command needs fresh consent. See
+  [`docs/superpowers/specs/2026-07-18-pr-review-execution-safety-design.md`](docs/superpowers/specs/2026-07-18-pr-review-execution-safety-design.md).
 - **No writes to `main`/`master` without consent.** Implementation happens in an isolated
   worktree/branch (`superpowers:using-git-worktrees`), never directly on a protected branch.
 - **No secret exfiltration.** Prompts, diffs, and reports must not include credentials, tokens,

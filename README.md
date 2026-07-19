@@ -112,9 +112,15 @@ asymmetry) review a **GitHub PR** (via `gh`) or a **local diff** independently a
 cross-examine, and converge on an **evidence-grounded consensus finding set** plus a **derived**
 Approve/Comment/Request-changes recommendation. It **reuses the same deterministic `crucible` CLI**
 with no config-schema change, and is **read-only** over the target by default (posting the review to
-the PR happens only for a GitHub PR, only after consensus, and only with your explicit OK). See
+the PR happens only for a GitHub PR, only after consensus, and only with your explicit OK).
+**Execution safety:** reviewed code is untrusted, so a PR-URL and a diff-file review are
+**static/CI-only** and never execute locally; running tests or builds is available only for a
+**trusted local checkout**, after explicit execution **consent** to the exact commands (with an
+arbitrary-code warning). Consent does not imply sandboxing and is separate from posting consent. See
 [`skills/pr-review/SKILL.md`](skills/pr-review/SKILL.md) and its design in
-[`docs/superpowers/specs/2026-07-17-pr-review-skill-design.md`](docs/superpowers/specs/2026-07-17-pr-review-skill-design.md).
+[`docs/superpowers/specs/2026-07-17-pr-review-skill-design.md`](docs/superpowers/specs/2026-07-17-pr-review-skill-design.md)
+(execution trust boundary:
+[`docs/superpowers/specs/2026-07-18-pr-review-execution-safety-design.md`](docs/superpowers/specs/2026-07-18-pr-review-execution-safety-design.md)).
 
 ### Usage patterns
 

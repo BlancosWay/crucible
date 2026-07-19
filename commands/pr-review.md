@@ -24,3 +24,12 @@ or an average. Resolve models, effort, caps, and policies from the `RUN/config.j
 never clear a blocking peer dispute with a rebuttal; resolve it against the cited source or flag both
 positions.** The deliverable is the findings; the review is **read-only** over the target by default —
 posting to the PR happens only for a GitHub PR, only after consensus, and only with your explicit OK.
+
+**Execution safety — reviewed code is untrusted.** Running a reviewed change is code execution, so
+`pr-review` never executes it by default. A **GitHub PR** target and a **diff file** target are
+static/CI-only and **never execute locally**. A **local checkout/range** is static by default; after
+PLAN consensus the Execution Safety Gate shows the **exact commands** and warns they run **arbitrary
+code** with your file, credential, environment, and network access, then runs them only if you
+explicitly approve that exact set. Declining continues the review static-only (runtime results
+`unverified`); a **new or changed command** needs **fresh consent**; execution consent and posting
+consent are separate.

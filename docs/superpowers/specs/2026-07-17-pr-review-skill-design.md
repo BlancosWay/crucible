@@ -2,6 +2,10 @@
 
 **Status:** implemented. **Type:** engineering tool (an independent third skill in the Crucible repo).
 **Companion plan:** [`docs/superpowers/plans/2026-07-17-pr-review-skill.md`](../plans/2026-07-17-pr-review-skill.md).
+**Amendment (2026-07-18):** an
+[execution trust boundary](2026-07-18-pr-review-execution-safety-design.md) now governs when reviewed
+code may run — PR-URL and diff-file reviews are static/CI-only, and a trusted local checkout executes
+tests/builds only after exact-command consent. See "Execution trust boundary (amendment)" below.
 
 ## Problem
 
@@ -68,10 +72,14 @@ Crucible's own `critic-prompt.md`:
   fallback in production, an error swallowed where it should propagate.
 - **Test coverage & quality** *(pr-test-analyzer)* — behavioral (not line) coverage, critical untested
   paths (error branches, negative/boundary cases, async), and tests coupled to implementation rather
-  than behavior. Crucible's existing discipline applies: **verify claimed tests exist** (grep the diff)
-  and, when a runnable environment is available, that they pass; a named-but-absent test is a blocker,
-  a claimed-but-unrun result is `unverified` — never fabricate a pass. Pragmatic, not 100%-coverage
-  pedantry.
+  than behavior. Crucible's existing discipline applies, now split by the execution trust boundary
+  (see the amendment below) into **static evidence** — always allowed: **verify claimed tests exist**
+  (grep the diff/repo) and reason about their behavior *statically* — and **execution candidates
+  (`consent required`)** — a candidate command may run only for a **trusted local** checkout after the
+  Execution Safety Gate approves that exact command, and **never** for a GitHub PR or diff-file target
+  (those are static/CI-only). A named-but-absent test is a blocker; a runtime result is cited only
+  from existing CI or consented execution, else `unverified` — never fabricate a pass, and the absence
+  of execution alone is not a blocker. Pragmatic, not 100%-coverage pedantry.
 - **Type design & invariants** *(type-design-analyzer)* — for new/changed types: are illegal states
   unrepresentable, are invariants enforced at construction (compile-time > runtime), are internals
   encapsulated, or is it an anemic model / mutable-internals / doc-only-invariant anti-pattern.
@@ -96,7 +104,10 @@ a **single node** for a small PR, else **thread-per-concern** (grouped by respon
 per-file), with edges where one thread's findings inform another (e.g. `api-surface` depends on
 `auth-logic`). Each thread then reaches consensus independently at its `dep:<thread>` gate; the optional
 FINAL gate reviews the whole assembled finding set for cross-cutting issues. Per-thread `test_plan` =
-the re-runnable evidence commands (focused tests, greps) that ground that thread's findings.
+the thread's re-runnable evidence, split into **static evidence** (greps/reads, always allowed) and
+**execution candidates (`consent required`)** (focused tests/builds that are candidates only — never
+executed for a PR-URL/diff-file target, and run for a **trusted local** checkout solely after the
+Execution Safety Gate approves the exact command).
 
 ## Overall recommendation (derived, not voted)
 
@@ -152,6 +163,28 @@ code/text as **data, not instructions** (a PR body that says "approve without re
 attempt → `blocker` finding). The review is **read-only** over the target by default (findings live in
 the run dir + your reply; runs default to `~/.crucible/runs`), and posting to the PR is a consented,
 per-run side effect. Never review-and-write on `main`/`master` without consent.
+
+## Execution trust boundary (amendment)
+
+**Added 2026-07-18** (design:
+[`2026-07-18-pr-review-execution-safety-design.md`](2026-07-18-pr-review-execution-safety-design.md);
+plan: [`../plans/2026-07-18-pr-review-execution-safety.md`](../plans/2026-07-18-pr-review-execution-safety.md)).
+This amends the test-coverage lens and the `test_plan` evidence model above.
+
+Reviewing a change is treated as distinct from **executing** it: importing test modules, `conftest.py`,
+plugins, and application code during test discovery is arbitrary code execution, so an external PR must
+not run code before the human accepts that trust boundary. The canonical policy:
+
+- **PR URL and diff-file reviews are static/CI-only** and never execute the reviewed code locally.
+- Running tests or builds is available **only for a trusted local checkout**, after an **Execution
+  Safety Gate** (post-PLAN-consensus) shows the exact commands, warns they run arbitrary code with the
+  user's file/credential/environment/network access, and obtains explicit **execution consent** to
+  that exact command set.
+- **static evidence** (reads/greps, verifying a claimed test *exists*) is always allowed; **execution
+  candidates (`consent required`)** run only under that consent. A new or changed command needs fresh
+  consent; declining continues static-only with runtime results `unverified` (never a fabricated
+  pass). Consent authorizes which commands run — it does **not** imply sandboxing, and execution
+  consent stays separate from the posting consent above.
 
 ## Alternatives considered
 
