@@ -56,6 +56,34 @@ run Peer B as a clearly delimited "Acting as the other peer now" pass using `pee
 producing an independent review that is unioned with Peer A's. If the runtime rejects the configured
 model id, fall back to the most capable available model and note it in the run-log.
 
+## Execution Safety Gate (consent to run reviewed code)
+
+Reviewed code is untrusted executable input, so `pr-review` **never executes it by default**. After
+PLAN consensus, realize the gate through the platform's **structured human-input mechanism** (the same
+consent channel used for posting), not an inferred yes:
+
+- **Unknown/ambiguous target** → static-only; **never execute locally**.
+- **GitHub PR** → static review + read-only `gh pr checks` / existing CI only; **never execute
+  locally**.
+- **Diff file** → static-only; **never execute locally**.
+- **Trusted local checkout/range** → show the **exact commands**, warn they run arbitrary code with
+  the user's file/credential/environment/network access, and ask to approve that set, continue
+  without execution, or cancel the review. Only an explicit affirmation and an exact-command match set
+  `LOCAL_EXECUTION_APPROVED: yes`; seed **both peers** with that identical value and command list.
+
+Error handling:
+
+- **Local decline** → continue static-only with runtime results `unverified`.
+- **Cancel review** → halt the whole review.
+- **CI unavailable/inaccessible** → mark runtime status `unverified`; never a fabricated pass.
+- **Command mismatch or a new/changed command** → refuse and obtain **fresh consent** before it runs;
+  approval of one command implies no fallback, retry, or setup variant.
+- **Approved command fails** → record the observed failure as evidence; do **not** run an unapproved
+  fallback.
+
+Execution consent and **posting consent** are separate: approving execution never approves posting,
+and approving posting never approves execution.
+
 ## Optional posting to the PR (consented side effect)
 
 By default the review is **read-only** over the target: findings + the derived recommendation live in

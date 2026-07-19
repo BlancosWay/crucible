@@ -122,6 +122,29 @@ def test_skill_derives_recommendation_and_gates_posting_on_consent():
     assert "never post automatically" in norm
 
 
+def test_skill_has_a_distinct_execution_safety_gate():
+    low = _norm(SKILL)
+    assert "execution safety gate" in low
+    assert "after plan consensus" in low
+    assert "exact commands" in low
+    assert "arbitrary code" in low
+    assert "fresh consent" in low
+
+
+def test_skill_remote_and_diff_inputs_never_execute_locally():
+    low = _norm(SKILL)
+    assert "github pr" in low and "never execute locally" in low
+    assert "diff file" in low and "never execute locally" in low
+    assert "existing ci" in low
+
+
+def test_skill_declined_execution_continues_static_only():
+    low = _norm(SKILL)
+    assert "continue without execution" in low
+    assert "static" in low and "unverified" in low
+    assert "posting consent" in low
+
+
 def test_command_file_exists_with_frontmatter_and_no_dangling_ref_tokens():
     text = CMD.read_text()
     assert text.startswith("---")

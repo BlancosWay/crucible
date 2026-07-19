@@ -76,7 +76,8 @@ ever signs off on only its own work:
 Rounds are 1-based per gate. As **Peer A**, draft the review plan (which concerns to review, which
 files/surrounding code to interrogate, what "reviewed" looks like) and emit the **review graph** JSON
 (see `references/review-thread.md`): nodes = review threads, edges = "this thread's review needs an
-earlier thread's conclusions first", each node's `test_plan` = the re-runnable evidence commands.
+earlier thread's conclusions first", each node's `test_plan` = the thread's re-runnable evidence
+(static evidence + consent-gated execution candidates).
 Size it adaptively — a single node for a small PR, thread-per-concern for a large one.
 
 1. Load the graph: `PYTHONPATH=scripts python3 -m crucible load-dag --run "$RUN" --file "$RUN"/dag.json` (rejects cycles/unknown ids).
@@ -96,6 +97,31 @@ collapsed/truncated and **not visible** to the human, so run
 or otherwise truncate it to a fragment (the collapsed bash output is not what the human sees; your
 reply is).
 
+## Execution Safety Gate
+
+This gate runs **after PLAN consensus** and before any THREAD execution — the approved review DAG now
+exposes the complete initial set of executable `test_plan` candidates. Reviewed code is untrusted
+executable input, so `pr-review` **never executes it by default**.
+
+Classify the target:
+
+- **GitHub PR number/URL** → static review + **existing CI** evidence (read-only `gh pr checks` / the
+  PR's already-produced checks); **never execute locally**.
+- **Diff file** → static evidence only; **never execute locally**.
+- **Local checkout/range** → static by default; execution requires explicit **trusted-local** consent.
+
+For a local checkout, collect every execution candidate from the approved DAG. Show the **exact
+commands** and warn that they execute **arbitrary code** with the current user's file, credential,
+environment, and network access. Ask the human to approve that exact command set, continue without
+execution, or cancel the review.
+
+No affirmative answer means `LOCAL_EXECUTION_APPROVED: no`. Approval means `LOCAL_EXECUTION_APPROVED:
+yes` plus the exact command list. A new or changed command requires **fresh consent**. Without
+approved execution or available CI evidence, runtime results remain **unverified** — never a
+fabricated pass. Seed **both peers** with the **same** `LOCAL_EXECUTION_APPROVED` value and, when
+approved, the identical exact command list — never give one peer execution authority the other lacks.
+Execution consent is separate from **posting consent**.
+
 ## Stage 2 — THREAD gates (one review thread at a time)
 
 Loop while `crucible next` yields a ready thread (`next` exits non-zero when the run is stuck or work
@@ -112,8 +138,10 @@ For each `$NODE`:
 
 1. `PYTHONPATH=scripts python3 -m crucible set-status --run "$RUN" --node "$NODE" --status in_progress`.
 2. **Both peers review the thread's slice independently** against the actual code — read the changed
-   files and their callers/callees, run the `test_plan` evidence commands, apply the lenses. When in
-   doubt, go to the source.
+   files and their callers/callees, gather the thread's **static evidence**, run **only** the
+   execution candidates the Execution Safety Gate approved for this run (none unless
+   `LOCAL_EXECUTION_APPROVED: yes` names the exact command), apply the lenses. When in doubt, go to
+   the source.
 3. One peer serializes the deduped union of both peers' findings for this thread; log it:
    `... log --event builder_output --gate dep:$NODE --round N --file "$RUN"/out.txt`.
 4. **Both peers review the merged set every round**; serialize the union into `"$RUN"/verdict.json`
