@@ -22,14 +22,14 @@ UNSAFE_EXACT_PHRASES = (
 # The guard flags any execution directive that is not accompanied, within
 # GUARD_WINDOW characters, by canonical safety context. It must recognize the whole
 # runtime execution-policy surface — generic test/build runs, ecosystem package-manager
-# scripts (npm/yarn/pnpm test|install|ci|build|start|run), go/cargo/make lifecycle,
-# Maven/Gradle goals including the `./gradlew` / `./mvnw` wrappers and lifecycle phases
-# (test/build/package/verify/install), dependency installs (pip/poetry/pipenv), an
-# interpreter run over a repository script (python/node/ruby/shell + a script file),
-# interpreting or importing target modules, plugin hooks, generated binaries, and
-# fallback/retry execution — not merely a bare `pytest`, so a future doc cannot slip an
-# unconsented "run the tests" / "npm test" / "yarn build" / "./gradlew test" /
-# "mvn package" / "poetry install" / "python scripts/check.py" past it.
+# scripts (npm/yarn/pnpm test|install|ci|build|start|run plus the yarn/pnpm direct script
+# shorthand lint|format|typecheck), go/cargo/make lifecycle, Maven/Gradle goals including the
+# `./gradlew` / `./mvnw` wrappers and lifecycle tasks/phases (check/clean/test/build/package/
+# verify/install), dependency installs (pip/poetry/pipenv), an interpreter run over a repository
+# script (python/node/ruby/shell + a script file), interpreting or importing target modules,
+# plugin hooks, generated binaries, and fallback/retry execution — not merely a bare `pytest`,
+# so a future doc cannot slip an unconsented "run the tests" / "npm test" / "yarn lint" /
+# "./gradlew check" / "mvn package" / "poetry install" / "python scripts/check.py" past it.
 _EXEC_VERB = (
     r"run|runs|running|rerun|reruns|re-run|re-runs|execute|executes|executing|exec|"
     r"invoke|invokes|invoking|install|installs|installing|import|imports|importing|"
@@ -44,15 +44,23 @@ _EXEC_TARGET = (
 )
 # Ecosystem / interpreter invocations that ARE execution regardless of a leading verb.
 # A `./gradlew`/`./mvnw` wrapper matches from the tool name (the leading `./` cannot anchor
-# a word boundary but the `/`->`g` transition does); a bare interpreter (python/node/ruby/
-# bash/sh) counts only when it runs an actual script file, so DAG "node"/"```bash" prose is
-# not swept in.
+# a word boundary but the `/`->`g` transition does); the yarn/pnpm direct script shorthand
+# (`yarn lint`) and the Gradle `check` task count too. Each alternative requires a real
+# task/goal/script token right after the tool, and any tokens between a gradle/mvn tool and
+# its goal must themselves be gradle-ish (a `-flag`, a `key=val` / `:module:task` token, or
+# another lifecycle goal) — so a composite like `gradle clean check` matches while a tool name
+# in narrative ("we use gradle to check the code", "yarn is …", "go check the source") does
+# not bridge across English filler to a goal. Likewise a bare interpreter
+# (python/node/ruby/bash/sh) counts only when it runs an actual script file, so DAG
+# "node"/"```bash" prose is not swept in.
 _EXEC_COMMAND = (
     r"python[0-9.]*\s+-m\s+(?:pytest|unittest|nox|tox)|"
-    r"(?:npm|yarn|pnpm)\s+(?:run\s+\S+|test|install|ci|build|start)|"
+    r"(?:npm|yarn|pnpm)\s+(?:run\s+\S+|test|install|ci|build|start|lint|format|typecheck)|"
     r"(?:go|cargo|make)\s+(?:test|build|install|run)|"
-    r"(?:gradlew|mvnw|gradle|mvn)\s+(?:[\w:.@=/-]+\s+)*?"
-    r"(?:compile|assemble|test|build|package|verify|install|run|exec)|"
+    r"(?:gradlew|mvnw|gradle|mvn)\s+"
+    r"(?:(?:-\S+|\S*[:=]\S*|check|clean|compile|assemble|test|build|package|verify|"
+    r"install|run|exec)\s+)*?"
+    r"(?:check|clean|compile|assemble|test|build|package|verify|install|run|exec)|"
     r"(?:pip[0-9]?|poetry|pipenv)\s+install|"
     r"(?:python[0-9.]*|node|ruby|bash|sh)\s+[\w./-]*\.(?:py|js|mjs|cjs|ts|rb|sh)|"
     r"pytest|tox|nox"
@@ -147,6 +155,15 @@ MUST_DETECT_UNSAFE = (
     "node scripts/foo.js",
     "ruby scripts/release.rb",
     "bash scripts/run.sh",
+    # Round-2 regression: the Gradle `check` lifecycle task (bare, the `./gradlew` wrapper, and
+    # a composite goal chain) and Yarn/pnpm direct script shorthand (`yarn lint`) — unconsented
+    # execution forms in command families the guard already claims to cover.
+    "gradle check",
+    "./gradlew check",
+    "gradle clean check",
+    "yarn lint",
+    "pnpm lint",
+    "yarn typecheck",
 )
 
 # Safe policy prose: each carries an execution directive AND canonical safety context
@@ -173,6 +190,28 @@ MUST_ACCEPT_GUARDED = (
     "required): python scripts/check.py — a candidate only, never for a github pr target",
     "a github pr target and a diff-file target never execute locally, so do not run pnpm "
     "build or install the dependency",
+    # Round-2 guarded: the Gradle `check` task and Yarn direct script shorthand stay accepted
+    # when real prohibition / consent context sits within GUARD_WINDOW.
+    "reviewed code is untrusted: you must not execute ./gradlew check or gradle check "
+    "without approval",
+    "for a trusted local checkout, run yarn lint only after consent required at the "
+    "execution safety gate",
+)
+
+# Benign prose that names build tooling without issuing an execution directive: a different
+# tool family (`go check ...` is not a go/cargo/make goal) or a bare tool name in narrative.
+# Broadening the Gradle/Yarn coverage must not start flagging these.
+MUST_NOT_DETECT_BENIGN = (
+    "go check the source before reviewing",
+    "yarn is a fast package manager",
+    "the gradle wrapper lives at the repo root",
+    "gradlew and mvnw are wrapper scripts",
+    # A gradle/mvn tool name in narrative must not bridge across English filler words to a
+    # distant lifecycle goal (`build`/`check`); only real task/flag tokens may sit between the
+    # tool and its goal.
+    "we use gradle to check the code",
+    "gradle can help you check things",
+    "we use gradle as our build tool",
 )
 
 
@@ -226,6 +265,12 @@ def test_scanner_accepts_guarded_execution_prose():
     wrongly_flagged = [prose for prose in MUST_ACCEPT_GUARDED
                        if _unguarded_execution_directives(prose)]
     assert not wrongly_flagged, f"scanner wrongly flagged guarded prose: {wrongly_flagged}"
+
+
+def test_scanner_ignores_benign_build_tool_prose():
+    wrongly_flagged = [prose for prose in MUST_NOT_DETECT_BENIGN
+                       if _unguarded_execution_directives(prose)]
+    assert not wrongly_flagged, f"scanner flagged benign prose: {wrongly_flagged}"
 
 
 # --- Public-policy drift guard ---------------------------------------------------
