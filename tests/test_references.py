@@ -1,6 +1,45 @@
+import re
 from pathlib import Path
 
 REF = Path(__file__).resolve().parents[1] / "skills" / "crucible" / "references"
+
+
+def _section(text: str, heading_substr: str) -> str:
+    """Body of the markdown section whose heading contains `heading_substr`, from that heading to the
+    next heading of the same-or-higher level (headings inside ``` fences ignored) — so a binding guard
+    is scoped to the handshake section and can't be satisfied by unrelated prose elsewhere."""
+    lines = text.splitlines()
+    in_fence = False
+    start = None
+    start_level = 0
+    for i, ln in enumerate(lines):
+        if ln.lstrip().startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        m = re.match(r"^(#{1,6})\s+\S", ln)
+        if not m:
+            continue
+        level = len(m.group(1))
+        if start is None:
+            if heading_substr in ln:
+                start, start_level = i, level
+            continue
+        if level <= start_level:
+            return "\n".join(lines[start:i])
+    assert start is not None, f"section {heading_substr!r} not found"
+    return "\n".join(lines[start:])
+
+
+def _flat(s: str) -> str:
+    """Lowercased, whitespace-collapsed, emphasis/code/comment markers (*, `, #) removed."""
+    return " ".join(s.lower().replace("*", "").replace("`", "").replace("#", " ").split())
+
+
+def _no_negated_echo(sec: str) -> None:
+    assert not re.search(r"\b(?:do not|don't|never|not)\s+echo\b", sec), \
+        "the binding echo must be required, not negated"
 
 
 def test_reference_files_exist():
@@ -59,37 +98,50 @@ def test_consensus_rubric_lists_stop_criteria():
 
 
 def test_critic_prompt_verdict_echoes_cli_bindings():
-    # Schema-2: the verdict JSON must ECHO the deterministic content bindings the CLI selected
-    # (`crucible bindings`) for the reviewed artifact/DAG/node, so `crucible verdict` can prove the
-    # decision refers to the exact reviewed content. The schema example and prose must carry the
-    # binding fields.
+    # Schema-2: the verdict must ECHO the deterministic content bindings the CLI selected. Scope to the
+    # critic prompt's "Binding echo" handshake section AND the "Output" JSON field rules, and assert the
+    # exact per-gate field shape — so a prompt that dropped the echo, negated it, or listed the wrong
+    # fields (a node hash at `reproduce`, or omitting `node_sha256` at a `dep:` gate) fails.
     text = (REF / "critic-prompt.md").read_text()
-    low = text.lower()
-    assert "artifact_sha256" in low
-    assert "dag_sha256" in low
-    assert "node_sha256" in low
-    assert "bindings" in low
-    assert "echo" in low
+    echo = _flat(_section(text, "Binding echo"))
+    assert "bindings block" in echo
+    assert "trusted cli metadata" in echo
+    assert "echo it verbatim" in echo
+    assert "rejects a missing or mismatched binding" in echo
+    assert "artifact_sha256" in echo and "dag_sha256" in echo
+    _no_negated_echo(echo)
+    # The verdict JSON schema must annotate the per-gate field set, not a fixed one.
+    out = _flat(_section(text, "Output"))
+    assert "artifact_sha256" in out and "dag_sha256" in out and "node_sha256" in out
+    assert "omit for the reproduce gate" in out
+    assert "reproduce gate carries only artifact_sha256" in out
+    assert "adds node_sha256" in out          # a dep:<node> gate adds the node hash
 
 
 def test_platform_notes_bindings_are_trusted_cli_metadata():
-    # The bindings appended to the Critic seed are TRUSTED CLI METADATA — the exact `crucible
-    # bindings` JSON — and are explicitly NOT content copied from the reviewed (untrusted) artifact.
-    text = (REF / "platform-notes.md").read_text()
-    low = " ".join(text.lower().split())
-    assert "crucible bindings" in low
-    assert "trusted cli metadata" in low
-    assert "not content copied from the reviewed" in low
+    # Scope to platform-notes' "Binding handshake" section: the seed bindings are the exact `crucible
+    # bindings` JSON as TRUSTED CLI METADATA — explicitly NOT content copied from the reviewed
+    # (untrusted) artifact — the verdict must echo them, and a mismatch is rejected before any decision.
+    bh = _flat(_section((REF / "platform-notes.md").read_text(), "Binding handshake"))
+    assert "crucible bindings" in bh
+    assert "trusted cli metadata" in bh
+    assert "not content copied from the reviewed" in bh
+    assert "the verdict must echo it" in bh
+    assert "rejects a missing or mismatched value" in bh
+    _no_negated_echo(bh)
 
 
 def test_consensus_rubric_records_binding_handshake():
-    # The stop-criteria doc must record that a settled decision is bound to the reviewed artifact:
-    # the verdict echoes the CLI bindings and a missing/mismatched binding is rejected before any
-    # decision is recorded.
-    low = " ".join((REF / "consensus-rubric.md").read_text().lower().split())
-    assert "bindings" in low
-    assert "artifact_sha256" in low
-    assert "echo" in low
+    # Scope to the stop-criteria doc's "decision is bound" section: a settled decision echoes the CLI
+    # bindings for the exact reviewed artifact/DAG/node, a missing/mismatched binding is rejected before
+    # any outcome, and the accepted artifact is immutable (a change requires a fresh run).
+    db = _flat(_section((REF / "consensus-rubric.md").read_text(), "decision is bound"))
+    assert "crucible bindings" in db
+    assert "artifact_sha256" in db
+    assert "echo" in db
+    assert "rejects a missing or mismatched binding" in db
+    assert "fresh run" in db
+    _no_negated_echo(db)
 
 
 def test_dependency_tree_doc_has_schema_keys():

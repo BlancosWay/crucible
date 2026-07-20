@@ -4,6 +4,45 @@ from pathlib import Path
 SKILL = Path(__file__).resolve().parents[1] / "skills" / "crucible" / "SKILL.md"
 
 
+def _section(text: str, heading_substr: str) -> str:
+    """Body of the markdown section whose heading contains `heading_substr`, from that heading to the
+    next heading of the same-or-higher level. Headings inside ``` fences are ignored so a per-gate
+    guard is scoped to exactly that gate — not satisfied by another gate's text elsewhere."""
+    lines = text.splitlines()
+    in_fence = False
+    start = None
+    start_level = 0
+    for i, ln in enumerate(lines):
+        if ln.lstrip().startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        m = re.match(r"^(#{1,6})\s+\S", ln)
+        if not m:
+            continue
+        level = len(m.group(1))
+        if start is None:
+            if heading_substr in ln:
+                start, start_level = i, level
+            continue
+        if level <= start_level:
+            return "\n".join(lines[start:i])
+    assert start is not None, f"section {heading_substr!r} not found"
+    return "\n".join(lines[start:])
+
+
+def _flat(s: str) -> str:
+    """Lowercased, whitespace-collapsed, with emphasis/code/comment markers (*, `, #) removed, so a
+    canonical phrase survives bold/`code` spans, line wraps, and bash-comment (`#`) prefixes."""
+    return " ".join(s.lower().replace("*", "").replace("`", "").replace("#", " ").split())
+
+
+def _no_negated_echo(sec: str) -> None:
+    assert not re.search(r"\b(?:do not|don't|never|not)\s+echo\b", sec), \
+        "a gate must require (not negate) the binding echo"
+
+
 def test_skill_exists_with_frontmatter():
     text = SKILL.read_text()
     assert text.startswith("---")
@@ -38,28 +77,63 @@ def test_skill_uses_cli_for_decisions():
 
 
 def test_skill_binds_every_gate_to_reviewed_artifact():
-    # Schema-2 binding handshake: at every gate the skill logs the Builder artifact, asks the CLI for
-    # the deterministic bindings, seeds the Critic with that JSON as TRUSTED CLI METADATA, and the
-    # Critic verdict must ECHO the bound artifact/DAG hashes back before `crucible verdict` records a
-    # decision. Assert the command, the trust framing, and the echoed fields.
+    # Schema-2 binding handshake, asserted PER GATE (section-scoped, not whole-document substrings):
+    # each gate must log the Builder artifact, ask `crucible bindings --gate <that gate>`, seed the
+    # Critic with the JSON as TRUSTED CLI METADATA, and require the verdict to ECHO exactly that gate's
+    # hash fields — artifact-only at REPRODUCE, artifact+DAG at PLAN/FINAL, all three at dep:<node>. A
+    # gate that dropped `bindings`, echoed the wrong field set (e.g. a stray node hash at PLAN/FINAL, a
+    # DAG hash at REPRODUCE), or negated the echo must FAIL here.
     text = SKILL.read_text()
-    low = text.lower()
-    assert "crucible bindings --run" in text
-    assert "--gate" in text and "--round" in text
-    assert "trusted cli metadata" in low
-    assert "echo" in low
-    assert "artifact_sha256" in low
-    assert "dag_sha256" in low          # PLAN carries the DAG binding
+
+    # REPRODUCE — log --file, bindings --gate reproduce, trusted metadata, echo ARTIFACT ONLY, verdict --file
+    repro = _flat(_section(text, "REPRODUCE gate"))
+    assert re.search(r"log --event builder_output --gate reproduce[^)]*--file", repro), \
+        "REPRODUCE must log the Builder artifact with --file"
+    assert 'bindings --run "$run" --gate reproduce' in repro
+    assert "trusted cli metadata" in repro
+    assert "verdict to echo artifact_sha256" in repro
+    assert "dag_sha256" not in repro and "node_sha256" not in repro, "REPRODUCE binds the artifact only"
+    assert 'verdict --run "$run" --gate reproduce --round n --file' in repro
+    _no_negated_echo(repro)
+
+    # PLAN — bindings --gate plan, trusted metadata, echo ARTIFACT + DAG (never a node hash), verdict --file
+    plan = _flat(_section(text, "PLAN gate"))
+    assert 'bindings --run "$run" --gate plan' in plan
+    assert "trusted cli metadata" in plan
+    assert re.search(r"echo (?:\w+ )?artifact_sha256 \+ dag_sha256", plan)
+    assert "node_sha256" not in plan, "PLAN carries no node hash"
+    assert 'verdict --run "$run" --gate plan --round n --file' in plan
+    _no_negated_echo(plan)
+
+    # dep:<node> — bindings --gate dep:$NODE, trusted metadata, echo ALL THREE hashes, verdict --file
+    dep = _flat(_section(text, "IMPLEMENT gates"))
+    assert 'bindings --run "$run" --gate "dep:$node"' in dep
+    assert "trusted cli metadata" in dep
+    assert "artifact_sha256 + dag_sha256 + node_sha256" in dep, "dep gate echoes all three hashes"
+    assert 'verdict --run "$run" --gate "dep:$node" --round n --file' in dep
+    _no_negated_echo(dep)
+
+    # FINAL — bindings --gate final, trusted metadata, echo ARTIFACT + DAG (never a node hash)
+    final = _flat(_section(text, "FINAL gate"))
+    assert 'bindings --run "$run" --gate final' in final
+    assert "trusted cli metadata" in final
+    assert re.search(r"echo (?:\w+ )?artifact_sha256 \+ dag_sha256", final)
+    assert "node_sha256" not in final, "FINAL carries no node hash"
+    _no_negated_echo(final)
 
 
 def test_skill_records_human_approval_with_approve_plan():
-    # The optional human-approval path records the human's OK deterministically via `approve-plan`
-    # (only AFTER the human explicitly approves), and a changed accepted plan/DAG requires a fresh run
-    # (the accepted plan/DAG is immutable within a run).
-    text = SKILL.read_text()
-    low = text.lower()
-    assert "crucible approve-plan --run" in text
-    assert "fresh run" in low
+    # Scope to the Approval gate: `approve-plan` is recorded ONLY AFTER an explicit human OK (ordered
+    # phrase, so misleading prose that records approval first cannot pass), a changed accepted plan/DAG
+    # requires a fresh run (the accepted plan/DAG is immutable within a run), and with approval disabled
+    # the skill must NOT call `approve-plan`.
+    appr = _flat(_section(SKILL.read_text(), "Approval gate"))
+    assert re.search(r"human explicitly approves.{0,90}approve-plan --run", appr), \
+        "approve-plan must be recorded only AFTER the human explicitly approves"
+    assert "fresh run" in appr
+    assert "immutable within a run" in appr
+    assert "do not call" in appr and "approve-plan" in appr, \
+        "disabled approval must NOT call approve-plan"
 
 
 def test_skill_does_not_hardcode_round_cap_override():

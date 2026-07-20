@@ -97,8 +97,10 @@ reproduces the reported bug; log it (`... log --event builder_output --gate repr
 "$RUN"/repro.txt`). Run the **binding handshake** (artifact-only for REPRODUCE):
 `BINDINGS=$(PYTHONPATH=scripts python3 -m crucible bindings --run "$RUN" --gate reproduce --round N)`,
 seed the Critic with `$BINDINGS` as trusted CLI metadata, and require the verdict to echo
-`artifact_sha256`. Dispatch the **Critic** to
-confirm the test fails **for the stated reason** (verdict `--gate reproduce`). `CONSENSUS` -> bug
+`artifact_sha256` (REPRODUCE binds the artifact only — no `dag`/`node` hash). Dispatch the **Critic**
+to confirm the test fails **for the stated reason**, then decide with
+`PYTHONPATH=scripts python3 -m crucible verdict --run "$RUN" --gate reproduce --round N --file "$RUN"/verdict.json`.
+`CONSENSUS` -> bug
 validated; carry that test into Stage 2 as the fix's done-signal, then go to PLAN. If the Builder
 cannot produce a failing repro, or the Critic rejects it -> **halt** and surface (the bug is
 unconfirmed; same posture as `on_cap: halt`) — do not plan. The reproduce gate **always halts** on

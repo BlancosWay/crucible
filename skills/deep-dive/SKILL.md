@@ -161,7 +161,11 @@ esac
 ```
 
 If enabled, **both peers review the whole assembled findings report** once (`--gate final`, round cap
-`max_rounds_dep`) for completeness, accuracy, and whether it truly answers the question — loop like a
+`max_rounds_dep`) for completeness, accuracy, and whether it truly answers the question. Run the
+**binding handshake** first (artifact + DAG, like PLAN — no node hash at FINAL): log the merged
+report, then `BINDINGS=$(PYTHONPATH=scripts python3 -m crucible bindings --run "$RUN" --gate final --round N)`,
+seed **Peer B** with `$BINDINGS` as **trusted CLI metadata**, and the single serialized **union**
+verdict must **echo** `artifact_sha256` + `dag_sha256`. Then loop like a
 thread gate: `CONSENSUS` -> finish; `CHANGES` -> return to source and revise; `CAPPED` (`on_cap:
 halt`) -> surface and stop; `PROCEED_WITH_FLAGS` (`on_cap: proceed_with_flags`) -> finish with the
 unresolved dispute carried as a flag in the report.
