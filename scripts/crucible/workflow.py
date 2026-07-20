@@ -30,6 +30,7 @@ from crucible.symmetric import (
     FindingSet,
     accepted_finding_set_for_gate,
     accepted_findings,
+    gate_post_terminal_protocol_indices,
     out_of_scope_protocol_gates,
     resolve_gate_acceptance,
     validate_final_finding_set,
@@ -422,19 +423,34 @@ def _symmetric_accepted_set_issues(
                     "invalid",
                     f"symmetric gate {gate!r} accepted finding set payload is not a valid finding "
                     f"set (malformed)"))
-    # Out-of-scope DEPENDENCY protocol gates: a fully bound-looking dep:<id> whose node is absent from
-    # the current tree is a ghost gate that must never be silently accepted (round-3 F2) — whether it
-    # persists an accepted set OR only CAPS/proceeds with objections (round-4). The protocol-wide scope
-    # guard spans every symmetric_verdict/accepted/terminal, so a capped ghost gate (no accepted set)
-    # is caught too. A forged FINAL gate while final_review is off is reported as a configured-forbidden
-    # phase by the FINAL terminal check in workflow_issues, so it is skipped here to avoid a duplicate.
+    # Post-terminal protocol residue: a same-gate symmetric protocol event (a verdict that could
+    # rewrite the gate's unresolved objections, an accepted set, or a second terminal) recorded AFTER
+    # the authoritative terminal is forged/crash residue, never part of the concluded decision
+    # (round-5 F1). Checked over every legitimate symmetric gate — including PLAN, which carries a
+    # terminal but no finding set — so a post-terminal verdict is flagged even where the resolver's
+    # post-terminal-accepted-set rule does not reach.
+    for gate in ["plan", *finding_gates]:
+        if gate_post_terminal_protocol_indices(events, gate):
+            issues.append(WorkflowIssue(
+                "invalid",
+                f"symmetric gate {gate!r} records a symmetric protocol event after its authoritative "
+                f"terminal (post-terminal residue that must never rewrite the concluded decision)"))
+    # Out-of-scope protocol gates: any gate carrying a symmetric protocol event that is not the PLAN
+    # gate, a current dependency, or the enabled FINAL gate is out of scope (round-3 F2 ghost dep,
+    # round-4 capped ghost, round-5 arbitrary/off-convention name such as ``sidequest`` or a
+    # ``reproduce`` gate symmetric protocols never use). The protocol-wide scope guard spans every
+    # symmetric_verdict/accepted/terminal, so a gate that only CAPS/proceeds with objections (no
+    # accepted set) is caught too. A forged FINAL gate while final_review is off is reported as a
+    # configured-forbidden phase by the FINAL terminal check in workflow_issues, so it is skipped here
+    # to avoid a duplicate.
     for gate in out_of_scope_protocol_gates(events, dag, final_enabled=cfg.final_review):
         if gate == "final":
             continue
         issues.append(WorkflowIssue(
             "invalid",
-            f"symmetric gate {gate!r} records review protocol events for a dependency absent from "
-            f"the current tree (out-of-scope/ghost gate)"))
+            f"symmetric gate {gate!r} records review protocol events outside the configured "
+            f"symmetric workflow (not the plan gate, a current dependency, or the enabled FINAL "
+            f"gate) — out-of-scope/ghost gate"))
     if cfg.final_review:
         issues.extend(_final_inclusion_issues(events, dag))
     return issues
@@ -520,7 +536,8 @@ def _final_issues(events: list[dict[str, Any]], dag: DAG) -> list[WorkflowIssue]
     final_terminal, final_idx = _accepted_terminal_with_index(events, "final")
     if final_terminal is None:
         if dag.is_complete():
-            return [WorkflowIssue("missing", "configured FINAL gate never reached consensus")]
+            return [WorkflowIssue("missing", "configured FINAL gate never reached consensus",
+                                  phase="final")]
         return []
     issues = _artifact_binding_issues(events, "final", final_terminal, final_idx, "FINAL")
     if final_terminal.get("dag_sha256") != dag_sha256(dag):
@@ -582,11 +599,15 @@ class WorkflowIssue:
     ``kind`` is exactly one of ``"missing"`` / ``"invalid"`` / ``"flagged"`` and orders the report
     status (``invalid`` > ``flagged`` > ``missing``, i.e. INVALID > FLAGGED > IN PROGRESS); the CLEAN
     status requires *no* issues at all. ``message`` names the phase/node and is rendered (sanitized)
-    in the report Summary.
+    in the report Summary. ``phase`` is an optional stable marker (e.g. ``"final"``) that lets a
+    Finish-time caller tolerate a specific configured-but-not-yet-reached prerequisite without
+    brittle message matching — ``accepted-findings`` deliberately tolerates only ``missing`` + a
+    ``"final"`` phase because it is used to assemble FINAL.
     """
 
     kind: str  # "missing" | "invalid" | "flagged"
     message: str
+    phase: str = ""
 
 
 def _node_completion_issues(

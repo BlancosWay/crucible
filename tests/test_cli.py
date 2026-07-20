@@ -2686,6 +2686,91 @@ def test_review_result_deep_dive_omits_recommendation(tmp_path):
     assert data["findings"][0]["id"] == "F1"
 
 
+# --- round-5 corrupt-history result integrity (F1 / F2 / F3) -------------------
+
+def _dep_gate_bindings(run_dir, gate="dep:auth"):
+    """The artifact/DAG/node bindings recorded on ``gate``'s symmetric_verdict in a settled run."""
+    sv = next(e for e in _events(run_dir)
+              if e.get("event") == "symmetric_verdict" and e.get("gate") == gate)
+    return {k: sv[k] for k in ("artifact_sha256", "dag_sha256", "node_sha256") if k in sv}
+
+
+def test_result_commands_reject_post_terminal_symmetric_verdict(tmp_path):
+    # F1: a valid complete run, then a forged post-terminal symmetric_verdict for the dep gate/round.
+    # A same-gate protocol event after the authoritative terminal is invalid history that could
+    # rewrite the gate's unresolved objections; both result commands must fail closed.
+    run_dir = _complete_one_node_symmetric(tmp_path, "auth",
+                                           findings=[_accepted_finding("dep:auth", "F1", "major")])
+    bind = _dep_gate_bindings(run_dir)
+    _append_raw_event(run_dir, {
+        "event": "symmetric_verdict", "gate": "dep:auth", "round": 1, "outcome": "CONSENSUS",
+        "objections": [], "candidate": {"summary": "", "findings": []}, **bind})
+    for command in ("accepted-findings", "review-result"):
+        r = _run([command, "--run", run_dir])
+        assert r.returncode != 0, command
+
+
+def test_review_result_rejects_post_terminal_verdict_erasing_blocker(tmp_path):
+    # F1 (erase attack): a dep gate proceeds-with-flags carrying a blocking objection, so the PR
+    # recommendation is REQUEST_CHANGES. A forged post-terminal empty symmetric_verdict would erase
+    # the blocker and flip the recommendation; review-result must fail closed rather than publish it.
+    run_dir = _init_symmetric_cfg(tmp_path, {
+        "final_review": False, "on_cap": "proceed_with_flags", "max_rounds_dep": 1})
+    _load(run_dir, tmp_path, {"auth": "pending"})
+    _settle_symmetric_plan(run_dir, tmp_path)
+    _start(run_dir, "auth")
+    r = _symmetric_dep_verdict(
+        run_dir, tmp_path, "auth", candidate={"summary": "auth review", "findings": []},
+        peer_a={"verdict": "REQUEST_CHANGES", "objections": [_objection("O1", "blocker")]})
+    assert r.stdout.strip() == "PROCEED_WITH_FLAGS", r.stdout + r.stderr
+    assert _run(["set-status", "--run", run_dir, "--node", "auth",
+                 "--status", "done"]).returncode == 0
+    pre = _run(["review-result", "--run", run_dir])
+    assert pre.returncode == 0, pre.stderr
+    assert json.loads(pre.stdout)["recommendation"] == "REQUEST_CHANGES"
+    # Forge the post-terminal empty verdict that would erase the blocker.
+    bind = _dep_gate_bindings(run_dir)
+    _append_raw_event(run_dir, {
+        "event": "symmetric_verdict", "gate": "dep:auth", "round": 1,
+        "outcome": "PROCEED_WITH_FLAGS", "objections": [],
+        "candidate": {"summary": "", "findings": []}, **bind})
+    post = _run(["review-result", "--run", run_dir])
+    assert post.returncode != 0, post.stdout  # fails closed; never COMMENT/APPROVE
+
+
+def test_result_commands_reject_missing_plan(tmp_path):
+    # F2: a complete-looking run (done node + valid dependency accepted trio) whose PLAN consensus is
+    # removed. A Finish-time result command must fail closed on a missing configured prerequisite,
+    # not publish — the completeness/binding guards alone let a `missing` PLAN issue through.
+    run_dir = _complete_one_node_symmetric(tmp_path, "auth",
+                                           findings=[_accepted_finding("dep:auth", "F1", "major")])
+
+    def _drop_plan(records):
+        records[:] = [r for r in records if r.get("gate") != "plan"]
+    _rewrite_events(run_dir, _drop_plan)
+    for command in ("accepted-findings", "review-result"):
+        r = _run([command, "--run", run_dir])
+        assert r.returncode != 0, command
+        assert "plan" in r.stderr.lower()
+
+
+def test_review_result_rejects_arbitrary_gate_objection(tmp_path):
+    # F3: a complete valid run whose accepted findings are empty (recommendation APPROVE), then a
+    # forged symmetric_verdict + gate_capped for an arbitrary non-schema gate (sidequest) carrying a
+    # blocker. review-result must fail closed, never fold the bogus objection into the recommendation.
+    run_dir = _complete_one_node_symmetric(tmp_path, "auth", findings=[])
+    bogus = {"artifact_sha256": "e" * 64, "dag_sha256": "d" * 64, "node_sha256": "f" * 64}
+    _append_raw_event(run_dir, {
+        "event": "symmetric_verdict", "gate": "sidequest", "round": 1, "outcome": "CAPPED",
+        "objections": [_objection("S1", "blocker")],
+        "candidate": {"summary": "", "findings": []}, **bogus})
+    _append_raw_event(run_dir, {
+        "event": "gate_capped", "gate": "sidequest", "round": 1,
+        "open_findings": ["S1"], **bogus})
+    r = _run(["review-result", "--run", run_dir])
+    assert r.returncode != 0, r.stdout
+
+
 def test_symmetric_verdict_final_rejects_dropped_dependency_finding(tmp_path):
     run_dir = _complete_one_node_symmetric(tmp_path, "auth", final_review=True,
                                            findings=[_accepted_finding("dep:auth", "F1", "major")])

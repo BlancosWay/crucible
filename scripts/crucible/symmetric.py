@@ -439,6 +439,23 @@ def _last_terminal(
     return last, last_idx
 
 
+def gate_post_terminal_protocol_indices(events: list[dict[str, Any]], gate: str) -> list[int]:
+    """Indices of same-gate symmetric protocol events recorded AFTER ``gate``'s authoritative (last)
+    terminal — forbidden post-terminal residue.
+
+    Once a gate reaches its authoritative terminal the decision is concluded; a later
+    ``symmetric_verdict`` (which could rewrite the gate's unresolved objections), ``accepted_finding_set``
+    (post-terminal accepted residue), or a second terminal can only be forged or crash residue, never
+    part of the concluded decision. The shared resolver already treats a post-terminal accepted SET as
+    residue; this closes the broader gap for a post-terminal verdict/terminal too. Pure; never raises.
+    """
+    _, term_idx = _last_terminal(events, gate)
+    if term_idx is None:
+        return []
+    return [i for i, e in enumerate(events)
+            if i > term_idx and e.get("gate") == gate and e.get("event") in _PROTOCOL_EVENTS]
+
+
 def _gates_with_accepted_sets(events: list[dict[str, Any]]) -> list[str]:
     """Every distinct gate carrying an ``accepted_finding_set`` event, in first-appearance order."""
     gates: list[str] = []
@@ -522,37 +539,39 @@ def out_of_scope_accepted_gates(
 
 
 def _in_workflow_scope(gate: str, expected: set[str]) -> bool:
-    """A dependency/FINAL finding gate is in scope only if it is one of the ``expected`` gates.
+    """A symmetric protocol gate is in scope only if it is a legitimate symmetric gate.
 
-    Only ``dep:<id>`` and ``final`` gates are scoped here (they carry review findings/objections);
-    other gates (``plan``, ``reproduce``) are validated by their own phase checks and are never
-    reported as out-of-scope by this guard.
+    The valid symmetric gate grammar is exactly ``plan``, a current dependency (``dep:<id>`` present
+    in ``expected``), and — only when FINAL is enabled — ``final`` (also in ``expected``). Every other
+    gate carrying a symmetric protocol event is out of scope: an arbitrary/off-convention name (e.g.
+    ``sidequest``), a ``dep:<id>`` whose node is absent from the current tree (a ghost/renamed node),
+    the ``final`` gate while ``final_review`` is disabled, or ``reproduce`` — which symmetric skills
+    never use (design: symmetric protocols have no reproduce gate). Failing closed on all of these
+    stops a forged capped/proceeded objection on such a gate from reaching the recommendation.
     """
-    if gate in expected:
-        return True
-    return not (gate == "final" or gate.startswith("dep:"))
+    return gate == "plan" or gate in expected
 
 
 def out_of_scope_protocol_gates(
     events: list[dict[str, Any]], dag: Any, *, final_enabled: bool
 ) -> list[str]:
-    """Dependency/FINAL gates carrying ANY symmetric protocol event (``symmetric_verdict``,
-    ``accepted_finding_set``, or a terminal) that are NOT part of the configured symmetric workflow,
-    sorted for determinism.
+    """Gates carrying ANY symmetric protocol event (``symmetric_verdict``, ``accepted_finding_set``,
+    or a terminal) that are NOT a legitimate symmetric gate, sorted for determinism.
 
-    The shared protocol-wide scope guard. In scope are exactly the current dependency gates
-    (``dep:<id>`` for every node in ``dag``) and — only when ``final_enabled`` — the ``final`` gate.
-    A ``dep:<id>`` whose node is absent from the current tree (a ghost/renamed node), or the
-    ``final`` gate in a run whose ``final_review`` is off, is out of scope: it was never legitimately
-    produced against this run's plan, so callers fail closed on it rather than publish its
-    findings/objections.
+    The shared protocol-wide scope guard (see :func:`_in_workflow_scope`). In scope are exactly the
+    ``plan`` gate, the current dependency gates (``dep:<id>`` for every node in ``dag``) and — only
+    when ``final_enabled`` — the ``final`` gate. Everything else is out of scope: an arbitrary
+    off-convention name (e.g. ``sidequest``), a ``dep:<id>`` whose node is absent from the current
+    tree (a ghost/renamed node), the ``final`` gate in a run whose ``final_review`` is off, or a
+    ``reproduce`` gate (symmetric protocols have none). Such a gate was never legitimately produced
+    against this run's plan, so callers fail closed on it rather than publish its findings/objections.
 
     Superset of :func:`out_of_scope_accepted_gates`: that guard only sees gates that persisted an
     accepted finding SET, so a CAPPED (halt) gate — or a forged out-of-scope trio that only records a
     verdict + capped/proceeded terminal carrying objections but no accepted set — slips past it while
     its objections still reach the recommendation. This guard closes that gap by scanning every
-    protocol event. ``plan``/``reproduce`` gates are excluded (they carry no review finding set and
-    are validated by their own phase checks). Pure; never raises.
+    protocol event. The ``plan`` gate is in scope (it carries no dependency/FINAL finding set and is
+    validated by the PLAN checks in :func:`crucible.workflow.workflow_issues`). Pure; never raises.
     """
     expected = {f"dep:{nid}" for nid in dag.order}
     if final_enabled:
@@ -673,16 +692,23 @@ def unresolved_objections(
     events: list[dict[str, Any]], dag: Any = None, *, final_enabled: bool = True
 ) -> list[dict[str, Any]]:
     """The namespaced peer objections carried UNRESOLVED past a proceeded-with-flags or capped
-    symmetric gate — the peers' still-open disputes with the candidate, taken from that gate's final
-    ``symmetric_verdict`` (falling back to the terminal's ``open_findings`` ids).
+    symmetric gate — the peers' still-open disputes with the candidate, taken from the
+    TERMINAL-BOUND ``symmetric_verdict`` (falling back to the terminal's ``open_findings`` ids).
+
+    "Terminal-bound" means the last ``symmetric_verdict`` for the gate/round recorded BEFORE the
+    gate's authoritative terminal, echoing the terminal's exact artifact/DAG/node bindings — the peer
+    decision that actually led to the terminal. A ``symmetric_verdict`` appended AFTER the terminal is
+    forged/crash residue (:func:`gate_post_terminal_protocol_indices` flags it invalid history) and is
+    never selected, so it can neither erase the terminal's blocker nor inflate it.
 
     Two calling modes with DELIBERATELY different scope contracts (mirroring
     :func:`accepted_findings`):
 
     - **DAG-aware Finish-time projection** (``dag`` given): FAILS CLOSED — an objection-bearing gate
-      whose ``dep:<id>`` node is absent from the current tree, or the ``final`` gate while
-      ``final_enabled`` is false, raises ``ValueError`` rather than let a forged/stale out-of-scope
-      objection reach the recommendation. In-scope capped/proceeded objections are retained.
+      outside the valid symmetric grammar (an arbitrary name, a ``dep:<id>`` node absent from the
+      current tree, or the ``final`` gate while ``final_enabled`` is false) raises ``ValueError``
+      rather than let a forged/stale out-of-scope objection reach the recommendation. In-scope
+      capped/proceeded objections are retained.
     - **No-DAG partial helper** (``dag`` omitted): a best-effort collection over EVERY capped/
       proceeded gate in log order, WITHOUT scope validation — it cannot know the tree, so it never
       fails closed on scope.
@@ -691,22 +717,27 @@ def unresolved_objections(
                     if dag is not None else set())
     out: list[dict[str, Any]] = []
     for gate in _ordered_unique_gates(events):
-        terminal, _ = _last_terminal(events, gate)
+        terminal, terminal_idx = _last_terminal(events, gate)
         if terminal is None or terminal.get("event") not in (
                 "gate_proceeded_with_flags", "gate_capped"):
             continue
         if gate in out_of_scope:
             raise ValueError(
                 f"unresolved objections reference gate {gate!r} outside the configured symmetric "
-                f"workflow (a dependency absent from the current tree, or FINAL while final_review "
-                f"is disabled); refusing to publish out-of-scope objections"
+                f"workflow (an arbitrary gate, a dependency absent from the current tree, or FINAL "
+                f"while final_review is disabled); refusing to publish out-of-scope objections"
             )
         round_index = terminal.get("round")
-        verdicts = [v for v in events if v.get("event") == "symmetric_verdict"
-                    and v.get("gate") == gate and v.get("round") == round_index]
-        if verdicts:
-            out.extend(o for o in verdicts[-1].get("objections", []) if isinstance(o, dict))
-        else:  # pragma: no cover - a terminal always follows its symmetric_verdict in practice
+        want_bind = event_bindings(terminal)
+        bound = None
+        for i, e in enumerate(events):
+            if (i < terminal_idx and e.get("event") == "symmetric_verdict"
+                    and e.get("gate") == gate and e.get("round") == round_index
+                    and event_bindings(e) == want_bind):
+                bound = e
+        if bound is not None:
+            out.extend(o for o in bound.get("objections", []) if isinstance(o, dict))
+        else:  # pragma: no cover - a terminal always follows its bound symmetric_verdict in practice
             out.extend({"id": oid} for oid in terminal.get("open_findings", []))
     return out
 
@@ -761,15 +792,16 @@ def require_complete_symmetric_run(
 
     Rejects (``ValueError`` prefixed ``incomplete symmetric workflow``) unless every DAG node is
     ``done`` and backed by an effective accepted dependency finding set, no orphan/pre-terminal/
-    post-terminal accepted set exists, no gate carrying ANY review protocol event is OUT OF SCOPE (a
-    ``dep:<id>`` absent from the current tree, or the ``final`` gate when ``final_enabled`` is false),
-    and — when ``require_final`` — the FINAL gate has an effective accepted set. The scope check spans
-    every ``symmetric_verdict``/``accepted_finding_set``/terminal so a forged out-of-scope gate that
-    only CAPS or proceeds-with-flags (persisting objections but no accepted set) is caught too.
-    ``final_enabled`` mirrors ``cfg.final_review`` (FINAL is part of the configured workflow); it is
-    distinct from ``require_final`` because ``accepted-findings`` legitimately precedes FINAL yet must
-    still reject a forged FINAL gate in a run where FINAL is disabled. A malformed effective accepted
-    payload surfaces its own ``ValueError``.
+    post-terminal accepted set exists, no in-scope gate records a same-gate symmetric protocol event
+    AFTER its authoritative terminal (post-terminal residue), no gate carrying ANY review protocol
+    event is OUT OF SCOPE (an arbitrary name, a ``dep:<id>`` absent from the current tree, or the
+    ``final`` gate when ``final_enabled`` is false), and — when ``require_final`` — the FINAL gate has
+    an effective accepted set. The scope check spans every ``symmetric_verdict``/``accepted_finding_set``/
+    terminal so a forged out-of-scope gate that only CAPS or proceeds-with-flags (persisting objections
+    but no accepted set) is caught too. ``final_enabled`` mirrors ``cfg.final_review`` (FINAL is part of
+    the configured workflow); it is distinct from ``require_final`` because ``accepted-findings``
+    legitimately precedes FINAL yet must still reject a forged FINAL gate in a run where FINAL is
+    disabled. A malformed effective accepted payload surfaces its own ``ValueError``.
     """
     if not dag.nodes:
         raise ValueError("incomplete symmetric workflow: no dependency tree is loaded")
@@ -792,12 +824,24 @@ def require_complete_symmetric_run(
             f"incomplete symmetric workflow: {len(orphans)} accepted finding set event(s) are "
             f"orphan/pre-terminal/post-terminal and are not accepted state"
         )
+    residue_gates = ["plan", *[f"dep:{nid}" for nid in dag.order]]
+    if final_enabled:
+        residue_gates.append("final")
+    post_terminal = sorted({gate for gate in residue_gates
+                            if gate_post_terminal_protocol_indices(events, gate)})
+    if post_terminal:
+        raise ValueError(
+            f"incomplete symmetric workflow: gate(s) {post_terminal} record a symmetric protocol "
+            f"event after their authoritative terminal (post-terminal residue that must never "
+            f"rewrite the concluded decision)"
+        )
     out_of_scope = out_of_scope_protocol_gates(events, dag, final_enabled=final_enabled)
     if out_of_scope:
         raise ValueError(
             f"incomplete symmetric workflow: gate(s) {out_of_scope} record review protocol events "
-            f"outside the configured workflow (a dependency gate absent from the current tree, or "
-            f"FINAL while final_review is disabled) — refusing to publish out-of-scope results"
+            f"outside the configured workflow (an arbitrary gate, a dependency absent from the "
+            f"current tree, or FINAL while final_review is disabled) — refusing to publish "
+            f"out-of-scope results"
         )
     if require_final and accepted_finding_set_for_gate(events, "final") is None:
         raise ValueError(

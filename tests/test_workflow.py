@@ -651,3 +651,60 @@ def test_workflow_issues_flags_out_of_scope_proceeded_dependency_gate(tmp_path):
                            "node_sha256": "f" * 64})
     issues = workflow_issues(run.read_events(), dag, cfg)
     assert any(i.kind == "invalid" and "ghost" in i.message for i in issues)
+
+
+# --- round-5 F1: a same-gate symmetric protocol event after the authoritative terminal is invalid ---
+
+def _copy_bindings(events, gate):
+    """The artifact/DAG/node bindings recorded on ``gate``'s symmetric_verdict, for forging residue."""
+    sv = next(e for e in events
+              if e.get("event") == "symmetric_verdict" and e.get("gate") == gate)
+    return {k: sv[k] for k in ("artifact_sha256", "dag_sha256", "node_sha256") if k in sv}
+
+
+def test_workflow_issues_flags_post_terminal_symmetric_verdict(tmp_path):
+    # A valid complete symmetric run, then a forged post-terminal symmetric_verdict for the same dep
+    # gate/round. A same-gate protocol event after the authoritative terminal can rewrite the gate's
+    # unresolved objections, so it is invalid history — not only a post-terminal accepted set.
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    bind = _copy_bindings(run.read_events(), "dep:a")
+    run.append("symmetric_verdict", gate="dep:a", round=1, outcome="CONSENSUS", objections=[],
+               candidate={"summary": "", "findings": []}, **bind)
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "invalid" and "dep:a" in i.message for i in issues)
+
+
+def test_workflow_issues_flags_post_terminal_accepted_set_as_residue(tmp_path):
+    # The accepted-set variant of the same rule: an accepted_finding_set appended after the gate's
+    # authoritative terminal is post-terminal residue (invalid), never accepted state.
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    bind = _copy_bindings(run.read_events(), "dep:a")
+    run.append("accepted_finding_set", gate="dep:a", round=1,
+               payload={"summary": "", "findings": []}, **bind)
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "invalid" and "dep:a" in i.message for i in issues)
+
+
+# --- round-5 F3: an arbitrary non-schema gate carrying symmetric protocol events is out of scope ---
+
+def test_workflow_issues_flags_arbitrary_symmetric_gate(tmp_path):
+    # A forged symmetric_verdict + capped terminal for an arbitrary gate name (sidequest) carrying a
+    # blocker. It is not plan / an in-scope dep / the enabled FINAL gate, so it is out of scope and
+    # flagged invalid before its objection can reach the recommendation.
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    _forge_objection_gate(run, "sidequest", "gate_capped", [_obj("A:S1", "blocker")],
+                          {"artifact_sha256": "e" * 64, "dag_sha256": dag_sha256(dag),
+                           "node_sha256": "f" * 64})
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "invalid" and "sidequest" in i.message for i in issues)
+
+
+def test_workflow_issues_flags_reproduce_symmetric_protocol_event(tmp_path):
+    # Symmetric protocols have no reproduce gate; a forged reproduce symmetric_verdict + capped
+    # terminal is out of scope for a symmetric run and flagged invalid.
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    _forge_objection_gate(run, "reproduce", "gate_capped", [_obj("A:R1", "blocker")],
+                          {"artifact_sha256": "e" * 64, "dag_sha256": dag_sha256(dag),
+                           "node_sha256": "f" * 64})
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "invalid" and "reproduce" in i.message.lower() for i in issues)

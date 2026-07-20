@@ -823,3 +823,123 @@ def test_review_result_retains_in_scope_objection_with_dag():
     result = review_result(events, Config.from_dict({"final_review": False}), "pr-review", dag)
     assert result["recommendation"] == "REQUEST_CHANGES"
     assert [o["id"] for o in result["unresolved_objections"]] == ["A:F1"]
+
+
+# --- round-5 F1: unresolved objections come from the TERMINAL-BOUND peer decision ---------------
+#
+# A gate's unresolved objections are the peers' still-open disputes recorded by the symmetric_verdict
+# that led to the gate's authoritative terminal. A same-gate/same-round symmetric_verdict appended
+# AFTER that terminal is forged/crash residue and must never be selected — otherwise an empty
+# post-terminal verdict could erase the terminal's blocker (REQUEST_CHANGES -> COMMENT) or a padded
+# one could inflate it.
+
+def _post_terminal_verdict(gate, objections, bindings, rnd=1):
+    return {"event": "symmetric_verdict", "gate": gate, "round": rnd,
+            "outcome": "PROCEED_WITH_FLAGS", "objections": objections,
+            "candidate": {"summary": "", "findings": []}, **bindings}
+
+
+def test_unresolved_objections_ignores_post_terminal_verdict_erasure():
+    from crucible.symmetric import unresolved_objections
+
+    b = _bindings("a", "d", "na")
+    events = _dep_events("a", outcome="PROCEED_WITH_FLAGS",
+                         objections=[_obj("A:F1", "blocker")], bindings=b)
+    # A forged post-terminal verdict with NO objections must not erase the terminal's blocker.
+    events.append(_post_terminal_verdict("dep:a", [], b))
+    assert [o["id"] for o in unresolved_objections(events)] == ["A:F1"]
+
+
+def test_unresolved_objections_ignores_post_terminal_verdict_inflation():
+    from crucible.symmetric import unresolved_objections
+
+    b = _bindings("a", "d", "na")
+    events = _dep_events("a", outcome="PROCEED_WITH_FLAGS",
+                         objections=[_obj("A:F1", "blocker")], bindings=b)
+    # A forged post-terminal verdict with extra objections must not inflate the terminal's set.
+    events.append(_post_terminal_verdict(
+        "dep:a", [_obj("A:F1", "blocker"), _obj("A:FAKE", "blocker")], b))
+    assert [o["id"] for o in unresolved_objections(events)] == ["A:F1"]
+
+
+def test_review_result_ignores_post_terminal_verdict_erasing_blocker():
+    # The erase attack at the projection boundary: the accepted findings are empty and the only
+    # blocker is an unresolved proceeded-with-flags objection. A post-terminal empty verdict would
+    # flip the recommendation to APPROVE; the terminal-bound derivation keeps it REQUEST_CHANGES.
+    b = _bindings("a", "d", "na")
+    events = _dep_events("a", findings=[], outcome="PROCEED_WITH_FLAGS",
+                         objections=[_obj("A:F1", "blocker")], bindings=b)
+    events.append(_post_terminal_verdict("dep:a", [], b))
+    cfg = Config.from_dict({"on_cap": "proceed_with_flags"})
+    assert review_result(events, cfg, "pr-review")["recommendation"] == "REQUEST_CHANGES"
+
+
+def test_gate_post_terminal_protocol_indices_detects_residue():
+    from crucible.symmetric import gate_post_terminal_protocol_indices
+
+    b = _bindings("a", "d", "na")
+    events = _dep_events("a", outcome="PROCEED_WITH_FLAGS",
+                         objections=[_obj("A:F1", "blocker")], bindings=b)
+    assert gate_post_terminal_protocol_indices(events, "dep:a") == []
+    events.append(_post_terminal_verdict("dep:a", [], b))
+    # The appended verdict is a same-gate protocol event after the authoritative terminal.
+    assert gate_post_terminal_protocol_indices(events, "dep:a") == [len(events) - 1]
+
+
+# --- round-5 F3: the scope guard accepts only plan / in-scope dep / enabled final ---------------
+#
+# Legitimate symmetric protocol gates are exactly ``plan``, a current ``dep:<id>``, and — only when
+# enabled — ``final``. Any other gate carrying a symmetric protocol event (an arbitrary name like
+# ``sidequest``, or ``reproduce`` which symmetric skills never use) is out of scope, so a forged
+# capped/proceeded objection on it can never reach the recommendation.
+
+def test_out_of_scope_protocol_gates_rejects_arbitrary_gate_name():
+    from crucible.symmetric import out_of_scope_protocol_gates
+
+    dag = _one_done_dag("a")
+    events = (
+        _dep_events("a", outcome="PROCEED_WITH_FLAGS", objections=[_obj("A:F1", "blocker")],
+                    bindings=_bindings("a", "d", "na"))
+        + _gate_events("sidequest", outcome="CAPPED", objections=[_obj("A:S1", "blocker")],
+                       bindings=_bindings("s", "d", "ns"))
+    )
+    assert out_of_scope_protocol_gates(events, dag, final_enabled=True) == ["sidequest"]
+
+
+def test_out_of_scope_protocol_gates_rejects_reproduce_protocol_event():
+    from crucible.symmetric import out_of_scope_protocol_gates
+
+    dag = _one_done_dag("a")
+    # Symmetric protocols have no reproduce gate; a symmetric protocol event on ``reproduce`` is
+    # out of scope (design: accept plan, in-scope dep, enabled final only).
+    events = (
+        _gate_events("plan", outcome="CONSENSUS", bindings=_bindings("p", "d", "np"))
+        + _gate_events("reproduce", outcome="CONSENSUS", bindings=_bindings("r", "d", "nr"))
+        + _dep_events("a", findings=[_finding("dep:a", "F1")], bindings=_bindings("a", "d", "na"))
+    )
+    assert out_of_scope_protocol_gates(events, dag, final_enabled=False) == ["reproduce"]
+
+
+def test_unresolved_objections_fails_closed_on_arbitrary_gate():
+    from crucible.symmetric import unresolved_objections
+
+    dag = _one_done_dag("a")
+    events = (
+        _dep_events("a", outcome="PROCEED_WITH_FLAGS", objections=[_obj("A:F1", "blocker")],
+                    bindings=_bindings("a", "d", "na"))
+        + _gate_events("sidequest", outcome="CAPPED", objections=[_obj("A:S1", "blocker")],
+                       bindings=_bindings("s", "d", "ns"))
+    )
+    with pytest.raises(ValueError, match="sidequest"):
+        unresolved_objections(events, dag, final_enabled=True)
+
+
+def test_require_complete_symmetric_run_rejects_post_terminal_verdict():
+    from crucible.symmetric import require_complete_symmetric_run
+
+    dag = _one_done_dag("a")
+    b = _bindings("a", "d", "na")
+    events = _dep_events("a", findings=[_finding("dep:a", "F1")], bindings=b)
+    events.append(_post_terminal_verdict("dep:a", [], b))
+    with pytest.raises(ValueError, match="post-terminal residue"):
+        require_complete_symmetric_run(events, dag, require_final=False, final_enabled=False)

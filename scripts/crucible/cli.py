@@ -918,25 +918,40 @@ def _load_result_dag(run: RunLog) -> DAG:
         raise ValueError("incomplete symmetric workflow: no dependency tree is loaded")
 
 
-def _reject_stale_result_bindings(events: list[dict], dag: DAG, cfg: Config, command: str) -> None:
-    """Fail a Finish-time result command closed when the recorded history is INVALID against the
-    CURRENT tree.
+def _reject_incomplete_result_history(events: list[dict], dag: DAG, cfg: Config, command: str,
+                                      *, tolerate_missing_final: bool) -> None:
+    """Fail a Finish-time result command closed when the recorded workflow history is INVALID against
+    the CURRENT tree OR is MISSING a configured prerequisite phase.
 
-    ``workflow_issues`` is the single owner of schema-v2 binding validity: it flags a PLAN/dependency
-    node/FINAL binding that no longer matches the current artifact/tree (a plan/DAG/node substituted
-    after acceptance), and — Task 3 fix — a symmetric accepted set whose peer decision bound a
-    different candidate. A result is a certified Finish-time output, so it must not be published from
-    history the report would render ``INVALID``. Reusing that owner (rather than re-deriving the
-    current-binding checks here) keeps the rule in one place and avoids a ``symmetric`` -> ``workflow``
-    import cycle. Only ``invalid`` issues fail closed; ``missing``/``flagged`` are handled by the
-    completeness guard (an in-progress run) or are audited bypasses.
+    ``workflow_issues`` is the single owner of the schema-v2 stage/phase contract: it flags an
+    ``invalid`` binding (a plan/DAG/node/approval substituted after acceptance, a symmetric peer
+    decision bound to a different candidate, post-terminal protocol residue, or an out-of-scope gate)
+    AND a ``missing`` configured prerequisite that never happened (PLAN, configured REPRODUCE,
+    configured human approval, or FINAL). A result is a certified Finish-time output, so it must not
+    be published from history the report would render ``INVALID`` (a recorded violation) or ``IN
+    PROGRESS`` (a missing prerequisite). Reusing that owner (rather than re-deriving the current-binding
+    checks here) keeps the rule in one place and avoids a ``symmetric`` -> ``workflow`` import cycle.
+
+    Every ``invalid`` issue fails closed. Every ``missing`` issue fails closed too, with ONE narrow
+    exception: ``accepted-findings`` (``tolerate_missing_final=True``) legitimately PRECEDES FINAL —
+    it is the union FINAL is assembled from — so it tolerates only the missing configured FINAL
+    prerequisite, and no other missing phase. ``review-result`` tolerates nothing (it requires FINAL
+    when ``final_review`` is enabled). ``flagged`` audited bypasses are handled by the completeness
+    guard, which requires every node backed by an accepted dependency set.
     """
-    invalid = [issue.message for issue in workflow_issues(events, dag, cfg)
-               if issue.kind == "invalid"]
-    if invalid:
+    blocking: list[str] = []
+    for issue in workflow_issues(events, dag, cfg):
+        if issue.kind == "invalid":
+            blocking.append(issue.message)
+        elif issue.kind == "missing":
+            if tolerate_missing_final and issue.phase == "final":
+                continue
+            blocking.append(issue.message)
+    if blocking:
         raise SystemExit(
-            f"crucible: {command} refuses to publish a result from invalid workflow history — the "
-            f"recorded decisions no longer bind the current plan/tree: {'; '.join(invalid)}"
+            f"crucible: {command} refuses to publish a result from incomplete or invalid workflow "
+            f"history — the recorded decisions are missing a configured prerequisite or no longer "
+            f"bind the current plan/tree: {'; '.join(blocking)}"
         )
 
 
@@ -957,7 +972,8 @@ def cmd_accepted_findings(args) -> int:
     cfg = load_config(run.path / "config.json")
     require_complete_symmetric_run(events, dag, require_final=False,
                                    final_enabled=cfg.final_review)
-    _reject_stale_result_bindings(events, dag, cfg, "accepted-findings")
+    _reject_incomplete_result_history(events, dag, cfg, "accepted-findings",
+                                      tolerate_missing_final=True)
     print(json.dumps(accepted_findings(events, dag).to_dict()))
     return 0
 
@@ -979,7 +995,8 @@ def cmd_review_result(args) -> int:
     dag = _load_result_dag(run)
     require_complete_symmetric_run(events, dag, require_final=cfg.final_review,
                                    final_enabled=cfg.final_review)
-    _reject_stale_result_bindings(events, dag, cfg, "review-result")
+    _reject_incomplete_result_history(events, dag, cfg, "review-result",
+                                      tolerate_missing_final=False)
     print(json.dumps(review_result(events, cfg, workflow, dag)))
     return 0
 
