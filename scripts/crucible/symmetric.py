@@ -477,6 +477,32 @@ def _orphan_accepted_indices(events: list[dict[str, Any]]) -> list[int]:
     return sorted(orphans)
 
 
+def out_of_scope_accepted_gates(
+    events: list[dict[str, Any]], dag: Any, *, final_enabled: bool
+) -> list[str]:
+    """Gates carrying an EFFECTIVE accepted finding set that are NOT part of the configured symmetric
+    workflow, sorted for determinism.
+
+    In scope are exactly the current dependency gates (``dep:<id>`` for every node in ``dag``) and —
+    only when ``final_enabled`` — the ``final`` gate. Anything else with a valid accepted trio is out
+    of scope: a ``dep:<id>`` whose node is absent from the current tree (a ghost/renamed node), or a
+    ``final`` set in a run whose ``final_review`` is off. Such a set is fully bound-looking but was
+    never legitimately produced against this run's plan, so callers fail closed on it rather than
+    publish it. Only EFFECTIVE sets count (via :func:`resolve_gate_acceptance`); orphan/pre-terminal
+    residue is handled separately by :func:`_orphan_accepted_indices`. Pure; never raises.
+    """
+    expected = {f"dep:{nid}" for nid in dag.order}
+    if final_enabled:
+        expected.add("final")
+    out: list[str] = []
+    for gate in _gates_with_accepted_sets(events):
+        if gate in expected:
+            continue
+        if resolve_gate_acceptance(events, gate).accepted_index is not None:
+            out.append(gate)
+    return sorted(out)
+
+
 def accepted_finding_set_for_gate(
     events: list[dict[str, Any]], gate: str
 ) -> FindingSet | None:
@@ -496,16 +522,36 @@ def accepted_findings(
     """The deterministic union of accepted DEPENDENCY finding sets, keyed by ``(source_gate, id)``.
 
     Only effective ``accepted_finding_set`` events for ``dep:<id>`` gates contribute (FINAL is
-    assembled FROM this union, so it is excluded here). When ``dag`` is given the union follows DAG
-    topological order; otherwise it follows log order. Finding order within each set is preserved.
-    Raises ``ValueError`` if any effective payload is malformed or if two accepted findings share a
-    ``(source_gate, id)`` key (duplicate/forged history).
+    assembled FROM this union, so it is excluded here). Finding order within each set is preserved.
+
+    Two calling modes with DELIBERATELY different scope contracts:
+
+    - **DAG-aware Finish-time union** (``dag`` given): the union follows DAG topological order and
+      FAILS CLOSED — an effective accepted ``dep:<id>`` whose node is absent from the current tree is
+      never silently sorted after known nodes and published; it raises ``ValueError``. This is the
+      deterministic scope guard the result commands and FINAL assembly rely on (a DAG that changed
+      after acceptance, or forged history, cannot inject out-of-scope findings).
+    - **No-DAG partial helper** (``dag`` omitted): a best-effort union over EVERY effective
+      ``dep:<id>`` accepted set in log order, WITHOUT scope validation — it cannot know the tree, so
+      it never fails closed on scope. Reports use this to render in-progress partial results; scope
+      enforcement is exclusively the DAG-aware path's job.
+
+    Raises ``ValueError`` if any effective payload is malformed, if two accepted findings share a
+    ``(source_gate, id)`` key (duplicate/forged history), or (DAG-aware only) if an accepted
+    dependency gate is outside the current tree.
     """
     effective = [(i, gate, fs) for i, gate, fs in _effective_accepted_events(events)
                  if isinstance(gate, str) and gate.startswith("dep:")]
     if dag is not None:
         position = {f"dep:{nid}": pos for pos, nid in enumerate(dag.topological_order())}
-        effective.sort(key=lambda item: (position.get(item[1], len(position)), item[0]))
+        out_of_scope = sorted({gate for _, gate, _ in effective if gate not in position})
+        if out_of_scope:
+            raise ValueError(
+                f"accepted dependency finding set(s) for gate(s) {out_of_scope} reference node(s) "
+                f"absent from the current dependency tree; refusing to publish out-of-scope accepted "
+                f"findings (the DAG changed after acceptance, or the history is forged)"
+            )
+        effective.sort(key=lambda item: (position[item[1]], item[0]))
     else:
         effective.sort(key=lambda item: item[0])
     findings: list[AcceptedFinding] = []
@@ -601,12 +647,16 @@ def review_result(events: list[dict[str, Any]], cfg: Config, workflow: str) -> d
     """The deterministic symmetric review deliverable: effective accepted findings, unresolved
     objections, and (pr-review only) the derived recommendation.
 
-    The effective finding set is the accepted FINAL set when FINAL reached an accepted terminal,
-    otherwise the accepted dependency union. For ``deep-dive`` the ``recommendation`` key is omitted
-    (an investigation returns a finding set, not an Approve/Comment/Request-changes call). This is a
-    projection over ``events``; callers (the CLI result commands) enforce completeness first.
+    The effective finding set is the accepted FINAL set when FINAL is CONFIGURED (``final_review``)
+    and reached an accepted terminal, otherwise the accepted dependency union. When ``final_review``
+    is disabled the FINAL gate is not part of the workflow, so a (forged) FINAL accepted set is never
+    promoted — the dependency union is the run's effective result (design: "If FINAL review is
+    disabled, the dependency union is the run's effective accepted finding set"). For ``deep-dive``
+    the ``recommendation`` key is omitted (an investigation returns a finding set, not an
+    Approve/Comment/Request-changes call). This is a projection over ``events``; callers (the CLI
+    result commands) enforce completeness and scope first.
     """
-    final_set = accepted_finding_set_for_gate(events, "final")
+    final_set = accepted_finding_set_for_gate(events, "final") if cfg.final_review else None
     effective = final_set if final_set is not None else accepted_findings(events)
     objections = unresolved_objections(events)
     result: dict[str, Any] = {"workflow": workflow}
@@ -618,14 +668,18 @@ def review_result(events: list[dict[str, Any]], cfg: Config, workflow: str) -> d
 
 
 def require_complete_symmetric_run(
-    events: list[dict[str, Any]], dag: Any, *, require_final: bool
+    events: list[dict[str, Any]], dag: Any, *, require_final: bool, final_enabled: bool
 ) -> None:
     """Finish-time completeness guard for the result commands (never for reports).
 
     Rejects (``ValueError`` prefixed ``incomplete symmetric workflow``) unless every DAG node is
     ``done`` and backed by an effective accepted dependency finding set, no orphan/pre-terminal/
-    post-terminal accepted set exists, and — when ``require_final`` — the FINAL gate has an effective
-    accepted set. A malformed effective accepted payload surfaces its own ``ValueError``.
+    post-terminal accepted set exists, no accepted set is OUT OF SCOPE (a ``dep:<id>`` absent from the
+    current tree, or a ``final`` set when ``final_enabled`` is false), and — when ``require_final`` —
+    the FINAL gate has an effective accepted set. ``final_enabled`` mirrors ``cfg.final_review`` (FINAL
+    is part of the configured workflow); it is distinct from ``require_final`` because
+    ``accepted-findings`` legitimately precedes FINAL yet must still reject a forged FINAL set in a
+    run where FINAL is disabled. A malformed effective accepted payload surfaces its own ``ValueError``.
     """
     if not dag.nodes:
         raise ValueError("incomplete symmetric workflow: no dependency tree is loaded")
@@ -647,6 +701,13 @@ def require_complete_symmetric_run(
         raise ValueError(
             f"incomplete symmetric workflow: {len(orphans)} accepted finding set event(s) are "
             f"orphan/pre-terminal/post-terminal and are not accepted state"
+        )
+    out_of_scope = out_of_scope_accepted_gates(events, dag, final_enabled=final_enabled)
+    if out_of_scope:
+        raise ValueError(
+            f"incomplete symmetric workflow: accepted finding set(s) for gate(s) {out_of_scope} are "
+            f"outside the configured workflow (a dependency gate absent from the current tree, or "
+            f"FINAL while final_review is disabled) — refusing to publish out-of-scope findings"
         )
     if require_final and accepted_finding_set_for_gate(events, "final") is None:
         raise ValueError(

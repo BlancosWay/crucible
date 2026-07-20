@@ -569,3 +569,116 @@ def test_review_result_final_set_replaces_dependency_union():
     result = review_result(events, Config.from_dict({}), "pr-review")
     keys = {(f["source_gate"], f["id"]) for f in result["findings"]}
     assert ("final", "C1") in keys and ("dep:auth", "F1") in keys
+
+
+def test_review_result_ignores_final_set_when_final_review_disabled():
+    # Round-3 F1: with final_review disabled a (forged) valid-looking FINAL accepted set must NEVER
+    # become the effective result — the dependency union is the run's effective accepted finding set
+    # (design: "If FINAL review is disabled, the dependency union is the run's effective accepted
+    # finding set"). review_result reads cfg.final_review and never promotes FINAL when it is off.
+    events = (
+        _dep_events("auth", findings=[_finding("dep:auth", "F1", "major")],
+                    bindings=_bindings("a", "d", "na"))
+        + _gate_events("final", findings=[
+            _finding("dep:auth", "F1", "major"), _finding("final", "C1", "blocker"),
+        ], bindings=_bindings("f", "d", "nf"))
+    )
+    result = review_result(events, Config.from_dict({"final_review": False}), "pr-review")
+    keys = {(f["source_gate"], f["id"]) for f in result["findings"]}
+    assert ("final", "C1") not in keys
+    assert ("dep:auth", "F1") in keys
+
+
+# --- out-of-scope accepted sets: DAG-aware fail-close vs no-DAG partial helper ---
+
+def _one_done_dag(node="a"):
+    """A single done-node DAG (only ``node`` exists), so any other ``dep:<id>`` is out of scope."""
+    return DAG.from_dict({
+        "nodes": [{"id": node, "title": node.upper(), "description": "", "files": [],
+                   "test_plan": "", "status": "done"}],
+        "edges": [],
+    })
+
+
+def test_accepted_findings_with_dag_rejects_out_of_scope_dependency_gate():
+    # Round-3 F2: a fully bound-looking dep:ghost trio whose node is absent from the current DAG must
+    # NOT be silently sorted after known nodes and published. With a DAG supplied, accepted_findings
+    # fails closed (deterministic fail-close on an unknown gate).
+    dag = _two_done_dag()  # nodes 'a' and 'b'
+    events = (
+        _dep_events("a", findings=[_finding("dep:a", "F1")], bindings=_bindings("a", "d", "na"))
+        + _dep_events("ghost", findings=[_finding("dep:ghost", "G1")],
+                      bindings=_bindings("g", "d", "ng"))
+    )
+    with pytest.raises(ValueError, match="ghost"):
+        accepted_findings(events, dag)
+
+
+def test_accepted_findings_without_dag_is_partial_helper_over_all_dep_gates():
+    # No-DAG partial-helper semantics (explicit): the report-time aggregation cannot know the DAG, so
+    # it unions every effective dep:<id> accepted set in LOG order WITHOUT scope validation. A gate
+    # not in any current tree is still included here — scope enforcement is the DAG-aware Finish-time
+    # path's job, never this best-effort partial helper's.
+    events = (
+        _dep_events("a", findings=[_finding("dep:a", "F1")], bindings=_bindings("a", "d", "na"))
+        + _dep_events("ghost", findings=[_finding("dep:ghost", "G1")],
+                      bindings=_bindings("g", "d", "ng"))
+    )
+    fs = accepted_findings(events)  # no dag => partial helper
+    assert [f.source_gate for f in fs.findings] == ["dep:a", "dep:ghost"]
+
+
+def test_out_of_scope_accepted_gates_detects_ghost_dep_and_disabled_final():
+    from crucible.symmetric import out_of_scope_accepted_gates
+
+    dag = _one_done_dag("a")
+    events = (
+        _dep_events("a", findings=[_finding("dep:a", "F1")], bindings=_bindings("a", "d", "na"))
+        + _dep_events("ghost", findings=[_finding("dep:ghost", "G1")],
+                      bindings=_bindings("g", "d", "ng"))
+        + _gate_events("final", findings=[_finding("dep:a", "F1"), _finding("final", "C1")],
+                       bindings=_bindings("f", "d", "nf"))
+    )
+    # FINAL disabled => both the ghost dep and the FINAL set are out of scope.
+    assert out_of_scope_accepted_gates(events, dag, final_enabled=False) == ["dep:ghost", "final"]
+    # FINAL enabled => only the ghost dep is out of scope.
+    assert out_of_scope_accepted_gates(events, dag, final_enabled=True) == ["dep:ghost"]
+
+
+def test_require_complete_symmetric_run_rejects_out_of_scope_dependency_gate():
+    from crucible.symmetric import require_complete_symmetric_run
+
+    dag = _one_done_dag("a")
+    events = (
+        _dep_events("a", findings=[_finding("dep:a", "F1")], bindings=_bindings("a", "d", "na"))
+        + _dep_events("ghost", findings=[_finding("dep:ghost", "G1")],
+                      bindings=_bindings("g", "d", "ng"))
+    )
+    with pytest.raises(ValueError, match="incomplete symmetric workflow"):
+        require_complete_symmetric_run(events, dag, require_final=False, final_enabled=False)
+
+
+def test_require_complete_symmetric_run_rejects_final_set_when_final_review_disabled():
+    from crucible.symmetric import require_complete_symmetric_run
+
+    dag = _one_done_dag("a")
+    events = (
+        _dep_events("a", findings=[_finding("dep:a", "F1")], bindings=_bindings("a", "d", "na"))
+        + _gate_events("final", findings=[_finding("dep:a", "F1"), _finding("final", "C1")],
+                       bindings=_bindings("f", "d", "nf"))
+    )
+    with pytest.raises(ValueError, match="incomplete symmetric workflow"):
+        require_complete_symmetric_run(events, dag, require_final=False, final_enabled=False)
+
+
+def test_require_complete_symmetric_run_accepts_in_scope_final_when_enabled():
+    from crucible.symmetric import require_complete_symmetric_run
+
+    dag = _one_done_dag("a")
+    events = (
+        _dep_events("a", findings=[_finding("dep:a", "F1")], bindings=_bindings("a", "d", "na"))
+        + _gate_events("final", findings=[_finding("dep:a", "F1"), _finding("final", "C1")],
+                       bindings=_bindings("f", "d", "nf"))
+    )
+    # When FINAL is configured, the in-scope FINAL set does not trip the out-of-scope guard.
+    require_complete_symmetric_run(events, dag, require_final=True, final_enabled=True)

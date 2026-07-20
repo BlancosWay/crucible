@@ -2710,3 +2710,44 @@ def test_symmetric_verdict_final_accepts_inclusive_candidate(tmp_path):
     keys = {(f["source_gate"], f["id"]) for f in data["findings"]}
     assert ("final", "C1") in keys and ("dep:auth", "F1") in keys
     assert data["recommendation"] == "REQUEST_CHANGES"
+
+
+def _forge_trio_events(run_dir, gate, findings, bindings):
+    """Append a fully bound-looking symmetric trio (verdict -> accepted set -> consensus) for ``gate``
+    directly to the run-log — corrupt history the CLI write path never produces."""
+    payload = {"summary": "", "findings": findings}
+    _append_raw_event(run_dir, {"event": "symmetric_verdict", "gate": gate, "round": 1,
+                                "outcome": "CONSENSUS", "objections": [], "candidate": payload,
+                                **bindings})
+    _append_raw_event(run_dir, {"event": "accepted_finding_set", "gate": gate, "round": 1,
+                                "payload": payload, **bindings})
+    _append_raw_event(run_dir, {"event": "gate_consensus", "gate": gate, "round": 1, **bindings})
+
+
+def test_result_commands_reject_out_of_scope_dependency_trio(tmp_path):
+    # Round-3 F2: a fully bound-looking dep:ghost trio (its node absent from the DAG) forged into the
+    # log must make BOTH Finish-time result commands fail closed — never publish out-of-scope accepted
+    # findings alongside the valid ones.
+    run_dir = _complete_one_node_symmetric(tmp_path, "auth",
+                                           findings=[_accepted_finding("dep:auth", "F1", "major")])
+    _forge_trio_events(run_dir, "dep:ghost", [_accepted_finding("dep:ghost", "G1", "blocker")],
+                       {"artifact_sha256": "e" * 64, "dag_sha256": "d" * 64, "node_sha256": "f" * 64})
+    for command in ("accepted-findings", "review-result"):
+        r = _run([command, "--run", run_dir])
+        assert r.returncode != 0, command
+        assert "ghost" in (r.stdout + r.stderr) or "incomplete" in r.stderr.lower(), command
+
+
+def test_result_commands_reject_final_trio_when_final_review_disabled(tmp_path):
+    # Round-3 F1: final_review is disabled, so a valid-looking FINAL trio is a configured-forbidden
+    # phase. Both result commands must reject it rather than let the forged FINAL set replace the
+    # dependency union (the run's effective result when FINAL is off).
+    run_dir = _complete_one_node_symmetric(tmp_path, "auth",
+                                           findings=[_accepted_finding("dep:auth", "F1", "major")])
+    _forge_trio_events(run_dir, "final",
+                       [_accepted_finding("dep:auth", "F1", "major"),
+                        _accepted_finding("final", "C1", "blocker")],
+                       {"artifact_sha256": "c" * 64, "dag_sha256": "d" * 64})
+    for command in ("accepted-findings", "review-result"):
+        r = _run([command, "--run", run_dir])
+        assert r.returncode != 0, command

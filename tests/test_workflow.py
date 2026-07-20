@@ -582,3 +582,35 @@ def test_workflow_issues_flags_intervening_protocol_event(tmp_path):
     events = _corrupt_dep_trio(run.read_events(), "intervening")
     issues = workflow_issues(events, dag, cfg)
     assert any(i.kind == "invalid" and "dep:a" in i.message for i in issues)
+
+
+def _forge_trio(run, gate, findings, bindings):
+    """Append a fully bound-looking ``symmetric_verdict -> accepted_finding_set -> gate_consensus``
+    trio for ``gate`` (the corrupt history a real CLI write path never produces)."""
+    payload = {"summary": "", "findings": findings}
+    run.append("symmetric_verdict", gate=gate, round=1, outcome="CONSENSUS", objections=[],
+               candidate=payload, **bindings)
+    run.append("accepted_finding_set", gate=gate, round=1, payload=payload, **bindings)
+    run.append("gate_consensus", gate=gate, round=1, **bindings)
+
+
+def test_workflow_issues_flags_out_of_scope_dependency_accepted_set(tmp_path):
+    # Round-3 F2: a fully bound-looking dep:ghost trio whose node is absent from the current DAG must
+    # be flagged invalid — never silently accepted — even though every current node is valid.
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")  # one done node 'a', final_review off
+    _forge_trio(run, "dep:ghost", [_af("dep:ghost", "G1")],
+                {"artifact_sha256": "e" * 64, "dag_sha256": dag_sha256(dag), "node_sha256": "f" * 64})
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "invalid" and "ghost" in i.message for i in issues)
+
+
+def test_workflow_issues_flags_final_trio_when_final_review_disabled(tmp_path):
+    # Round-3 F1: final_review is off, but a valid-looking FINAL trio was forged into the log. FINAL
+    # is not part of this run's configured workflow, so its terminal is a configured-forbidden phase
+    # (mirrors the disabled-REPRODUCE rule) — workflow invalid.
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")  # final_review off, no FINAL
+    assert cfg.final_review is False
+    _forge_trio(run, "final", [_af("dep:a", "F1"), _af("final", "C1", "nit")],
+                {"artifact_sha256": "c" * 64, "dag_sha256": dag_sha256(dag)})
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "invalid" and "final" in i.message.lower() for i in issues)

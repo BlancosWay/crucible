@@ -163,10 +163,15 @@ The command:
 9. applies the existing blocking severities and round-cap/on-cap policy;
 10. appends one `symmetric_verdict` event containing both parsed/raw attestations, configured
     model/effort provenance, aggregate objections, and bindings;
-11. appends the existing terminal event (`gate_consensus`, `gate_capped`, or
-    `gate_proceeded_with_flags`) with bindings.
+11. for an advancing dependency/FINAL outcome, appends the validated `accepted_finding_set`;
+12. appends the existing terminal event (`gate_consensus`, `gate_capped`, or
+    `gate_proceeded_with_flags`) **last** with bindings.
 
 No partial peer event is written if either file is invalid.
+
+All candidate/final-inclusion validation is complete before step 10. A terminal is never appended
+unless the required accepted finding event was successfully persisted first. A crash that leaves a
+pre-terminal accepted event is incomplete/unaccepted history and can never certify the gate.
 
 The existing `verdict` command rejects symmetric workflow runs with a message directing the
 orchestrator to `symmetric-verdict`. Symmetric workflows never use `--resolutions`.
@@ -184,7 +189,7 @@ Therefore, a candidate finding set containing an accepted blocker can correctly 
 
 ## Accepted finding events
 
-When a dependency or FINAL gate reaches `CONSENSUS`, append:
+Immediately before the dependency or FINAL terminal for `CONSENSUS`, append:
 
 ```json
 {
@@ -198,8 +203,9 @@ When a dependency or FINAL gate reaches `CONSENSUS`, append:
 }
 ```
 
-For `PROCEED_WITH_FLAGS`, persist the candidate finding set as accepted-with-flags and record the
-unresolved peer objections. A `CAPPED`/halted gate does not create an accepted finding set.
+For `PROCEED_WITH_FLAGS`, persist the candidate finding set as accepted-with-flags before its
+terminal and record the unresolved peer objections. A `CAPPED`/halted gate does not create an
+accepted finding set. A post-terminal or terminal-without-accepted-set history is invalid.
 
 The event is deterministic parsed state, not a report-time interpretation of free-form text.
 
@@ -217,7 +223,10 @@ finding sets in DAG topological order. Every item retains `source_gate`.
 The FINAL artifact starts from this output and may add `source_gate: final` findings. The CLI
 validates that no accepted dependency finding was dropped or altered.
 
-If FINAL review is disabled, the dependency union is the run's effective accepted finding set.
+If FINAL review is disabled, the dependency union is the run's effective accepted finding set. FINAL
+is then not part of the configured workflow: a recorded FINAL accepted set or terminal is a
+configured-forbidden phase (like a disabled REPRODUCE terminal) — the result commands reject the run
+and never promote it over the dependency union.
 
 ## Deterministic review result
 
@@ -256,6 +265,20 @@ For `pr-review`:
 For `deep-dive`, `recommendation` is omitted; the deterministic finding set is still returned.
 
 `review-result` rejects `build` workflows.
+
+Both result commands are Finish-time deterministic outputs, not partial-progress queries. They reject
+unless every DAG node is done and backed by a valid accepted dependency finding event/terminal; when
+FINAL is configured, `review-result` additionally requires an accepted FINAL gate. An
+`accepted_finding_set` with no later matching accepted terminal is incomplete crash residue and is
+never returned as accepted. Reports may still render partial **in-progress** accepted results from
+completed gates, but must not promote orphan/pre-terminal finding events.
+
+The Finish-time union is also **scope-enforcing**: an accepted `dep:<id>` set whose node is absent
+from the current dependency tree (the DAG changed after acceptance, or the history is forged) is
+out-of-scope and the result commands fail closed on it rather than publish it — the DAG-aware union
+raises instead of silently ordering the ghost gate after known nodes. The scope-free, best-effort
+partial union used by **in-progress reports** deliberately does not enforce this (it has no DAG);
+scope enforcement is exclusively the Finish-time path's job.
 
 ## Report behavior
 
@@ -305,7 +328,11 @@ introduced into the asymmetric Builder/Critic flow.
 - dependency candidate with wrong `source_gate`: reject;
 - FINAL candidate missing/altering prior accepted finding: reject;
 - `accepted-findings`/`review-result` on incomplete or wrong workflow: clear nonzero error where
-  required; reports may show in-progress partial results without fabricating acceptance.
+  required;
+- pre-terminal/orphan `accepted_finding_set`: ignored as acceptance, flagged invalid in reports, and
+  causes result commands to reject;
+- reports may show partial findings from completed accepted gates while the workflow remains
+  in-progress, without deriving a final recommendation.
 
 No broad catch or success-shaped fallback is added.
 

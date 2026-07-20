@@ -955,7 +955,8 @@ def cmd_accepted_findings(args) -> int:
     _require_symmetric_result_workflow(events, "accepted-findings")
     dag = _load_result_dag(run)
     cfg = load_config(run.path / "config.json")
-    require_complete_symmetric_run(events, dag, require_final=False)
+    require_complete_symmetric_run(events, dag, require_final=False,
+                                   final_enabled=cfg.final_review)
     _reject_stale_result_bindings(events, dag, cfg, "accepted-findings")
     print(json.dumps(accepted_findings(events, dag).to_dict()))
     return 0
@@ -976,7 +977,8 @@ def cmd_review_result(args) -> int:
     cfg = load_config(run.path / "config.json")
     workflow = _require_symmetric_result_workflow(events, "review-result")
     dag = _load_result_dag(run)
-    require_complete_symmetric_run(events, dag, require_final=cfg.final_review)
+    require_complete_symmetric_run(events, dag, require_final=cfg.final_review,
+                                   final_enabled=cfg.final_review)
     _reject_stale_result_bindings(events, dag, cfg, "review-result")
     print(json.dumps(review_result(events, cfg, workflow)))
     return 0

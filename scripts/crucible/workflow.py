@@ -30,6 +30,7 @@ from crucible.symmetric import (
     FindingSet,
     accepted_finding_set_for_gate,
     accepted_findings,
+    out_of_scope_accepted_gates,
     resolve_gate_acceptance,
     validate_final_finding_set,
     workflow_kind,
@@ -353,27 +354,39 @@ def workflow_issues(events: list[dict[str, Any]], dag: DAG, cfg: Config) -> list
 
     if cfg.final_review:
         issues.extend(_final_issues(events, dag))
+    elif any(e.get("gate") == "final" and e.get("event") in _TERMINAL_EVENTS for e in events):
+        # final_review is OFF, yet a FINAL gate reached a terminal in the log. FINAL is not part of
+        # this run's configured workflow (design: "If FINAL review is disabled, the dependency union
+        # is the run's effective accepted finding set"), so a recorded terminal — accepted OR capped —
+        # is a configured-forbidden phase: an integrity violation, never CLEAN (mirrors the disabled
+        # REPRODUCE rule above).
+        issues.append(WorkflowIssue(
+            "invalid",
+            "FINAL gate terminal is recorded though final_review is disabled "
+            "(configured-forbidden phase)"))
 
     # Symmetric (deep-dive/pr-review) runs additionally persist a structured accepted finding set for
     # every dependency/FINAL gate that advances. A terminal without it — or an accepted set recorded
-    # after the terminal — is incomplete/orphan history (see Task 2).
+    # after the terminal, or for a gate outside the configured workflow — is incomplete/orphan/
+    # out-of-scope history (see Task 2 and round-3 F1/F2).
     if workflow_kind(events) in SYMMETRIC_WORKFLOWS:
-        issues.extend(_symmetric_accepted_set_issues(events, dag))
+        issues.extend(_symmetric_accepted_set_issues(events, dag, cfg))
 
     return issues
 
 
 def _symmetric_accepted_set_issues(
-    events: list[dict[str, Any]], dag: DAG
+    events: list[dict[str, Any]], dag: DAG, cfg: Config
 ) -> list[WorkflowIssue]:
     """Accepted-finding-set integrity for symmetric dependency/FINAL gates.
 
-    Each dependency (``dep:<id>``) and FINAL gate carries a structured accepted finding set. Its
-    acceptance is decided by the single shared resolver :func:`resolve_gate_acceptance`: exactly one
-    ``accepted_finding_set`` may sit as the middle of an atomic ``symmetric_verdict ->
-    accepted_finding_set -> advancing terminal`` trio for the gate/round, binding the same
-    artifact/DAG/node throughout, with no other same-gate protocol event intervening. Every integrity
-    violation the resolver reports is surfaced here as ``invalid``:
+    Each in-scope dependency (``dep:<id>`` for a current DAG node) and — only when ``final_review`` is
+    enabled — the FINAL gate carries a structured accepted finding set. Its acceptance is decided by
+    the single shared resolver :func:`resolve_gate_acceptance`: exactly one ``accepted_finding_set``
+    may sit as the middle of an atomic ``symmetric_verdict -> accepted_finding_set -> advancing
+    terminal`` trio for the gate/round, binding the same artifact/DAG/node throughout, with no other
+    same-gate protocol event intervening. Every integrity violation the resolver reports is surfaced
+    here as ``invalid``:
 
     - a terminal with no accepted set immediately before it (missing set OR an intervening protocol
       event between the accepted set and its terminal);
@@ -383,13 +396,19 @@ def _symmetric_accepted_set_issues(
     - an accepted set with no advancing terminal, or recorded AFTER its terminal (orphan/post-terminal
       crash residue that must never count as accepted state).
 
-    When the resolver selects an effective set, its payload is additionally checked for validity here,
-    and the accepted FINAL set must include every accepted dependency finding unchanged and add only
+    An accepted set for a gate OUTSIDE the configured workflow is also ``invalid``: a ``dep:<id>``
+    whose node is absent from the current tree (a ghost gate) is flagged here (round-3 F2); a forged
+    FINAL set while ``final_review`` is off is a configured-forbidden phase reported by the FINAL
+    terminal check in :func:`workflow_issues` (round-3 F1). When the resolver selects an effective
+    set, its payload is additionally checked for validity here, and — when FINAL is configured — the
+    accepted FINAL set must include every accepted dependency finding unchanged and add only
     ``source_gate: final`` extras (:func:`_final_inclusion_issues`). PLAN gates carry a text artifact
     and never an accepted finding set, so they are excluded. Pure and never raises.
     """
     issues: list[WorkflowIssue] = []
-    finding_gates = [f"dep:{nid}" for nid in dag.order] + ["final"]
+    finding_gates = [f"dep:{nid}" for nid in dag.order]
+    if cfg.final_review:
+        finding_gates.append("final")
     for gate in finding_gates:
         resolution = resolve_gate_acceptance(events, gate)
         for reason in resolution.issues:
@@ -402,7 +421,19 @@ def _symmetric_accepted_set_issues(
                     "invalid",
                     f"symmetric gate {gate!r} accepted finding set payload is not a valid finding "
                     f"set (malformed)"))
-    issues.extend(_final_inclusion_issues(events, dag))
+    # Out-of-scope accepted DEPENDENCY sets: a fully bound-looking dep:<id> trio whose node is absent
+    # from the current tree is a ghost gate that must never be silently accepted (round-3 F2). A
+    # forged FINAL set while final_review is off is reported as a configured-forbidden phase by the
+    # FINAL terminal check in workflow_issues, so it is skipped here to avoid a duplicate message.
+    for gate in out_of_scope_accepted_gates(events, dag, final_enabled=cfg.final_review):
+        if gate == "final":
+            continue
+        issues.append(WorkflowIssue(
+            "invalid",
+            f"symmetric gate {gate!r} records an accepted finding set for a dependency absent from "
+            f"the current tree (out-of-scope/ghost gate)"))
+    if cfg.final_review:
+        issues.extend(_final_inclusion_issues(events, dag))
     return issues
 
 
