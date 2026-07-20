@@ -27,8 +27,12 @@ from crucible.symmetric import (
     VALID_WORKFLOWS,
     FindingSet,
     PeerAttestation,
+    accepted_findings,
     decide_symmetric,
     peer_slot_provenance,
+    require_complete_symmetric_run,
+    review_result,
+    validate_final_finding_set,
     workflow_kind,
 )
 from crucible.verdict import VALID_RESOLUTIONS, Finding, Verdict, decide
@@ -828,14 +832,17 @@ def cmd_symmetric_verdict(args) -> int:
             raise SystemExit(inconsistency)
 
     # Structured candidate finding set for dependency/FINAL gates (PLAN stays plain text). A
-    # dependency candidate must attribute every finding to this exact gate; FINAL inclusion validation
-    # against prior accepted findings is Task 3 (parsed here only so the event/accepted set can record
-    # it).
+    # dependency candidate must attribute every finding to this exact gate; a FINAL candidate must
+    # CONTAIN every accepted dependency finding unchanged and add only source_gate: final extras
+    # (validated against the accepted dependency union before any append).
     candidate: FindingSet | None = None
     if args.gate.startswith("dep:") or args.gate == "final":
         candidate = _bound_candidate_finding_set(run, args.gate, args.round)
         if args.gate.startswith("dep:"):
             candidate.validate_for_gate(args.gate)
+        else:
+            prior = accepted_findings(run.read_events(), DAG.from_dict(run.load_dag()))
+            validate_final_finding_set(candidate, prior)
 
     # Gate progress is decided ONLY from the union of peer objections, never from accepted-finding
     # severity — so a candidate that accepts a blocker still reaches consensus when both peers attest.
@@ -886,6 +893,64 @@ def cmd_symmetric_verdict(args) -> int:
         raise SystemExit(f"unexpected decision outcome: {decision.outcome!r}")
 
     print(decision.outcome)
+    return 0
+
+
+def _require_symmetric_result_workflow(events: list[dict], command: str) -> str:
+    """Route a result command to the two-peer workflows only. The asymmetric build workflow records
+    no accepted finding sets or review result, so reject it before any read/projection."""
+    workflow = workflow_kind(events)
+    if workflow not in SYMMETRIC_WORKFLOWS:
+        raise SystemExit(
+            f"crucible: {command} is for deep-dive/pr-review runs, but this is a {workflow!r} run — "
+            f"the asymmetric build workflow has no accepted finding sets or review result."
+        )
+    return workflow
+
+
+def _load_result_dag(run: RunLog) -> DAG:
+    """Load the current dependency tree for a result command, mapping an absent tree to the same
+    'incomplete symmetric workflow' rejection the completeness guard raises for an unfinished run."""
+    try:
+        return DAG.from_dict(run.load_dag())
+    except FileNotFoundError:
+        raise ValueError("incomplete symmetric workflow: no dependency tree is loaded")
+
+
+def cmd_accepted_findings(args) -> int:
+    """Emit the deterministic union of accepted DEPENDENCY finding sets as canonical JSON.
+
+    A Finish-time output (design): it requires the current schema, a symmetric workflow, and a
+    complete run (every node done and backed by a valid accepted dependency set, no orphan accepted
+    events) before emitting the topologically-ordered union the FINAL artifact is assembled from. It
+    does NOT require FINAL (it precedes it).
+    """
+    run = RunLog(args.run)
+    require_current_schema(run)
+    events = run.read_events()
+    _require_symmetric_result_workflow(events, "accepted-findings")
+    dag = _load_result_dag(run)
+    require_complete_symmetric_run(events, dag, require_final=False)
+    print(json.dumps(accepted_findings(events, dag).to_dict()))
+    return 0
+
+
+def cmd_review_result(args) -> int:
+    """Emit the deterministic review deliverable (effective findings, unresolved objections, and —
+    for pr-review — the derived recommendation) as canonical JSON.
+
+    A Finish-time output (design): it requires the current schema, a symmetric workflow, and a
+    complete run — additionally requiring an accepted FINAL gate when ``final_review`` is configured —
+    before deriving the recommendation from the accepted finding set (never from workflow status).
+    """
+    run = RunLog(args.run)
+    require_current_schema(run)
+    events = run.read_events()
+    cfg = load_config(run.path / "config.json")
+    workflow = _require_symmetric_result_workflow(events, "review-result")
+    dag = _load_result_dag(run)
+    require_complete_symmetric_run(events, dag, require_final=cfg.final_review)
+    print(json.dumps(review_result(events, cfg, workflow)))
     return 0
 
 
@@ -1130,6 +1195,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--max-rounds", type=int, default=None,
                    help="override the round cap; defaults to config max_rounds_plan/max_rounds_dep by gate")
     s.set_defaults(func=cmd_symmetric_verdict)
+
+    s = sub.add_parser("accepted-findings"); s.add_argument("--run", required=True)
+    s.set_defaults(func=cmd_accepted_findings)
+
+    s = sub.add_parser("review-result"); s.add_argument("--run", required=True)
+    s.set_defaults(func=cmd_review_result)
 
     s = sub.add_parser("bindings"); s.add_argument("--run", required=True); s.add_argument("--gate", required=True)
     s.add_argument("--round", type=int, required=True)

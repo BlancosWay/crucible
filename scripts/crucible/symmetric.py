@@ -309,3 +309,273 @@ def decide_symmetric(
             return SymmetricDecision(outcome="PROCEED_WITH_FLAGS", open_objections=open_objections)
         return SymmetricDecision(outcome="CAPPED", open_objections=open_objections)
     return SymmetricDecision(outcome="CHANGES", open_objections=open_objections)
+
+
+# --- accepted-finding aggregation and deterministic review result ------------
+#
+# Everything below is a PURE projection over the append-only run-log events (plus, for topological
+# ordering/completeness, the current DAG). It owns the deterministic state the symmetric skills add
+# on top of the schema-v2 bindings: the accepted finding set and — for pr-review — the derived
+# recommendation. It never reads the filesystem or mutates the run; the CLI commands
+# (accepted-findings / review-result) and the report call these helpers so the result is decided in
+# exactly one place, never eyeballed.
+#
+# The terminal-event vocabulary is duplicated here (as in cli/report/workflow) so this module stays
+# free of an import cycle with workflow.py (which imports THIS module).
+
+_ADVANCE_TERMINALS = ("gate_consensus", "gate_proceeded_with_flags")
+_TERMINAL_EVENTS = ("gate_consensus", "gate_proceeded_with_flags", "gate_capped")
+_BINDING_KEYS = ("artifact_sha256", "dag_sha256", "node_sha256")
+
+
+def _bindings_of(event: dict[str, Any]) -> dict[str, Any]:
+    """The content bindings recorded on an event (absent fields dropped), for exact comparison."""
+    return {key: event[key] for key in _BINDING_KEYS if event.get(key) is not None}
+
+
+def _last_terminal(
+    events: list[dict[str, Any]], gate: str
+) -> tuple[dict[str, Any] | None, int | None]:
+    """The gate's LAST terminal event (any outcome) and its index, or ``(None, None)``."""
+    last: dict[str, Any] | None = None
+    last_idx: int | None = None
+    for i, e in enumerate(events):
+        if e.get("gate") == gate and e.get("event") in _TERMINAL_EVENTS:
+            last, last_idx = e, i
+    return last, last_idx
+
+
+def _authoritative_accepted_terminal(
+    events: list[dict[str, Any]], gate: str
+) -> tuple[dict[str, Any] | None, int | None]:
+    """The gate's authoritative accepted terminal (LAST terminal iff it ADVANCES) and its index.
+
+    Mirrors ``workflow._accepted_terminal_with_index`` (re-implemented here to avoid an import
+    cycle): an earlier consensus overturned by a later ``gate_capped`` is not accepted.
+    """
+    last, last_idx = _last_terminal(events, gate)
+    if last is None or last.get("event") not in _ADVANCE_TERMINALS:
+        return None, None
+    return last, last_idx
+
+
+def _is_effective_accepted(events: list[dict[str, Any]], idx: int) -> bool:
+    """Whether the ``accepted_finding_set`` at ``events[idx]`` is complete, accepted state.
+
+    It counts only when it is bracketed by its gate's atomic decision: a matching
+    ``symmetric_verdict`` (same gate/round) is recorded BEFORE it, and the gate's authoritative
+    ADVANCING terminal (same gate/round/bindings) is recorded AFTER it. An orphan (no advancing
+    terminal), a pre-terminal event with no later terminal, a post-terminal event, or one whose
+    bindings differ from the terminal is incomplete/residual history, never accepted state.
+    """
+    event = events[idx]
+    gate = event.get("gate")
+    round_index = event.get("round")
+    binding = _bindings_of(event)
+    if not any(v.get("event") == "symmetric_verdict" and v.get("gate") == gate
+               and v.get("round") == round_index for v in events[:idx]):
+        return False
+    terminal, terminal_idx = _authoritative_accepted_terminal(events, gate)
+    if terminal is None or terminal_idx is None or terminal_idx <= idx:
+        return False
+    if terminal.get("round") != round_index:
+        return False
+    return _bindings_of(terminal) == binding
+
+
+def _effective_accepted_events(
+    events: list[dict[str, Any]]
+) -> list[tuple[int, str, FindingSet]]:
+    """``(index, gate, FindingSet)`` for every EFFECTIVE ``accepted_finding_set`` event, in log
+    order. Raises ``ValueError`` when an effective event's payload is not a valid finding set."""
+    out: list[tuple[int, str, FindingSet]] = []
+    for i, e in enumerate(events):
+        if e.get("event") == "accepted_finding_set" and _is_effective_accepted(events, i):
+            out.append((i, e.get("gate"), FindingSet.from_dict(e.get("payload"))))
+    return out
+
+
+def _orphan_accepted_indices(events: list[dict[str, Any]]) -> list[int]:
+    """Indices of ``accepted_finding_set`` events that are NOT effective accepted state — orphan,
+    pre-terminal-without-terminal, post-terminal, or binding-mismatched crash residue."""
+    effective = {i for i, _, _ in _effective_accepted_events(events)}
+    return [i for i, e in enumerate(events)
+            if e.get("event") == "accepted_finding_set" and i not in effective]
+
+
+def accepted_finding_set_for_gate(
+    events: list[dict[str, Any]], gate: str
+) -> FindingSet | None:
+    """The effective accepted finding set for ``gate`` (``dep:<id>`` or ``final``), or ``None``.
+
+    Raises ``ValueError`` if an effective accepted payload is malformed.
+    """
+    for _, gate_of, finding_set in _effective_accepted_events(events):
+        if gate_of == gate:
+            return finding_set
+    return None
+
+
+def accepted_findings(
+    events: list[dict[str, Any]], dag: Any = None
+) -> FindingSet:
+    """The deterministic union of accepted DEPENDENCY finding sets, keyed by ``(source_gate, id)``.
+
+    Only effective ``accepted_finding_set`` events for ``dep:<id>`` gates contribute (FINAL is
+    assembled FROM this union, so it is excluded here). When ``dag`` is given the union follows DAG
+    topological order; otherwise it follows log order. Finding order within each set is preserved.
+    Raises ``ValueError`` if any effective payload is malformed or if two accepted findings share a
+    ``(source_gate, id)`` key (duplicate/forged history).
+    """
+    effective = [(i, gate, fs) for i, gate, fs in _effective_accepted_events(events)
+                 if isinstance(gate, str) and gate.startswith("dep:")]
+    if dag is not None:
+        position = {f"dep:{nid}": pos for pos, nid in enumerate(dag.topological_order())}
+        effective.sort(key=lambda item: (position.get(item[1], len(position)), item[0]))
+    else:
+        effective.sort(key=lambda item: item[0])
+    findings: list[AcceptedFinding] = []
+    seen: set[tuple[str, str]] = set()
+    for _, _, finding_set in effective:
+        for finding in finding_set.findings:
+            if finding.key in seen:
+                raise ValueError(
+                    f"duplicate accepted finding key {finding.key} across accepted finding sets; "
+                    f"the accepted history is invalid"
+                )
+            seen.add(finding.key)
+            findings.append(finding)
+    return FindingSet(summary="", findings=findings)
+
+
+def validate_final_finding_set(candidate: FindingSet, prior: FindingSet) -> None:
+    """Require a FINAL candidate to CONTAIN every accepted dependency finding exactly and add only
+    cross-cutting ``source_gate: final`` findings.
+
+    ``prior`` is the accepted dependency union. Every prior ``(source_gate, id)`` must be present in
+    ``candidate`` with byte-for-structure identical content; a dropped or altered prior finding, or a
+    candidate extra whose ``source_gate`` is not ``"final"``, is rejected (raises ``ValueError``).
+    """
+    candidate_by_key = candidate.by_key()
+    prior_by_key = prior.by_key()
+    dropped = [key[1] for key in prior_by_key if key not in candidate_by_key]
+    if dropped:
+        raise ValueError(
+            f"FINAL finding set drops accepted dependency finding(s) {dropped}; a FINAL set must "
+            f"contain every accepted dependency finding unchanged"
+        )
+    altered = [key[1] for key, prior_finding in prior_by_key.items()
+               if candidate_by_key[key].to_dict() != prior_finding.to_dict()]
+    if altered:
+        raise ValueError(
+            f"FINAL finding set alters accepted dependency finding(s) {altered}; accepted dependency "
+            f"findings must be carried into FINAL byte-for-structure identical"
+        )
+    non_final_extra = [finding.id for finding in candidate.findings
+                       if finding.key not in prior_by_key and finding.source_gate != "final"]
+    if non_final_extra:
+        raise ValueError(
+            f"FINAL finding set adds finding(s) {non_final_extra} whose source_gate is not 'final'; "
+            f"FINAL may only add cross-cutting findings with source_gate 'final'"
+        )
+
+
+def _ordered_unique_gates(events: list[dict[str, Any]]) -> list[str]:
+    """Every distinct string ``gate`` in first-appearance (log) order."""
+    ordered: list[str] = []
+    for e in events:
+        gate = e.get("gate")
+        if isinstance(gate, str) and gate not in ordered:
+            ordered.append(gate)
+    return ordered
+
+
+def unresolved_objections(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The namespaced peer objections carried UNRESOLVED past a proceeded-with-flags or capped
+    symmetric gate — the peers' still-open disputes with the candidate, taken from that gate's final
+    ``symmetric_verdict`` (falling back to the terminal's ``open_findings`` ids)."""
+    out: list[dict[str, Any]] = []
+    for gate in _ordered_unique_gates(events):
+        terminal, _ = _last_terminal(events, gate)
+        if terminal is None or terminal.get("event") not in (
+                "gate_proceeded_with_flags", "gate_capped"):
+            continue
+        round_index = terminal.get("round")
+        verdicts = [v for v in events if v.get("event") == "symmetric_verdict"
+                    and v.get("gate") == gate and v.get("round") == round_index]
+        if verdicts:
+            out.extend(o for o in verdicts[-1].get("objections", []) if isinstance(o, dict))
+        else:  # pragma: no cover - a terminal always follows its symmetric_verdict in practice
+            out.extend({"id": oid} for oid in terminal.get("open_findings", []))
+    return out
+
+
+def _pr_recommendation(
+    findings: list[AcceptedFinding], objections: list[dict[str, Any]], cfg: Config
+) -> str:
+    """The deterministic ``APPROVE|COMMENT|REQUEST_CHANGES`` for pr-review, from the EFFECTIVE
+    accepted findings and unresolved blocking objections — never from workflow status."""
+    blocking = set(cfg.blocking_severities)
+    if objections or any(f.severity in blocking for f in findings):
+        return "REQUEST_CHANGES"
+    if findings:
+        return "COMMENT"
+    return "APPROVE"
+
+
+def review_result(events: list[dict[str, Any]], cfg: Config, workflow: str) -> dict[str, Any]:
+    """The deterministic symmetric review deliverable: effective accepted findings, unresolved
+    objections, and (pr-review only) the derived recommendation.
+
+    The effective finding set is the accepted FINAL set when FINAL reached an accepted terminal,
+    otherwise the accepted dependency union. For ``deep-dive`` the ``recommendation`` key is omitted
+    (an investigation returns a finding set, not an Approve/Comment/Request-changes call). This is a
+    projection over ``events``; callers (the CLI result commands) enforce completeness first.
+    """
+    final_set = accepted_finding_set_for_gate(events, "final")
+    effective = final_set if final_set is not None else accepted_findings(events)
+    objections = unresolved_objections(events)
+    result: dict[str, Any] = {"workflow": workflow}
+    if workflow == "pr-review":
+        result["recommendation"] = _pr_recommendation(effective.findings, objections, cfg)
+    result["findings"] = [f.to_dict() for f in effective.findings]
+    result["unresolved_objections"] = objections
+    return result
+
+
+def require_complete_symmetric_run(
+    events: list[dict[str, Any]], dag: Any, *, require_final: bool
+) -> None:
+    """Finish-time completeness guard for the result commands (never for reports).
+
+    Rejects (``ValueError`` prefixed ``incomplete symmetric workflow``) unless every DAG node is
+    ``done`` and backed by an effective accepted dependency finding set, no orphan/pre-terminal/
+    post-terminal accepted set exists, and — when ``require_final`` — the FINAL gate has an effective
+    accepted set. A malformed effective accepted payload surfaces its own ``ValueError``.
+    """
+    if not dag.nodes:
+        raise ValueError("incomplete symmetric workflow: no dependency tree is loaded")
+    not_done = [nid for nid in dag.order if dag.nodes[nid].status != "done"]
+    if not_done:
+        raise ValueError(
+            f"incomplete symmetric workflow: node(s) {not_done} are not done — the result is a "
+            f"Finish-time output, not a partial-progress query"
+        )
+    unbacked = [nid for nid in dag.order
+                if accepted_finding_set_for_gate(events, f"dep:{nid}") is None]
+    if unbacked:
+        raise ValueError(
+            f"incomplete symmetric workflow: node(s) {unbacked} have no valid accepted dependency "
+            f"finding set"
+        )
+    orphans = _orphan_accepted_indices(events)
+    if orphans:
+        raise ValueError(
+            f"incomplete symmetric workflow: {len(orphans)} accepted finding set event(s) are "
+            f"orphan/pre-terminal/post-terminal and are not accepted state"
+        )
+    if require_final and accepted_finding_set_for_gate(events, "final") is None:
+        raise ValueError(
+            "incomplete symmetric workflow: the configured FINAL gate has not reached an accepted "
+            "finding set"
+        )

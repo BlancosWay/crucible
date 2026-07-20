@@ -1,6 +1,7 @@
 import pytest
 
 from crucible.config import Config
+from crucible.dag import DAG
 from crucible.symmetric import (
     SYMMETRIC_WORKFLOWS,
     VALID_WORKFLOWS,
@@ -8,7 +9,10 @@ from crucible.symmetric import (
     FindingSet,
     PeerAttestation,
     SymmetricDecision,
+    accepted_findings,
     decide_symmetric,
+    review_result,
+    validate_final_finding_set,
     workflow_kind,
 )
 
@@ -272,3 +276,229 @@ def test_peer_slot_provenance_maps_a_to_builder_b_to_critic():
         "A": {"model": "model-a", "effort": "high"},
         "B": {"model": "model-b", "effort": "low"},
     }
+
+# --- accepted-finding aggregation, FINAL inclusion, and review result --------
+#
+# These exercise the pure result-projection helpers (Task 3): the deterministic union of accepted
+# dependency finding sets, FINAL inclusion validation, and the deep-dive/pr-review result +
+# recommendation. Events are constructed by hand (no run-log/CLI) so the projection contract is
+# proven at the module boundary the CLI commands and the report both call.
+
+
+def _bindings(a="a", d="d", n="n"):
+    return {"artifact_sha256": a * 64, "dag_sha256": d * 64, "node_sha256": n * 64}
+
+
+def _obj(fid="A:O1", severity="blocker"):
+    return {"id": fid, "severity": severity, "location": "candidate:F1",
+            "claim": "Set is incomplete.", "suggestion": "Add the missing case."}
+
+
+def _gate_events(gate, *, findings=None, outcome="CONSENSUS", objections=None, bindings=None, rnd=1):
+    """A gate's symmetric_verdict [-> accepted_finding_set] -> terminal, in atomic-decision order.
+
+    ``outcome`` is CONSENSUS / PROCEED_WITH_FLAGS (both advance and persist an accepted set) or
+    CAPPED (no accepted set). ``objections`` are namespaced aggregate objection dicts carried on the
+    verdict + terminal for non-consensus outcomes.
+    """
+    b = bindings or _bindings()
+    objections = objections or []
+    payload = {"summary": "", "findings": findings if findings is not None else []}
+    evs = [{"event": "symmetric_verdict", "gate": gate, "round": rnd, "outcome": outcome,
+            "objections": objections, **b}]
+    if outcome in ("CONSENSUS", "PROCEED_WITH_FLAGS"):
+        acc = {"event": "accepted_finding_set", "gate": gate, "round": rnd, "payload": payload, **b}
+        if outcome == "PROCEED_WITH_FLAGS":
+            acc["accepted_with_flags"] = True
+            acc["open_objections"] = [o["id"] for o in objections]
+        evs.append(acc)
+    terminal = {"CONSENSUS": "gate_consensus", "PROCEED_WITH_FLAGS": "gate_proceeded_with_flags",
+                "CAPPED": "gate_capped"}[outcome]
+    tev = {"event": terminal, "gate": gate, "round": rnd, **b}
+    if outcome in ("PROCEED_WITH_FLAGS", "CAPPED"):
+        tev["open_findings"] = [o["id"] for o in objections]
+    evs.append(tev)
+    return evs
+
+
+def _dep_events(node, **kwargs):
+    return _gate_events(f"dep:{node}", **kwargs)
+
+
+def _two_done_dag():
+    """A two-node DAG where 'b' depends on 'a', so topological order is [a, b]."""
+    return DAG.from_dict({
+        "nodes": [
+            {"id": "b", "title": "B", "description": "", "files": [], "test_plan": "",
+             "status": "done"},
+            {"id": "a", "title": "A", "description": "", "files": [], "test_plan": "",
+             "status": "done"},
+        ],
+        "edges": [{"from": "b", "depends_on": "a"}],
+    })
+
+
+def test_accepted_findings_unions_dependency_sets_in_topological_order():
+    dag = _two_done_dag()
+    events = (
+        _dep_events("b", findings=[_finding("dep:b", "F1")], bindings=_bindings("b", "d", "nb"))
+        + _dep_events("a", findings=[_finding("dep:a", "F1")], bindings=_bindings("a", "d", "na"))
+    )
+    fs = accepted_findings(events, dag)
+    # 'a' is a dependency of 'b', so its findings come first regardless of event/log order.
+    assert [f.source_gate for f in fs.findings] == ["dep:a", "dep:b"]
+
+
+def test_accepted_findings_preserves_finding_order_within_a_set():
+    events = _dep_events("auth", findings=[
+        _finding("dep:auth", "F2"), _finding("dep:auth", "F1"),
+    ])
+    fs = accepted_findings(events)
+    assert [f.id for f in fs.findings] == ["F2", "F1"]
+
+
+def test_accepted_findings_excludes_pre_terminal_orphan_events():
+    # An accepted set with no matching advancing terminal is incomplete history, never accepted.
+    events = [e for e in _dep_events("auth", findings=[_finding("dep:auth", "F1")])
+              if e["event"] != "gate_consensus"]
+    assert accepted_findings(events).findings == []
+
+
+def test_accepted_findings_excludes_post_terminal_orphan_events():
+    b = _bindings()
+    events = _dep_events("auth", findings=[_finding("dep:auth", "F1")], bindings=b)
+    events.append({"event": "accepted_finding_set", "gate": "dep:auth", "round": 1,
+                   "payload": {"summary": "", "findings": [_finding("dep:auth", "F2")]}, **b})
+    # only the pre-terminal accepted set counts; the post-terminal one is orphan residue.
+    assert [f.id for f in accepted_findings(events).findings] == ["F1"]
+
+
+def test_accepted_findings_excludes_binding_mismatched_accepted_set():
+    # The accepted set's bindings differ from the gate's advancing terminal => not effective.
+    events = _dep_events("auth", findings=[_finding("dep:auth", "F1")], bindings=_bindings())
+    for e in events:
+        if e["event"] == "accepted_finding_set":
+            e["artifact_sha256"] = "0" * 64
+    assert accepted_findings(events).findings == []
+
+
+def test_accepted_findings_rejects_duplicate_composite_keys_across_events():
+    b = _bindings()
+    events = _dep_events("auth", findings=[_finding("dep:auth", "F1")], bindings=b)
+    # a second pre-terminal accepted set for the same gate repeats (dep:auth, F1).
+    events.insert(1, {"event": "accepted_finding_set", "gate": "dep:auth", "round": 1,
+                      "payload": {"summary": "", "findings": [_finding("dep:auth", "F1")]}, **b})
+    with pytest.raises(ValueError, match="duplicate"):
+        accepted_findings(events)
+
+
+def test_accepted_findings_rejects_malformed_effective_payload():
+    b = _bindings()
+    events = [
+        {"event": "symmetric_verdict", "gate": "dep:auth", "round": 1, "outcome": "CONSENSUS", **b},
+        {"event": "accepted_finding_set", "gate": "dep:auth", "round": 1,
+         "payload": {"findings": "not-a-list"}, **b},
+        {"event": "gate_consensus", "gate": "dep:auth", "round": 1, **b},
+    ]
+    with pytest.raises(ValueError):
+        accepted_findings(events)
+
+
+# --- FINAL inclusion ---------------------------------------------------------
+
+def test_validate_final_finding_set_accepts_inclusive_candidate():
+    prior = FindingSet.from_dict({"findings": [_finding("dep:auth", "F1")]})
+    candidate = FindingSet.from_dict({"findings": [
+        _finding("dep:auth", "F1"), _finding("final", "C1"),
+    ]})
+    validate_final_finding_set(candidate, prior)  # does not raise
+
+
+def test_validate_final_finding_set_rejects_dropped_prior_finding():
+    prior = FindingSet.from_dict({"findings": [_finding("dep:auth", "F1")]})
+    candidate = FindingSet.from_dict({"findings": [_finding("final", "C1")]})
+    with pytest.raises(ValueError, match="F1"):
+        validate_final_finding_set(candidate, prior)
+
+
+def test_validate_final_finding_set_rejects_altered_prior_finding():
+    prior = FindingSet.from_dict({"findings": [_finding("dep:auth", "F1", severity="major")]})
+    candidate = FindingSet.from_dict({"findings": [_finding("dep:auth", "F1", severity="nit")]})
+    with pytest.raises(ValueError):
+        validate_final_finding_set(candidate, prior)
+
+
+def test_validate_final_finding_set_rejects_non_final_extra():
+    prior = FindingSet.from_dict({"findings": [_finding("dep:auth", "F1")]})
+    candidate = FindingSet.from_dict({"findings": [
+        _finding("dep:auth", "F1"), _finding("dep:auth", "F2"),
+    ]})
+    with pytest.raises(ValueError, match="final"):
+        validate_final_finding_set(candidate, prior)
+
+
+# --- deterministic review result + recommendation ----------------------------
+
+def test_review_result_pr_review_blocking_severity_requests_changes():
+    events = _dep_events("auth", findings=[_finding("dep:auth", "F1", "major")])
+    result = review_result(events, Config.from_dict({}), "pr-review")
+    assert result["workflow"] == "pr-review"
+    assert result["recommendation"] == "REQUEST_CHANGES"
+    assert result["findings"][0]["id"] == "F1"
+
+
+def test_review_result_nonblocking_major_is_comment_when_only_blocker_blocks():
+    events = _dep_events("auth", findings=[_finding("dep:auth", "F1", "major")])
+    cfg = Config.from_dict({"blocking_severities": ["blocker"]})
+    assert review_result(events, cfg, "pr-review")["recommendation"] == "COMMENT"
+
+
+def test_review_result_minor_or_nit_only_is_comment():
+    events = _dep_events("auth", findings=[_finding("dep:auth", "F1", "minor")])
+    assert review_result(events, Config.from_dict({}), "pr-review")["recommendation"] == "COMMENT"
+
+
+def test_review_result_no_findings_is_approve():
+    events = _dep_events("auth", findings=[])
+    result = review_result(events, Config.from_dict({}), "pr-review")
+    assert result["recommendation"] == "APPROVE"
+    assert result["findings"] == []
+
+
+def test_review_result_proceeded_with_flags_objection_requests_changes():
+    # The accepted findings are all nonblocking, but an unresolved blocking peer objection remains.
+    events = _dep_events("auth", findings=[_finding("dep:auth", "F1", "nit")],
+                         outcome="PROCEED_WITH_FLAGS",
+                         objections=[_obj("A:O1", "blocker")])
+    cfg = Config.from_dict({"on_cap": "proceed_with_flags"})
+    result = review_result(events, cfg, "pr-review")
+    assert result["recommendation"] == "REQUEST_CHANGES"
+    assert result["unresolved_objections"]
+
+
+def test_review_result_capped_objection_requests_changes():
+    events = _dep_events("auth", findings=[], outcome="CAPPED",
+                         objections=[_obj("A:O1", "blocker")])
+    cfg = Config.from_dict({"on_cap": "halt"})
+    result = review_result(events, cfg, "pr-review")
+    assert result["recommendation"] == "REQUEST_CHANGES"
+
+
+def test_review_result_deep_dive_omits_recommendation():
+    events = _dep_events("auth", findings=[_finding("dep:auth", "F1", "major")])
+    result = review_result(events, Config.from_dict({}), "deep-dive")
+    assert "recommendation" not in result
+    assert result["findings"][0]["id"] == "F1"
+
+
+def test_review_result_final_set_replaces_dependency_union():
+    events = (
+        _dep_events("auth", findings=[_finding("dep:auth", "F1", "major")],
+                    bindings=_bindings("a", "d", "na"))
+        + _gate_events("final", findings=[
+            _finding("dep:auth", "F1", "major"), _finding("final", "C1", "nit"),
+        ], bindings=_bindings("f", "d", "n"))
+    )
+    result = review_result(events, Config.from_dict({}), "pr-review")
+    keys = {(f["source_gate"], f["id"]) for f in result["findings"]}
+    assert ("final", "C1") in keys and ("dep:auth", "F1") in keys

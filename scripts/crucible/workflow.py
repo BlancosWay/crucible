@@ -25,7 +25,14 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from crucible.integrity import artifact_sha256, dag_sha256, node_sha256
-from crucible.symmetric import SYMMETRIC_WORKFLOWS, workflow_kind
+from crucible.symmetric import (
+    SYMMETRIC_WORKFLOWS,
+    FindingSet,
+    accepted_finding_set_for_gate,
+    accepted_findings,
+    validate_final_finding_set,
+    workflow_kind,
+)
 
 if TYPE_CHECKING:  # annotation-only imports keep this module free of runtime import cycles
     from crucible.config import Config
@@ -363,15 +370,20 @@ def _symmetric_accepted_set_issues(
     Each dependency (``dep:<id>``) and FINAL gate carries a structured accepted finding set. When such
     a gate reaches an ADVANCING terminal (``gate_consensus``/``gate_proceeded_with_flags``), exactly
     one ``accepted_finding_set`` for it must be recorded BEFORE that terminal (the atomic-decision
-    contract: symmetric_verdict -> accepted set -> terminal). Two integrity violations are reported as
-    ``invalid``:
+    contract: symmetric_verdict -> accepted set -> terminal), it must bind the same
+    artifact/DAG/node as the terminal, and its payload must be a valid finding set. The accepted
+    FINAL set must additionally include every accepted dependency finding unchanged and add only
+    ``source_gate: final`` extras. Each violation below is reported as ``invalid``:
 
     - a terminal with no pre-terminal accepted set (the gate certified without persisting its result);
-    - an accepted set recorded AFTER its gate's advancing terminal, or with no advancing terminal at
-      all (orphan/post-terminal crash residue that must never count as accepted state).
+    - a pre-terminal accepted set whose bindings do not match the terminal (bound to another artifact);
+    - a pre-terminal accepted set whose payload is not a valid finding set (malformed);
+    - an accepted set recorded AFTER its advancing terminal, or with no advancing terminal at all
+      (orphan/post-terminal crash residue that must never count as accepted state);
+    - a FINAL accepted set that drops/alters a dependency finding or adds a non-``final`` finding.
 
-    Binding-shape, malformed-payload, and FINAL-inclusion validation are Task 3; PLAN gates carry a
-    text artifact and never an accepted finding set, so they are excluded.
+    PLAN gates carry a text artifact and never an accepted finding set, so they are excluded. Pure and
+    never raises (the finding-set parsing/inclusion helpers are guarded and reported as ``invalid``).
     """
     issues: list[WorkflowIssue] = []
     finding_gates = [f"dep:{nid}" for nid in dag.order] + ["final"]
@@ -387,13 +399,64 @@ def _symmetric_accepted_set_issues(
                     "invalid",
                     f"symmetric gate {gate!r} reached an accepted terminal without a persisted "
                     f"accepted finding set recorded before it"))
+            else:
+                issues.extend(_accepted_set_content_issues(events, gate, terminal, pre_terminal))
         for i in accepted_indices:
             if terminal is None or (terminal_idx is not None and i > terminal_idx):
                 issues.append(WorkflowIssue(
                     "invalid",
                     f"symmetric gate {gate!r} records an accepted finding set after its terminal or "
                     f"without an accepted terminal (orphan/post-terminal, not accepted state)"))
+    issues.extend(_final_inclusion_issues(events, dag))
     return issues
+
+
+def _symmetric_bindings(event: dict[str, Any]) -> dict[str, Any]:
+    """The content bindings recorded on an event (absent fields dropped), for exact comparison."""
+    return {key: event[key] for key in ("artifact_sha256", "dag_sha256", "node_sha256")
+            if event.get(key) is not None}
+
+
+def _accepted_set_content_issues(
+    events: list[dict[str, Any]], gate: str, terminal: dict[str, Any], pre_terminal: list[int]
+) -> list[WorkflowIssue]:
+    """Binding-match and payload-validity of a gate's pre-terminal accepted finding set."""
+    want = _symmetric_bindings(terminal)
+    bound = [i for i in pre_terminal if _symmetric_bindings(events[i]) == want]
+    if not bound:
+        return [WorkflowIssue(
+            "invalid",
+            f"symmetric gate {gate!r} accepted finding set does not bind the same artifact/DAG/node "
+            f"as its accepted terminal")]
+    try:
+        FindingSet.from_dict(events[bound[-1]].get("payload"))
+    except (ValueError, TypeError):
+        return [WorkflowIssue(
+            "invalid",
+            f"symmetric gate {gate!r} accepted finding set payload is not a valid finding set "
+            f"(malformed)")]
+    return []
+
+
+def _final_inclusion_issues(
+    events: list[dict[str, Any]], dag: DAG
+) -> list[WorkflowIssue]:
+    """The accepted FINAL set must include every accepted dependency finding unchanged and add only
+    ``source_gate: final`` extras. Guarded so a malformed set (already flagged above) never raises."""
+    final_terminal, _ = _accepted_terminal_with_index(events, "final")
+    if final_terminal is None:
+        return []
+    try:
+        final_set = accepted_finding_set_for_gate(events, "final")
+        if final_set is None:
+            return []
+        validate_final_finding_set(final_set, accepted_findings(events, dag))
+    except (ValueError, TypeError) as exc:
+        return [WorkflowIssue(
+            "invalid",
+            f"symmetric FINAL finding set is inconsistent with the accepted dependency findings "
+            f"({exc})")]
+    return []
 
 
 def _artifact_binding_issues(

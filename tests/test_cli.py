@@ -2392,3 +2392,189 @@ def test_symmetric_verdict_rejects_wrong_round(tmp_path):
     assert r.returncode != 0
     assert "round" in r.stderr.lower()
     assert not _sym_events(run_dir, "symmetric_verdict")
+
+
+# --- Task 3: accepted-findings / review-result result projection -------------
+
+def _init_symmetric_cfg(tmp_path, config, workflow="pr-review"):
+    cfg = Path(tmp_path) / "sym-cfg.json"
+    cfg.write_text(json.dumps(config))
+    r = _run(["init-run", "--goal", "g", "--base-dir", str(tmp_path),
+              "--workflow", workflow, "--config", str(cfg)])
+    assert r.returncode == 0, r.stderr
+    return r.stdout.strip()
+
+
+def _complete_symmetric_node(run_dir, tmp_path, node, *, findings=None):
+    """Review a started node to symmetric dependency consensus (persisting its accepted findings)
+    and mark it done."""
+    candidate = {"summary": f"{node} review", "findings": findings if findings is not None else []}
+    r = _symmetric_dep_verdict(run_dir, tmp_path, node, candidate=candidate)
+    assert r.stdout.strip() == "CONSENSUS", r.stdout + r.stderr
+    d = _run(["set-status", "--run", run_dir, "--node", node, "--status", "done"])
+    assert d.returncode == 0, d.stderr
+
+
+def _complete_one_node_symmetric(tmp_path, node="auth", *, findings=None, final_review=False,
+                                 workflow="pr-review"):
+    """A fully-settled one-node symmetric run: PLAN consensus, the node reviewed to dependency
+    consensus with its accepted findings, and marked done."""
+    run_dir = _init_symmetric_cfg(tmp_path, {"final_review": final_review}, workflow)
+    _load(run_dir, tmp_path, {node: "pending"})
+    _settle_symmetric_plan(run_dir, tmp_path)
+    _start(run_dir, node)
+    _complete_symmetric_node(run_dir, tmp_path, node, findings=findings)
+    return run_dir
+
+
+def _symmetric_final_verdict(run_dir, tmp_path, candidate, *, peer_a=None, peer_b=None,
+                             round_index=1):
+    """Log a FINAL candidate finding set and run symmetric-verdict for the FINAL gate."""
+    _log_text(run_dir, tmp_path, "final", round_index, json.dumps(candidate),
+              f"final-cand-{round_index}.json")
+    b = _sym_bindings(run_dir, "final", round_index)
+    a = _peer_file(tmp_path, "A", "final", round_index, b, **(peer_a or {}))
+    bb = _peer_file(tmp_path, "B", "final", round_index, b, **(peer_b or {}))
+    return _run(["symmetric-verdict", "--run", run_dir, "--gate", "final", "--round",
+                 str(round_index), "--peer-a", a, "--peer-b", bb])
+
+
+def _append_raw_event(run_dir, record):
+    with (Path(run_dir) / "runlog.jsonl").open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record) + "\n")
+
+
+def test_result_commands_reject_build_run(tmp_path):
+    run_dir = _init(tmp_path)
+    _load(run_dir, tmp_path, {"a": "pending"})
+    for command in ("accepted-findings", "review-result"):
+        r = _run([command, "--run", run_dir])
+        assert r.returncode != 0, command
+        assert "build" in r.stderr.lower()
+
+
+def test_accepted_findings_rejects_unfinished_dag(tmp_path):
+    run_dir = _init_symmetric_cfg(tmp_path, {"final_review": False})
+    _load(run_dir, tmp_path, {"auth": "pending"})
+    _settle_symmetric_plan(run_dir, tmp_path)
+    _start(run_dir, "auth")  # in_progress, not done
+    r = _run(["accepted-findings", "--run", run_dir])
+    assert r.returncode != 0
+    assert "incomplete" in r.stderr.lower()
+
+
+def test_review_result_rejects_unfinished_dag(tmp_path):
+    run_dir = _init_symmetric_cfg(tmp_path, {"final_review": False})
+    _load(run_dir, tmp_path, {"auth": "pending"})
+    _settle_symmetric_plan(run_dir, tmp_path)
+    _start(run_dir, "auth")
+    r = _run(["review-result", "--run", run_dir])
+    assert r.returncode != 0
+    assert "incomplete" in r.stderr.lower()
+
+
+def test_result_commands_reject_orphan_accepted_set(tmp_path):
+    run_dir = _complete_one_node_symmetric(tmp_path, "auth",
+                                           findings=[_accepted_finding("dep:auth", "F1", "major")])
+    # A post-terminal accepted set is crash residue: it must make BOTH result commands fail.
+    _append_raw_event(run_dir, {
+        "event": "accepted_finding_set", "gate": "dep:auth", "round": 1,
+        "payload": {"summary": "", "findings": []},
+        "artifact_sha256": "a" * 64, "dag_sha256": "d" * 64, "node_sha256": "n" * 64})
+    for command in ("accepted-findings", "review-result"):
+        r = _run([command, "--run", run_dir])
+        assert r.returncode != 0, command
+        assert "incomplete" in r.stderr.lower()
+
+
+def test_review_result_requires_accepted_final_when_enabled(tmp_path):
+    # final_review enabled, deps done + accepted, but FINAL never ran.
+    run_dir = _complete_one_node_symmetric(tmp_path, "auth", final_review=True,
+                                           findings=[_accepted_finding("dep:auth", "F1", "major")])
+    r = _run(["review-result", "--run", run_dir])
+    assert r.returncode != 0
+    assert "incomplete" in r.stderr.lower() and "final" in r.stderr.lower()
+    # accepted-findings does NOT require FINAL (it is used to assemble it), so it succeeds.
+    a = _run(["accepted-findings", "--run", run_dir])
+    assert a.returncode == 0, a.stderr
+    assert json.loads(a.stdout)["findings"][0]["id"] == "F1"
+
+
+def test_accepted_findings_emits_topological_union(tmp_path):
+    run_dir = _init_symmetric_cfg(tmp_path, {"final_review": False})
+    # 'b' depends on 'a', so the union lists dep:a before dep:b regardless of completion order.
+    _load(run_dir, tmp_path, {"a": "pending", "b": "pending"},
+          edges=[{"from": "b", "depends_on": "a"}])
+    _settle_symmetric_plan(run_dir, tmp_path)
+    _start(run_dir, "a")
+    _complete_symmetric_node(run_dir, tmp_path, "a",
+                             findings=[_accepted_finding("dep:a", "A1", "minor")])
+    _start(run_dir, "b")
+    _complete_symmetric_node(run_dir, tmp_path, "b",
+                             findings=[_accepted_finding("dep:b", "B1", "major")])
+    r = _run(["accepted-findings", "--run", run_dir])
+    assert r.returncode == 0, r.stderr
+    findings = json.loads(r.stdout)["findings"]
+    assert [f["source_gate"] for f in findings] == ["dep:a", "dep:b"]
+
+
+def test_review_result_recommendation_request_changes(tmp_path):
+    run_dir = _complete_one_node_symmetric(tmp_path, "auth",
+                                           findings=[_accepted_finding("dep:auth", "F1", "major")])
+    r = _run(["review-result", "--run", run_dir])
+    assert r.returncode == 0, r.stderr
+    data = json.loads(r.stdout)
+    assert data["workflow"] == "pr-review"
+    assert data["recommendation"] == "REQUEST_CHANGES"
+    assert data["findings"][0]["id"] == "F1"
+
+
+def test_review_result_recommendation_comment_for_nonblocking(tmp_path):
+    run_dir = _complete_one_node_symmetric(tmp_path, "auth",
+                                           findings=[_accepted_finding("dep:auth", "F1", "minor")])
+    data = json.loads(_run(["review-result", "--run", run_dir]).stdout)
+    assert data["recommendation"] == "COMMENT"
+
+
+def test_review_result_recommendation_approve_when_empty(tmp_path):
+    run_dir = _complete_one_node_symmetric(tmp_path, "auth", findings=[])
+    data = json.loads(_run(["review-result", "--run", run_dir]).stdout)
+    assert data["recommendation"] == "APPROVE"
+    assert data["findings"] == []
+
+
+def test_review_result_deep_dive_omits_recommendation(tmp_path):
+    run_dir = _complete_one_node_symmetric(tmp_path, "auth", workflow="deep-dive",
+                                           findings=[_accepted_finding("dep:auth", "F1", "major")])
+    r = _run(["review-result", "--run", run_dir])
+    assert r.returncode == 0, r.stderr
+    data = json.loads(r.stdout)
+    assert data["workflow"] == "deep-dive"
+    assert "recommendation" not in data
+    assert data["findings"][0]["id"] == "F1"
+
+
+def test_symmetric_verdict_final_rejects_dropped_dependency_finding(tmp_path):
+    run_dir = _complete_one_node_symmetric(tmp_path, "auth", final_review=True,
+                                           findings=[_accepted_finding("dep:auth", "F1", "major")])
+    # FINAL candidate drops the accepted dependency finding F1 -> rejected before any append.
+    candidate = {"summary": "final", "findings": [_accepted_finding("final", "C1", "nit")]}
+    r = _symmetric_final_verdict(run_dir, tmp_path, candidate)
+    assert r.returncode != 0
+    assert "F1" in r.stderr or "final" in r.stderr.lower()
+    assert not _sym_events(run_dir, "symmetric_verdict", "final")
+
+
+def test_symmetric_verdict_final_accepts_inclusive_candidate(tmp_path):
+    run_dir = _complete_one_node_symmetric(tmp_path, "auth", final_review=True,
+                                           findings=[_accepted_finding("dep:auth", "F1", "major")])
+    union = json.loads(_run(["accepted-findings", "--run", run_dir]).stdout)
+    candidate = {"summary": "final",
+                 "findings": union["findings"] + [_accepted_finding("final", "C1", "nit")]}
+    r = _symmetric_final_verdict(run_dir, tmp_path, candidate)
+    assert r.stdout.strip() == "CONSENSUS", r.stdout + r.stderr
+    # review-result now uses the FINAL accepted set as the effective result.
+    data = json.loads(_run(["review-result", "--run", run_dir]).stdout)
+    keys = {(f["source_gate"], f["id"]) for f in data["findings"]}
+    assert ("final", "C1") in keys and ("dep:auth", "F1") in keys
+    assert data["recommendation"] == "REQUEST_CHANGES"

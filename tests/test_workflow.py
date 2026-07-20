@@ -437,3 +437,81 @@ def test_workflow_issues_allows_approval_before_dependency_work(tmp_path):
     run.append("plan_approved", gate="plan", artifact_sha256=artifact, dag_sha256=dag_hash)
     _bind_dep_a(run, dag)
     assert workflow_issues(run.read_events(), dag, cfg) == []
+
+
+# --- symmetric accepted-finding-set integrity (Task 3) -----------------------
+
+def _af(source_gate="dep:a", fid="F1", severity="major"):
+    return {"source_gate": source_gate, "id": fid, "severity": severity,
+            "location": "src/a.py:1", "claim": "c", "suggestion": "s"}
+
+
+def _symmetric_run(tmp_path, *, accepted="valid", final=None):
+    """A pr-review run with one done node 'a' backed by a symmetric dependency gate, plus optional
+    FINAL. ``accepted`` selects a dependency accepted-set fault: ``"valid"``, ``"binding"`` (its
+    bindings differ from the terminal), or ``"malformed"`` (its payload is not a valid finding set).
+    ``final`` selects the FINAL accepted-set inclusion: ``None`` (no FINAL gate), ``"valid"`` (adds a
+    ``source_gate: final`` extra), or ``"drops"`` (omits the accepted dependency finding)."""
+    cfg = Config.from_dict({"final_review": final is not None})
+    run = init_run("sym", cfg, base_dir=tmp_path, workflow="pr-review")
+    dag = _dag(status="done")
+    run.save_dag(dag.to_dict())
+    dsha, nsha = dag_sha256(dag), node_sha256(dag, "a")
+
+    plan_art = artifact_sha256(b"plan")
+    run.append("builder_output", gate="plan", round=1, payload="plan", artifact_sha256=plan_art)
+    run.append("gate_consensus", gate="plan", round=1, artifact_sha256=plan_art, dag_sha256=dsha)
+
+    candidate = {"summary": "", "findings": [_af("dep:a", "F1")]}
+    cand_text = json.dumps(candidate)
+    cand_art = artifact_sha256(cand_text.encode("utf-8"))
+    dep_bind = {"artifact_sha256": cand_art, "dag_sha256": dsha, "node_sha256": nsha}
+    run.append("builder_output", gate="dep:a", round=1, payload=cand_text, artifact_sha256=cand_art)
+    run.append("symmetric_verdict", gate="dep:a", round=1, outcome="CONSENSUS", objections=[],
+               candidate=candidate, **dep_bind)
+    acc_bind = dep_bind if accepted != "binding" else {**dep_bind, "artifact_sha256": "0" * 64}
+    acc_payload = candidate if accepted != "malformed" else {"findings": "not-a-list"}
+    run.append("accepted_finding_set", gate="dep:a", round=1, payload=acc_payload, **acc_bind)
+    run.append("gate_consensus", gate="dep:a", round=1, **dep_bind)
+    run.append("node_status_change", node="a", status="done")
+
+    if final is not None:
+        if final == "drops":
+            final_findings = [_af("final", "C1", "nit")]  # drops the accepted dependency finding
+        else:
+            final_findings = [_af("dep:a", "F1"), _af("final", "C1", "nit")]
+        final_payload = {"summary": "", "findings": final_findings}
+        final_text = json.dumps(final_payload)
+        final_art = artifact_sha256(final_text.encode("utf-8"))
+        fbind = {"artifact_sha256": final_art, "dag_sha256": dsha}
+        run.append("builder_output", gate="final", round=1, payload=final_text,
+                   artifact_sha256=final_art)
+        run.append("symmetric_verdict", gate="final", round=1, outcome="CONSENSUS", objections=[],
+                   candidate=final_payload, **fbind)
+        run.append("accepted_finding_set", gate="final", round=1, payload=final_payload, **fbind)
+        run.append("gate_consensus", gate="final", round=1, **fbind)
+
+    return run, dag, cfg
+
+
+def test_workflow_issues_clean_for_valid_symmetric_run_with_final(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid", final="valid")
+    assert workflow_issues(run.read_events(), dag, cfg) == []
+
+
+def test_workflow_issues_flags_symmetric_binding_mismatched_accepted_set(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="binding")
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "invalid" and "dep:a" in i.message for i in issues)
+
+
+def test_workflow_issues_flags_symmetric_malformed_accepted_set(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="malformed")
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "invalid" for i in issues)
+
+
+def test_workflow_issues_flags_symmetric_final_inclusion_violation(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid", final="drops")
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "invalid" and "final" in i.message.lower() for i in issues)

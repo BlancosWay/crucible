@@ -5,7 +5,9 @@ import sys
 from pathlib import Path
 
 from crucible.config import Config
-from crucible.runlog import RunLog, init_run
+from crucible.dag import DAG
+from crucible.integrity import artifact_sha256, dag_sha256, node_sha256
+from crucible.runlog import init_run
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,15 +22,6 @@ def _run(args):
         env=env,
         cwd=ROOT,
     )
-
-
-def _set_workflow(run_dir, workflow):
-    path = Path(run_dir) / "runlog.jsonl"
-    lines = path.read_text().splitlines()
-    start = json.loads(lines[0])
-    start["workflow"] = workflow
-    lines[0] = json.dumps(start)
-    path.write_text("\n".join(lines) + "\n")
 
 
 def test_single_verdict_cannot_certify_symmetric_workflow(tmp_path):
@@ -85,27 +78,48 @@ def test_single_verdict_cannot_certify_symmetric_workflow(tmp_path):
 
 
 def test_review_result_derives_request_changes_from_accepted_blocker(tmp_path):
-    run = init_run("accepted blocker", Config.from_dict({}), base_dir=tmp_path)
-    _set_workflow(run.path, "pr-review")
-    run.append(
-        "accepted_finding_set",
-        gate="dep:auth",
-        round=1,
-        payload={
-            "summary": "accepted findings",
-            "findings": [{
-                "source_gate": "dep:auth",
-                "id": "F1",
-                "severity": "major",
-                "location": "src/auth.py:42",
-                "claim": "Expired refresh tokens are accepted.",
-                "suggestion": "Reject expired refresh tokens.",
-            }],
-        },
-        artifact_sha256="a" * 64,
-        dag_sha256="d" * 64,
-        node_sha256="n" * 64,
-    )
+    # A COMPLETE, valid symmetric run — settled the real way, not a hand-planted orphan event: PLAN
+    # consensus, one node reviewed to symmetric dependency consensus with an accepted major (blocking)
+    # finding, then marked done. `review-result` derives the deterministic PR recommendation from the
+    # accepted finding set (a severity in blocking_severities -> REQUEST_CHANGES), separate from
+    # workflow status. FINAL is disabled so the dependency union is the effective result.
+    run = init_run("accepted blocker", Config.from_dict({"final_review": False}),
+                   base_dir=tmp_path, workflow="pr-review")
+    dag = DAG.from_dict({
+        "nodes": [{"id": "auth", "title": "Auth", "description": "d", "files": ["auth.py"],
+                   "test_plan": "pytest", "status": "done"}],
+        "edges": [],
+    })
+    run.save_dag(dag.to_dict())
+    dsha, nsha = dag_sha256(dag), node_sha256(dag, "auth")
+
+    plan_payload = "investigation plan"
+    plan_art = artifact_sha256(plan_payload.encode("utf-8"))
+    run.append("builder_output", gate="plan", round=1, payload=plan_payload,
+               artifact_sha256=plan_art)
+    run.append("gate_consensus", gate="plan", round=1, artifact_sha256=plan_art, dag_sha256=dsha)
+
+    candidate = {
+        "summary": "accepted findings",
+        "findings": [{
+            "source_gate": "dep:auth",
+            "id": "F1",
+            "severity": "major",
+            "location": "src/auth.py:42",
+            "claim": "Expired refresh tokens are accepted.",
+            "suggestion": "Reject expired refresh tokens.",
+        }],
+    }
+    cand_text = json.dumps(candidate)
+    cand_art = artifact_sha256(cand_text.encode("utf-8"))
+    bindings = {"artifact_sha256": cand_art, "dag_sha256": dsha, "node_sha256": nsha}
+    run.append("builder_output", gate="dep:auth", round=1, payload=cand_text,
+               artifact_sha256=cand_art)
+    run.append("symmetric_verdict", gate="dep:auth", round=1, outcome="CONSENSUS", objections=[],
+               candidate=candidate, **bindings)
+    run.append("accepted_finding_set", gate="dep:auth", round=1, payload=candidate, **bindings)
+    run.append("gate_consensus", gate="dep:auth", round=1, **bindings)
+    run.append("node_status_change", node="auth", status="done")
 
     result = _run(["review-result", "--run", str(run.path)])
 
