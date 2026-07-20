@@ -12,6 +12,7 @@ from typing import Any
 
 from crucible.config import Config
 from crucible.integrity import RUN_SCHEMA_VERSION
+from crucible.symmetric import VALID_WORKFLOWS
 
 
 def _fsync_dir(dirpath: Path) -> None:
@@ -120,7 +121,10 @@ class RunLog:
         return json.loads((self.path / "dag.json").read_text(encoding="utf-8"))
 
 
-def init_run(goal: str, cfg: Config, base_dir: str | Path = "runs") -> RunLog:
+def init_run(goal: str, cfg: Config, base_dir: str | Path = "runs",
+             workflow: str = "build") -> RunLog:
+    if workflow not in VALID_WORKFLOWS:
+        raise ValueError(f"workflow must be one of {VALID_WORKFLOWS}, got {workflow!r}")
     base = Path(base_dir)
     slug = slugify(goal)[:40].strip("-") or "run"
     run_dir = None
@@ -139,5 +143,6 @@ def init_run(goal: str, cfg: Config, base_dir: str | Path = "runs") -> RunLog:
     _atomic_write_text(run_dir / "config.json",
                        json.dumps(cfg.to_dict(), indent=2, ensure_ascii=False))
     run = RunLog(run_dir)
-    run.append("run_start", schema_version=RUN_SCHEMA_VERSION, goal=goal, config=cfg.to_dict())
+    run.append("run_start", schema_version=RUN_SCHEMA_VERSION, goal=goal, workflow=workflow,
+               config=cfg.to_dict())
     return run

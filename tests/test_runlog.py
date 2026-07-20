@@ -31,6 +31,23 @@ def test_init_run_records_schema_version(tmp_path):
     assert start["schema_version"] == 2
 
 
+def test_init_run_defaults_workflow_to_build(tmp_path):
+    run = init_run("g", Config.from_dict({}), base_dir=tmp_path)
+    assert run.read_events()[0]["workflow"] == "build"
+
+
+def test_init_run_records_requested_workflow(tmp_path):
+    run = init_run("g", Config.from_dict({}), base_dir=tmp_path, workflow="pr-review")
+    start = run.read_events()[0]
+    assert start["event"] == "run_start"
+    assert start["workflow"] == "pr-review"
+
+
+def test_init_run_rejects_invalid_workflow(tmp_path):
+    with pytest.raises(ValueError, match="workflow"):
+        init_run("g", Config.from_dict({}), base_dir=tmp_path, workflow="bogus")
+
+
 def test_append_event_is_append_only_and_full_text(tmp_path):
     cfg = Config.from_dict({})
     run = init_run("g", cfg, base_dir=tmp_path)

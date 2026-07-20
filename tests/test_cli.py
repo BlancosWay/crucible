@@ -89,6 +89,37 @@ def test_init_run_env_override_base(tmp_path):
     assert str(Path(r.stdout.strip())).startswith(str(tmp_path / "elsewhere"))
 
 
+def _run_start(run_dir):
+    events = (Path(run_dir) / "runlog.jsonl").read_text().splitlines()
+    return json.loads(events[0])
+
+
+def test_init_run_defaults_workflow_to_build(tmp_path):
+    r = _run(["init-run", "--goal", "g", "--base-dir", str(tmp_path)])
+    assert r.returncode == 0, r.stderr
+    assert _run_start(r.stdout.strip())["workflow"] == "build"
+
+
+def test_init_run_records_workflow_metadata(tmp_path):
+    r = _run(["init-run", "--goal", "g", "--base-dir", str(tmp_path), "--workflow", "pr-review"])
+    assert r.returncode == 0, r.stderr
+    start = _run_start(r.stdout.strip())
+    assert start["event"] == "run_start"
+    assert start["workflow"] == "pr-review"
+
+
+def test_init_run_records_deep_dive_workflow(tmp_path):
+    r = _run(["init-run", "--goal", "g", "--base-dir", str(tmp_path), "--workflow", "deep-dive"])
+    assert r.returncode == 0, r.stderr
+    assert _run_start(r.stdout.strip())["workflow"] == "deep-dive"
+
+
+def test_init_run_rejects_invalid_workflow(tmp_path):
+    r = _run(["init-run", "--goal", "g", "--base-dir", str(tmp_path), "--workflow", "bogus"])
+    assert r.returncode != 0
+    assert "workflow" in r.stderr
+
+
 def test_full_dry_run_flow(tmp_path):
     r = _run(["init-run", "--goal", "Add caching", "--base-dir", str(tmp_path)])
     run_dir = r.stdout.strip()

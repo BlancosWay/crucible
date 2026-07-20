@@ -22,6 +22,7 @@ from crucible.integrity import (
 from crucible.lenses import read_critic_lenses
 from crucible.report import render_html, render_markdown
 from crucible.runlog import RunLog, RunLogCorruptError, init_run
+from crucible.symmetric import VALID_WORKFLOWS
 from crucible.verdict import VALID_RESOLUTIONS, Finding, Verdict, decide
 from crucible.workflow import (
     accepted_terminal,
@@ -260,7 +261,7 @@ def _require_gate_stage_ready(run: RunLog, cfg: Config, gate: str) -> None:
 def cmd_init_run(args) -> int:
     cfg = load_config(args.config) if args.config else Config.from_dict({})
     base = args.base_dir or os.environ.get("CRUCIBLE_RUNS_DIR") or str(Path.home() / ".crucible" / "runs")
-    run = init_run(args.goal, cfg, base_dir=base)
+    run = init_run(args.goal, cfg, base_dir=base, workflow=args.workflow)
     print(run.path)
     return 0
 
@@ -870,6 +871,9 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("init-run"); s.add_argument("--goal", required=True)
     s.add_argument("--config"); s.add_argument("--base-dir", default=None,
                    help="run base dir; default $CRUCIBLE_RUNS_DIR or ~/.crucible/runs (keeps runs out of the target repo)")
+    s.add_argument("--workflow", choices=VALID_WORKFLOWS, default="build",
+                   help="immutable workflow kind recorded on run_start; default build (asymmetric "
+                        "Builder/Critic). deep-dive/pr-review select the symmetric two-peer flow.")
     s.set_defaults(func=cmd_init_run)
 
     s = sub.add_parser("load-dag"); s.add_argument("--run", required=True); s.add_argument("--file", required=True)
