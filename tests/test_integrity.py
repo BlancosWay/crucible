@@ -6,7 +6,9 @@ from crucible.config import Config
 from crucible.dag import DAG
 from crucible.integrity import (
     RUN_SCHEMA_VERSION,
+    BindingSet,
     artifact_sha256,
+    current_bindings,
     dag_sha256,
     node_sha256,
     read_artifact,
@@ -68,3 +70,87 @@ def test_legacy_run_is_not_mutable(tmp_path):
     run.append("run_start", goal="old", config=Config.from_dict({}).to_dict())
     with pytest.raises(SystemExit, match="legacy.*fresh run"):
         require_current_schema(run)
+
+
+def test_binding_set_to_dict_omits_none_fields():
+    assert BindingSet(artifact_sha256="a").to_dict() == {"artifact_sha256": "a"}
+    assert BindingSet(artifact_sha256="a", dag_sha256="d").to_dict() == {
+        "artifact_sha256": "a", "dag_sha256": "d"}
+    assert BindingSet(artifact_sha256="a", dag_sha256="d", node_sha256="n").to_dict() == {
+        "artifact_sha256": "a", "dag_sha256": "d", "node_sha256": "n"}
+
+
+def test_current_plan_bindings_require_builder_output_and_dag(tmp_path):
+    run = init_run("g", Config.from_dict({}), base_dir=tmp_path)
+    run.save_dag(_dag().to_dict())
+    run.append("builder_output", gate="plan", round=1, payload="plan",
+               artifact_sha256=artifact_sha256(b"plan"))
+    b = current_bindings(run, "plan", 1)
+    assert b.artifact_sha256 == artifact_sha256(b"plan")
+    assert b.dag_sha256 == dag_sha256(_dag())
+    assert b.node_sha256 is None
+
+
+def test_dep_bindings_include_node(tmp_path):
+    run = init_run("g", Config.from_dict({}), base_dir=tmp_path)
+    dag = _dag()
+    run.save_dag(dag.to_dict())
+    run.append(
+        "builder_output",
+        gate="dep:a",
+        round=1,
+        payload="diff",
+        artifact_sha256=artifact_sha256(b"diff"),
+    )
+    b = current_bindings(run, "dep:a", 1)
+    assert b.artifact_sha256 == artifact_sha256(b"diff")
+    assert b.dag_sha256 == dag_sha256(dag)
+    assert b.node_sha256 == node_sha256(dag, "a")
+
+
+def test_current_bindings_require_a_logged_builder_output(tmp_path):
+    run = init_run("g", Config.from_dict({}), base_dir=tmp_path)
+    run.save_dag(_dag().to_dict())
+    with pytest.raises(SystemExit, match="builder"):
+        current_bindings(run, "plan", 1)
+
+
+def test_current_bindings_use_latest_nonempty_output_for_exact_round(tmp_path):
+    run = init_run("g", Config.from_dict({}), base_dir=tmp_path)
+    run.save_dag(_dag().to_dict())
+    run.append("builder_output", gate="plan", round=1, payload="stale",
+               artifact_sha256=artifact_sha256(b"stale"))
+    run.append("builder_output", gate="plan", round=1, payload="",
+               artifact_sha256=artifact_sha256(b""))
+    run.append("builder_output", gate="plan", round=1, payload="latest",
+               artifact_sha256=artifact_sha256(b"latest"))
+    # a different round must not be selected
+    run.append("builder_output", gate="plan", round=2, payload="other",
+               artifact_sha256=artifact_sha256(b"other"))
+    assert current_bindings(run, "plan", 1).artifact_sha256 == artifact_sha256(b"latest")
+
+
+def test_reproduce_bindings_are_artifact_only(tmp_path):
+    run = init_run("g", Config.from_dict({}), base_dir=tmp_path)
+    run.append("builder_output", gate="reproduce", round=1, payload="repro",
+               artifact_sha256=artifact_sha256(b"repro"))
+    b = current_bindings(run, "reproduce", 1)
+    assert b.to_dict() == {"artifact_sha256": artifact_sha256(b"repro")}
+
+
+def test_plan_bindings_require_a_loaded_dag(tmp_path):
+    run = init_run("g", Config.from_dict({}), base_dir=tmp_path)
+    run.append("builder_output", gate="plan", round=1, payload="plan",
+               artifact_sha256=artifact_sha256(b"plan"))
+    with pytest.raises(SystemExit, match="dependency tree"):
+        current_bindings(run, "plan", 1)
+
+
+def test_current_bindings_reject_non_string_payload_cleanly(tmp_path):
+    # A hand-edited/foreign log with a non-string builder payload must fail closed with a clean
+    # SystemExit (never an AttributeError traceback) — the binding never rests on a corrupt record.
+    run = init_run("g", Config.from_dict({}), base_dir=tmp_path)
+    run.save_dag(_dag().to_dict())
+    run.append("builder_output", gate="plan", round=1, payload=12345, artifact_sha256="deadbeef")
+    with pytest.raises(SystemExit, match="builder"):
+        current_bindings(run, "plan", 1)

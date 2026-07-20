@@ -12,6 +12,13 @@ from pathlib import Path
 
 from crucible.config import Config, load_config
 from crucible.dag import DAG
+from crucible.integrity import (
+    current_bindings,
+    dag_sha256,
+    node_sha256,
+    read_artifact,
+    require_current_schema,
+)
 from crucible.lenses import read_critic_lenses
 from crucible.report import render_html, render_markdown
 from crucible.runlog import RunLog, RunLogCorruptError, init_run
@@ -45,27 +52,44 @@ def _print_dependency_tree(dag, stream=None) -> None:
         print(f"  {n.id}: {n.title}  [deps: {deps}]", file=stream)
 
 
-def _print_approved_plan(run, dag, stream=None) -> None:
-    """Render the approved plan artifact + a given (already-loaded) dependency tree to
-    ``stream``. Shared by `show-plan` (stdout) and the automatic echo when the PLAN gate
-    settles (stderr). The caller loads the DAG, so each caller owns its strict-vs-tolerant
-    policy; this renderer never loads the DAG. The *approved* plan is the last plan
-    ``builder_output`` at or before the plan gate's advance-terminal (consensus/proceed) round —
-    never a later, un-reviewed edit; if nothing qualifies, the ``(no plan artifact logged)``
-    placeholder is shown rather than a post-consensus payload."""
-    stream = sys.stdout if stream is None else stream
-    events = run.read_events()
+def _plan_advance_terminal(events) -> dict | None:
+    """The last PLAN gate advance-terminal event (``gate_consensus``/``gate_proceeded_with_flags``),
+    or ``None`` if the plan gate has not advanced. ``gate_capped`` (a halt) is deliberately excluded:
+    a capped plan is not an approval."""
     advance = [e for e in events if e.get("gate") == "plan"
                and e.get("event") in ("gate_consensus", "gate_proceeded_with_flags")]
-    approved_round = advance[-1].get("round") if advance else None
-    plans = [e for e in events if e.get("gate") == "plan" and e.get("event") == "builder_output"]
-    if approved_round is not None:
-        # Bound to the approved round; if nothing qualifies, do NOT fall back to a later
-        # (post-consensus) edit — render the no-artifact placeholder instead.
-        plans = [e for e in plans if isinstance(e.get("round"), int) and e["round"] <= approved_round]
+    return advance[-1] if advance else None
+
+
+def _bound_plan_payload(events) -> str | None:
+    """The exact approved plan artifact: the payload of the pre-terminal ``builder_output`` whose
+    ``artifact_sha256`` matches the PLAN advance-terminal's recorded binding.
+
+    Selection is by *content identity*, never by round — a later, un-reviewed edit (even at a higher
+    round) has a different hash and is never chosen. Returns ``None`` (rendered as the no-artifact
+    placeholder) when the plan has not advanced or no logged artifact matches the accepted binding.
+    """
+    terminal = _plan_advance_terminal(events)
+    if terminal is None:
+        return None
+    approved_sha = terminal.get("artifact_sha256")
+    if not approved_sha:
+        return None
+    matches = [e for e in events if e.get("gate") == "plan"
+               and e.get("event") == "builder_output"
+               and e.get("artifact_sha256") == approved_sha]
+    return matches[-1].get("payload") if matches else None
+
+
+def _print_approved_plan(payload, dag, stream=None) -> None:
+    """Render an already-resolved approved plan ``payload`` + a given (already-loaded) dependency
+    tree to ``stream``. Shared by `show-plan` (stdout) and the automatic echo when the PLAN gate
+    settles (stderr). The caller resolves the exact bound payload (see ``_bound_plan_payload``) and
+    loads the DAG; ``None`` renders the ``(no plan artifact logged)`` placeholder rather than any
+    post-consensus or unbound payload."""
+    stream = sys.stdout if stream is None else stream
     print("=== Approved plan ===", file=stream)
-    print(plans[-1].get("payload", "(no plan artifact logged)") if plans else "(no plan artifact logged)",
-          file=stream)
+    print(payload if payload is not None else "(no plan artifact logged)", file=stream)
     print(file=stream)
     _print_dependency_tree(dag, stream)
 
@@ -208,6 +232,20 @@ def cmd_init_run(args) -> int:
 
 def cmd_load_dag(args) -> int:
     run = RunLog(args.run)
+    require_current_schema(run)
+    # Artifact immutability: once the PLAN gate concludes (any terminal outcome), the accepted
+    # dependency tree is frozen. Refuse to replace it — even with --force — because a Critic already
+    # reviewed and the run bound its decision to this exact tree. A changed plan/DAG needs a fresh
+    # run. Checked before --force so the override cannot reach it.
+    plan_terminal = [e for e in run.read_events()
+                     if e.get("gate") == "plan" and e.get("event") in _TERMINAL_EVENTS]
+    if plan_terminal:
+        last = plan_terminal[-1]
+        raise SystemExit(
+            f"load-dag: the plan gate has already concluded ({last['event']} at round "
+            f"{last.get('round', '?')}); refusing to replace the accepted dependency tree — a "
+            f"changed plan requires a fresh run (--force cannot override an accepted plan)."
+        )
     data = json.loads(Path(args.file).read_text(encoding="utf-8"))
     dag = DAG.from_dict(data)
     if not dag.nodes:
@@ -238,7 +276,8 @@ def cmd_load_dag(args) -> int:
                     f"replace it (discards current node statuses)."
                 )
     run.save_dag(dag.to_dict())
-    run.append("dag_loaded", gate="plan", nodes=len(dag.nodes), forced=bool(args.force))
+    run.append("dag_loaded", gate="plan", nodes=len(dag.nodes), forced=bool(args.force),
+               dag_sha256=dag_sha256(dag))
     print(f"loaded {len(dag.nodes)} nodes")
     print()
     _print_dependency_tree(dag)
@@ -293,15 +332,29 @@ def cmd_set_status(args) -> int:
     # logged human recovery override.
     if args.status == "done" and not args.force:
         node_gate = f"dep:{args.node}"
-        terminal = [e.get("event") for e in run.read_events()
+        terminal = [e for e in run.read_events()
                     if e.get("gate") == node_gate
                     and e.get("event") in ("gate_consensus", "gate_proceeded_with_flags", "gate_capped")]
-        accepted = bool(terminal) and terminal[-1] in ("gate_consensus", "gate_proceeded_with_flags")
+        accepted = bool(terminal) and terminal[-1]["event"] in ("gate_consensus", "gate_proceeded_with_flags")
         if not accepted:
             raise SystemExit(
                 f"set-status: refusing to mark {args.node!r} done — its review gate {node_gate!r} "
                 f"has not reached consensus (or proceeded with flags). Run the gate to a terminal "
                 f"advance first, or pass --force to override (recorded)."
+            )
+        # Task 2 binding guard: the accepted gate's recorded DAG/node bindings must still match the
+        # CURRENT tree/node. If the plan/DAG/node was substituted after the gate was accepted (e.g. a
+        # same-id node whose files/description/test-plan changed), the reviewed artifact no longer
+        # describes what would be marked done — reject the stale consensus and require a fresh review.
+        accepted_terminal = terminal[-1]
+        expected_dag = accepted_terminal.get("dag_sha256")
+        expected_node = accepted_terminal.get("node_sha256")
+        if expected_dag != dag_sha256(dag) or expected_node != node_sha256(dag, args.node):
+            raise SystemExit(
+                f"set-status: refusing to mark {args.node!r} done — the reviewed dependency binding "
+                f"no longer matches the current tree/node (dag/node sha256 changed since gate "
+                f"{node_gate!r} was accepted). The plan/DAG/node was changed after review; re-review "
+                f"the current node or start a fresh run."
             )
     # A --force bypasses the review gate above (an explicit human override), so it must carry a
     # non-empty rationale — recorded in provenance and surfaced in the report — for the audit trail.
@@ -324,8 +377,25 @@ def cmd_log(args) -> int:
         raise ValueError(f"log --event must be one of {LOG_EVENTS}; other events are written "
                          f"by their own commands (verdict, set-status, load-dag)")
     _validate_gate(args.gate)
+    if args.round < 1:
+        raise SystemExit("log --round must be >= 1 (rounds are 1-based)")
     run = RunLog(args.run)
+    require_current_schema(run)
     _require_dep_node_in_dag(run, args.gate)
+    # Artifact immutability: never log Builder/Critic output for a gate that already concluded — a
+    # post-terminal artifact would masquerade as reviewed content (the reported same-round bug).
+    terminal = [e for e in run.read_events()
+                if e.get("gate") == args.gate and e.get("event") in _TERMINAL_EVENTS]
+    if terminal:
+        last = terminal[-1]
+        raise SystemExit(
+            f"log: gate {args.gate!r} already concluded ({last['event']} at round "
+            f"{last.get('round', '?')}); refusing to log a new artifact to a terminal gate — a "
+            f"changed artifact requires a fresh run."
+        )
+    if args.event == "builder_output":
+        return _log_builder_output(run, args)
+    # critic_output: raw provenance text, no binding — payload optional (empty allowed).
     payload = _read_payload(args.file)
     run.append(args.event, gate=args.gate, round=args.round, payload=payload)
     if payload is None:
@@ -338,6 +408,58 @@ def cmd_log(args) -> int:
     return 0
 
 
+def _log_builder_output(run: RunLog, args) -> int:
+    """Log a Builder artifact under the binding handshake: require ``--file`` with a non-empty
+    payload, require the CLI-derived current round (so an artifact can't be back/forward-dated to a
+    concluded or future round), read the *exact bytes* (CRLF-preserving), and record the
+    ``artifact_sha256`` the later `bindings`/verdict handshake binds the gate decision to."""
+    if not args.file:
+        raise SystemExit(
+            "log: builder_output requires --file (the Builder artifact whose exact bytes bind the "
+            "gate decision); an empty payload cannot be reviewed or bound."
+        )
+    expected = _expected_round(run, args.gate)
+    if args.round != expected:
+        raise SystemExit(
+            f"log --round {args.round} does not match the expected round {expected} for gate "
+            f"{args.gate!r} ({expected - 1} prior review round(s) logged); a Builder artifact is "
+            f"logged for the current round only."
+        )
+    text, digest = read_artifact(args.file)
+    if not text:
+        raise SystemExit(
+            "log: builder_output artifact is empty; a Builder artifact must be non-empty to be "
+            "reviewable and bindable."
+        )
+    run.append("builder_output", gate=args.gate, round=args.round, payload=text,
+               artifact_sha256=digest)
+    print(f"logged builder_output (gate {args.gate}, round {args.round}, {len(text)} chars):")
+    sys.stdout.write(text if text.endswith("\n") else text + "\n")
+    return 0
+
+
+def _require_matching_bindings(verdict: Verdict, expected: dict[str, str], gate: str, round_index: int) -> None:
+    """Reject a schema-2 verdict whose echoed bindings do not exactly match ``expected`` (the
+    CLI-selected ``crucible bindings`` output for this gate/round).
+
+    An exact match is required: every expected field present and equal, and no extra binding field
+    the gate never carries (e.g. a ``node_sha256`` on a plan gate). Raises ``SystemExit`` — with
+    "binding" in the message — so the caller rejects before any log append."""
+    provided = {key: getattr(verdict, key)
+                for key in ("artifact_sha256", "dag_sha256", "node_sha256")}
+    problems = [f"{key}: expected {want}, got {provided.get(key)!r}"
+                for key, want in expected.items() if provided.get(key) != want]
+    problems += [f"unexpected {key} for this gate" for key in provided
+                 if provided[key] is not None and key not in expected]
+    if problems:
+        raise SystemExit(
+            f"verdict bindings do not match the CLI-selected artifact/DAG/node for gate {gate!r} "
+            f"round {round_index} ({'; '.join(problems)}); the Critic verdict must echo the exact "
+            f"`crucible bindings` output — refusing to record a decision bound to a different "
+            f"artifact."
+        )
+
+
 def cmd_verdict(args) -> int:
     if args.round < 1:
         raise SystemExit("--round must be >= 1 (rounds are 1-based)")
@@ -345,6 +467,9 @@ def cmd_verdict(args) -> int:
         raise SystemExit("--max-rounds must be >= 1")
     _validate_gate(args.gate)
     run = RunLog(args.run)
+    # Schema guard: a legacy run's provenance is unverified, so a verdict must never append to it —
+    # checked before any read/mutation so `verdict` can never certify unbindable history.
+    require_current_schema(run)
     cfg = load_config(run.path / "config.json")
     raw_text = Path(args.file).read_text(encoding="utf-8")
     data = json.loads(raw_text)
@@ -400,6 +525,17 @@ def cmd_verdict(args) -> int:
     if bad_defer:
         raise ValueError(f"cannot defer finding(s) {bad_defer}: 'deferred' is only allowed for "
                          f"severities in defer_severities {cfg.defer_severities}")
+
+    # Binding handshake: the verdict must echo the EXACT bindings the CLI selects for this
+    # gate/round — the artifact the Critic reviewed plus the relevant DAG/node identity. Recompute
+    # them from run history + the current tree and require an exact match (every expected field
+    # present and equal; no extra field the gate never carries) BEFORE any log append. This proves
+    # the decision refers to the same content the CLI selected — a substituted artifact/DAG/node or
+    # a stale echo is rejected without mutating the run. Placed after resolution validation so a
+    # malformed-resolution verdict still fails for its own reason first.
+    bindings = current_bindings(run, args.gate, args.round).to_dict()
+    _require_matching_bindings(verdict, bindings, args.gate, args.round)
+
     if resolutions_raw:
         run.append("builder_resolution", gate=args.gate, round=args.round, payload=resolutions_raw)
 
@@ -410,15 +546,18 @@ def cmd_verdict(args) -> int:
     # redundant: the report renders the parsed payload as a readable digest (verdict + summary
     # + per-finding bullets) and the `raw` text as a full-fidelity provenance block (exact
     # bytes/formatting/extra keys). Keeping both is intentional (digest for humans, raw for audit).
-    run.append("critic_verdict", gate=args.gate, round=args.round, payload=data, raw=raw_text)
+    # The validated bindings ride on the critic_verdict and every terminal event so provenance
+    # records exactly which artifact/DAG/node this decision was bound to.
+    run.append("critic_verdict", gate=args.gate, round=args.round, payload=data, raw=raw_text,
+               **bindings)
     if decision.outcome == "CONSENSUS":
-        run.append("gate_consensus", gate=args.gate, round=args.round)
+        run.append("gate_consensus", gate=args.gate, round=args.round, **bindings)
     elif decision.outcome == "PROCEED_WITH_FLAGS":
         run.append("gate_proceeded_with_flags", gate=args.gate, round=args.round,
-                   open_findings=[f.id for f in decision.open_findings])
+                   open_findings=[f.id for f in decision.open_findings], **bindings)
     elif decision.outcome == "CAPPED":
         run.append("gate_capped", gate=args.gate, round=args.round,
-                   open_findings=[f.id for f in decision.open_findings])
+                   open_findings=[f.id for f in decision.open_findings], **bindings)
     elif decision.outcome != "CHANGES":  # CHANGES intentionally logs no terminal event
         raise SystemExit(f"unexpected decision outcome: {decision.outcome!r}")
     print(decision.outcome)
@@ -442,10 +581,28 @@ def cmd_verdict(args) -> int:
             # Best-effort echo: a missing OR corrupt/invalid/malformed dag.json must never turn a
             # concluded gate into a failure. The outcome token + gate_consensus are already emitted;
             # skip the echo. (CycleError is a ValueError; a node/edge missing a required key such as
-            # "id" raises KeyError.)
+            # "id" raises KeyError.) In practice the binding handshake above already required a valid
+            # DAG, so this guard is defensive.
             settled_dag = None
         if settled_dag is not None:
-            _print_approved_plan(run, settled_dag, sys.stderr)
+            _print_approved_plan(_bound_plan_payload(run.read_events()), settled_dag, sys.stderr)
+    return 0
+
+
+def cmd_bindings(args) -> int:
+    """Emit the deterministic content bindings for a gate/round as machine-readable JSON.
+
+    The orchestrator appends this JSON to the Critic seed as trusted CLI metadata; the Critic echoes
+    it in its verdict, and `verdict` requires an exact match (the binding handshake). Fields vary by
+    gate: ``reproduce`` → artifact; ``plan``/``final`` → artifact + DAG; ``dep:<id>`` → artifact +
+    DAG + node. Requires the current schema (a legacy run has no verifiable bindings)."""
+    if args.round < 1:
+        raise SystemExit("--round must be >= 1 (rounds are 1-based)")
+    _validate_gate(args.gate)
+    run = RunLog(args.run)
+    require_current_schema(run)
+    _require_dep_node_in_dag(run, args.gate)
+    print(json.dumps(current_bindings(run, args.gate, args.round).to_dict()))
     return 0
 
 
@@ -490,21 +647,28 @@ def cmd_should_reproduce(args) -> int:
 
 
 def cmd_show_plan(args) -> int:
-    """Print the approved plan + dependency tree to the terminal after PLAN consensus.
+    """Print the exact approved plan + dependency tree to the terminal after PLAN consensus.
 
-    Refuses to run until the plan gate has concluded, so the operator always sees exactly
-    what was approved before any implementation begins. Reads from the run-log (final plan
-    artifact) and the loaded DAG.
+    Refuses to run until the plan gate has advanced (consensus/proceed-with-flags), and binds what it
+    shows to what was accepted: it verifies the current ``dag_sha256`` still matches the accepted
+    plan terminal and selects the pre-terminal Builder artifact whose ``artifact_sha256`` matches the
+    terminal binding — never an artifact chosen merely by round. A plan/DAG changed after approval is
+    refused, so the operator can only ever see exactly what was reviewed.
     """
     run = RunLog(args.run)
-    concluded = [e for e in run.read_events()
-                 if e.get("gate") == "plan"
-                 and e.get("event") in ("gate_consensus", "gate_proceeded_with_flags")]
-    if not concluded:
+    require_current_schema(run)
+    events = run.read_events()
+    terminal = _plan_advance_terminal(events)
+    if terminal is None:
         raise SystemExit("show-plan: the plan gate has not reached consensus (or proceeded with "
                          "flags) yet; nothing to show")
     dag = DAG.from_dict(run.load_dag())
-    _print_approved_plan(run, dag, sys.stdout)
+    if dag_sha256(dag) != terminal.get("dag_sha256"):
+        raise SystemExit(
+            "show-plan: the current dependency tree no longer matches the accepted plan binding "
+            "(dag_sha256); the plan/DAG was changed after approval — start a fresh run."
+        )
+    _print_approved_plan(_bound_plan_payload(events), dag, sys.stdout)
     return 0
 
 
@@ -601,6 +765,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--resolutions", help="JSON file of Builder per-finding resolutions (id -> fixed|deferred|wontfix)")
     s.add_argument("--file", required=True)
     s.set_defaults(func=cmd_verdict)
+
+    s = sub.add_parser("bindings"); s.add_argument("--run", required=True); s.add_argument("--gate", required=True)
+    s.add_argument("--round", type=int, required=True)
+    s.set_defaults(func=cmd_bindings)
 
     s = sub.add_parser("status"); s.add_argument("--run", required=True)
     s.set_defaults(func=cmd_status)

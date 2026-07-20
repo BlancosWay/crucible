@@ -12,6 +12,20 @@ VALID_SEVERITIES = ("blocker", "major", "minor", "nit")
 VALID_RESOLUTIONS = ("fixed", "deferred", "wontfix")
 
 
+def _optional_hash(data: dict[str, Any], key: str) -> str | None:
+    """Parse an optional binding hash field: absent → ``None``; present must be a non-empty string.
+
+    A wrong-typed value (number, list, empty string) is rejected here so a malformed binding never
+    slips through as ``None`` and then silently matches a gate that requires no such hash.
+    """
+    if key not in data:
+        return None
+    value = data[key]
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"verdict.{key} must be a non-empty string when present")
+    return value
+
+
 @dataclass
 class Finding:
     id: str
@@ -46,6 +60,12 @@ class Verdict:
     verdict: str
     summary: str
     findings: list[Finding]
+    # Schema-2 content bindings the Critic echoes back (see integrity.BindingSet). Optional here so
+    # historical/legacy verdict objects still parse; the schema-2 CLI (cmd_verdict) requires them to
+    # match the CLI-selected bindings exactly before it will log or decide.
+    artifact_sha256: str | None = None
+    dag_sha256: str | None = None
+    node_sha256: str | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Verdict":
@@ -74,6 +94,9 @@ class Verdict:
             verdict=verdict,
             summary=data.get("summary", ""),
             findings=findings,
+            artifact_sha256=_optional_hash(data, "artifact_sha256"),
+            dag_sha256=_optional_hash(data, "dag_sha256"),
+            node_sha256=_optional_hash(data, "node_sha256"),
         )
 
     def open_blocking(self, cfg: Config) -> list[Finding]:

@@ -15,6 +15,52 @@ def _run(args):
     )
 
 
+def _log_artifact_and_get_bindings(run_dir, tmp_path, gate, round_index, payload):
+    """Write a Builder artifact, log it, then fetch the CLI-selected bindings for gate/round."""
+    artifact = Path(tmp_path) / f"{gate.replace(':', '-')}-{round_index}-artifact.txt"
+    artifact.write_text(payload)
+    logged = _run(["log", "--run", run_dir, "--event", "builder_output",
+                   "--gate", gate, "--round", str(round_index), "--file", str(artifact)])
+    assert logged.returncode == 0, logged.stderr
+    result = _run(["bindings", "--run", run_dir, "--gate", gate, "--round", str(round_index)])
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
+
+
+def _write_bound_verdict(tmp_path, run_dir, gate, round_index, verdict, findings) -> Path:
+    """Write a success-path verdict file with the CLI-selected bindings merged in (schema-2)."""
+    bindings_result = _run([
+        "bindings", "--run", run_dir, "--gate", gate,
+        "--round", str(round_index),
+    ])
+    assert bindings_result.returncode == 0, bindings_result.stderr
+    path = tmp_path / f"{gate.replace(':', '-')}-{round_index}-verdict.json"
+    path.write_text(json.dumps({
+        "gate": gate,
+        "round": round_index,
+        "verdict": verdict,
+        "summary": "test verdict",
+        "findings": findings,
+        **json.loads(bindings_result.stdout),
+    }))
+    return path
+
+
+def _run_bound_verdict(tmp_path, run_dir, gate, round_index=1, verdict="APPROVE", findings=None,
+                       payload="artifact body", max_rounds=None, resolutions=None):
+    """Log a Builder artifact then run `verdict` with the CLI-selected bindings echoed back — the
+    standard schema-2 success path. Assumes any DAG the gate needs is already loaded."""
+    _log_artifact_and_get_bindings(run_dir, tmp_path, gate, round_index, payload)
+    vpath = _write_bound_verdict(tmp_path, run_dir, gate, round_index, verdict, findings or [])
+    argv = ["verdict", "--run", run_dir, "--gate", gate, "--round", str(round_index),
+            "--file", str(vpath)]
+    if max_rounds is not None:
+        argv += ["--max-rounds", str(max_rounds)]
+    if resolutions is not None:
+        argv += ["--resolutions", str(resolutions)]
+    return _run(argv)
+
+
 def test_init_run_prints_run_dir(tmp_path):
     r = _run(["init-run", "--goal", "Add caching", "--base-dir", str(tmp_path)])
     assert r.returncode == 0, r.stderr
@@ -62,10 +108,8 @@ def test_full_dry_run_flow(tmp_path):
     r = _run(["next", "--run", run_dir])
     assert r.stdout.strip() == "a"
 
-    vfile = Path(tmp_path) / "v.json"
-    vfile.write_text(json.dumps({"gate": "dep:a", "round": 1, "verdict": "APPROVE", "summary": "ok", "findings": []}))
-    r = _run(["verdict", "--run", run_dir, "--gate", "dep:a", "--round", "1", "--max-rounds", "5", "--file", str(vfile)])
-    assert "CONSENSUS" in r.stdout
+    r = _run_bound_verdict(tmp_path, run_dir, "dep:a", 1, "APPROVE", payload="impl a", max_rounds=5)
+    assert "CONSENSUS" in r.stdout, r.stdout + r.stderr
 
     r = _run(["set-status", "--run", run_dir, "--node", "a", "--status", "done"])
     assert r.returncode == 0, r.stderr
@@ -77,14 +121,13 @@ def test_full_dry_run_flow(tmp_path):
 
 
 def test_verdict_capped_outcome(tmp_path):
-    r = _run(["init-run", "--goal", "g", "--base-dir", str(tmp_path)])
-    run_dir = r.stdout.strip()
-    vfile = Path(tmp_path) / "v.json"
-    vfile.write_text(json.dumps({
-        "gate": "plan", "round": 1, "verdict": "REQUEST_CHANGES", "summary": "still broken",
-        "findings": [{"id": "F1", "severity": "blocker", "location": "x", "claim": "c", "suggestion": "s"}],
-    }))
-    r = _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1", "--max-rounds", "1", "--file", str(vfile)])
+    run_dir = _init(tmp_path)
+    _load(run_dir, tmp_path, {"a": "pending"})
+    r = _run_bound_verdict(
+        tmp_path, run_dir, "plan", 1, "REQUEST_CHANGES",
+        findings=[{"id": "F1", "severity": "blocker", "location": "x", "claim": "c", "suggestion": "s"}],
+        max_rounds=1,
+    )
     assert "CAPPED" in r.stdout
 
 
@@ -93,12 +136,12 @@ def test_verdict_proceed_with_flags_outcome(tmp_path):
     cfg.write_text(json.dumps({"on_cap": "proceed_with_flags"}))
     r = _run(["init-run", "--goal", "g", "--base-dir", str(tmp_path), "--config", str(cfg)])
     run_dir = r.stdout.strip()
-    vfile = Path(tmp_path) / "v.json"
-    vfile.write_text(json.dumps({
-        "gate": "plan", "round": 1, "verdict": "REQUEST_CHANGES", "summary": "unresolved",
-        "findings": [{"id": "F1", "severity": "blocker", "location": "x", "claim": "c", "suggestion": "s"}],
-    }))
-    r = _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1", "--max-rounds", "1", "--file", str(vfile)])
+    _load(run_dir, tmp_path, {"a": "pending"})
+    r = _run_bound_verdict(
+        tmp_path, run_dir, "plan", 1, "REQUEST_CHANGES",
+        findings=[{"id": "F1", "severity": "blocker", "location": "x", "claim": "c", "suggestion": "s"}],
+        max_rounds=1,
+    )
     assert r.returncode == 0, r.stderr
     assert "PROCEED_WITH_FLAGS" in r.stdout
     events = [json.loads(l) for l in (Path(run_dir) / "runlog.jsonl").read_text().splitlines() if l.strip()]
@@ -123,29 +166,25 @@ def test_verdict_rejects_round_jumped_ahead(tmp_path):
 def test_verdict_rejects_repeated_round(tmp_path):
     # Round 1 CHANGES then a second round-1 verdict is refused (expected 2) — no infinite round 1.
     run_dir = _init(tmp_path)
+    _load(run_dir, tmp_path, {"a": "pending"})
+    blocker = [{"id": "F1", "severity": "blocker", "location": "x", "claim": "c", "suggestion": "s"}]
+    assert _run_bound_verdict(tmp_path, run_dir, "plan", 1, "REQUEST_CHANGES",
+                              findings=blocker).stdout.strip() == "CHANGES"
+    # A repeat round-1 verdict fails the derived-round check (before the binding handshake).
     v1 = Path(tmp_path) / "v1.json"
     v1.write_text(json.dumps({"gate": "plan", "round": 1, "verdict": "REQUEST_CHANGES",
-                              "summary": "x", "findings": [{"id": "F1", "severity": "blocker",
-                              "location": "x", "claim": "c", "suggestion": "s"}]}))
-    assert _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1",
-                 "--file", str(v1)]).stdout.strip() == "CHANGES"
+                              "summary": "x", "findings": blocker}))
     r = _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1", "--file", str(v1)])
     assert r.returncode != 0 and "expected round 2" in r.stderr
 
 
 def test_verdict_accepts_consecutive_rounds(tmp_path):
     run_dir = _init(tmp_path)
-    v1 = Path(tmp_path) / "v1.json"
-    v1.write_text(json.dumps({"gate": "plan", "round": 1, "verdict": "REQUEST_CHANGES",
-                              "summary": "x", "findings": [{"id": "F1", "severity": "blocker",
-                              "location": "x", "claim": "c", "suggestion": "s"}]}))
-    assert _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1",
-                 "--file", str(v1)]).stdout.strip() == "CHANGES"
-    v2 = Path(tmp_path) / "v2.json"
-    v2.write_text(json.dumps({"gate": "plan", "round": 2, "verdict": "APPROVE",
-                              "summary": "ok", "findings": []}))
-    assert _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "2",
-                 "--file", str(v2)]).stdout.strip() == "CONSENSUS"
+    _load(run_dir, tmp_path, {"a": "pending"})
+    blocker = [{"id": "F1", "severity": "blocker", "location": "x", "claim": "c", "suggestion": "s"}]
+    assert _run_bound_verdict(tmp_path, run_dir, "plan", 1, "REQUEST_CHANGES",
+                              findings=blocker).stdout.strip() == "CHANGES"
+    assert _run_bound_verdict(tmp_path, run_dir, "plan", 2, "APPROVE").stdout.strip() == "CONSENSUS"
 
 
 def test_verdict_expected_round_is_scoped_per_gate(tmp_path):
@@ -153,17 +192,10 @@ def test_verdict_expected_round_is_scoped_per_gate(tmp_path):
     # round of a different gate — dep:a still starts at round 1 (guards per-gate independence).
     run_dir = _init(tmp_path)
     _load(run_dir, tmp_path, {"a": "pending"})
-    vp = Path(tmp_path) / "vp.json"
-    vp.write_text(json.dumps({"gate": "plan", "round": 1, "verdict": "REQUEST_CHANGES",
-                              "summary": "x", "findings": [{"id": "F1", "severity": "blocker",
-                              "location": "x", "claim": "c", "suggestion": "s"}]}))
-    assert _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1",
-                 "--file", str(vp)]).stdout.strip() == "CHANGES"
-    va = Path(tmp_path) / "va.json"
-    va.write_text(json.dumps({"gate": "dep:a", "round": 1, "verdict": "APPROVE",
-                              "summary": "ok", "findings": []}))
-    assert _run(["verdict", "--run", run_dir, "--gate", "dep:a", "--round", "1",
-                 "--file", str(va)]).stdout.strip() == "CONSENSUS"
+    blocker = [{"id": "F1", "severity": "blocker", "location": "x", "claim": "c", "suggestion": "s"}]
+    assert _run_bound_verdict(tmp_path, run_dir, "plan", 1, "REQUEST_CHANGES",
+                              findings=blocker).stdout.strip() == "CHANGES"
+    assert _run_bound_verdict(tmp_path, run_dir, "dep:a", 1, "APPROVE").stdout.strip() == "CONSENSUS"
 
 
 def test_log_appends_full_payload(tmp_path):
@@ -262,13 +294,12 @@ def test_verdict_cap_from_config_when_max_rounds_omitted(tmp_path):
     cfg.write_text(json.dumps({"max_rounds_plan": 1}))
     r = _run(["init-run", "--goal", "g", "--base-dir", str(tmp_path), "--config", str(cfg)])
     run_dir = r.stdout.strip()
-    vfile = Path(tmp_path) / "v.json"
-    vfile.write_text(json.dumps({
-        "gate": "plan", "round": 1, "verdict": "REQUEST_CHANGES", "summary": "x",
-        "findings": [{"id": "F1", "severity": "blocker", "location": "x", "claim": "c", "suggestion": "s"}],
-    }))
+    _load(run_dir, tmp_path, {"a": "pending"})
     # no --max-rounds: cap should come from config (max_rounds_plan=1) -> CAPPED at round 1
-    r = _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1", "--file", str(vfile)])
+    r = _run_bound_verdict(
+        tmp_path, run_dir, "plan", 1, "REQUEST_CHANGES",
+        findings=[{"id": "F1", "severity": "blocker", "location": "x", "claim": "c", "suggestion": "s"}],
+    )
     assert "CAPPED" in r.stdout, r.stdout + r.stderr
 
 
@@ -283,16 +314,15 @@ def test_verdict_rejects_gate_mismatch(tmp_path):
 
 
 def test_verdict_resolutions_and_raw_are_logged(tmp_path):
-    r = _run(["init-run", "--goal", "g", "--base-dir", str(tmp_path)])
-    run_dir = r.stdout.strip()
-    vfile = Path(tmp_path) / "v.json"
-    vfile.write_text(json.dumps({
-        "gate": "plan", "round": 1, "verdict": "REQUEST_CHANGES", "summary": "x",
-        "findings": [{"id": "F1", "severity": "major", "location": "x", "claim": "c", "suggestion": "s"}],
-    }))
+    run_dir = _init(tmp_path)
+    _load(run_dir, tmp_path, {"a": "pending"})
     res = Path(tmp_path) / "res.json"
     res.write_text(json.dumps({"F1": {"resolution": "wontfix", "rationale": "r"}}))
-    r = _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1", "--file", str(vfile), "--resolutions", str(res)])
+    r = _run_bound_verdict(
+        tmp_path, run_dir, "plan", 1, "REQUEST_CHANGES",
+        findings=[{"id": "F1", "severity": "major", "location": "x", "claim": "c", "suggestion": "s"}],
+        resolutions=str(res),
+    )
     assert "CONSENSUS" in r.stdout, r.stdout + r.stderr
     events = [json.loads(l) for l in (Path(run_dir) / "runlog.jsonl").read_text().splitlines() if l.strip()]
     kinds = [e["event"] for e in events]
@@ -384,6 +414,19 @@ def _load(run_dir, tmp_path, nodes, edges=None):
                            "--rationale", "fixture scaffolding"])
                 assert sr.returncode == 0, sr.stderr
     return r
+
+
+def _legacy_run(tmp_path):
+    """A schema-2 run downgraded to legacy: its run_start no longer records a schema_version, so
+    the CLI must refuse to mutate or certify it (but reads/config stay intact)."""
+    run_dir = _init(tmp_path)
+    log = Path(run_dir) / "runlog.jsonl"
+    events = [json.loads(l) for l in log.read_text().splitlines() if l.strip()]
+    for e in events:
+        if e.get("event") == "run_start":
+            e.pop("schema_version", None)
+    log.write_text("".join(json.dumps(e) + "\n" for e in events))
+    return run_dir
 
 
 def test_load_dag_rejects_empty(tmp_path):
@@ -667,11 +710,9 @@ def _approve_plan(tmp_path):
     run_dir = _init(tmp_path)
     df = Path(tmp_path) / "d.json"; df.write_text(json.dumps(_two_node_dag()))
     _run(["load-dag", "--run", run_dir, "--file", str(df)])
-    plan = Path(tmp_path) / "plan.md"; plan.write_text("# Final plan\nDo the thing.")
-    _run(["log", "--run", run_dir, "--event", "builder_output", "--gate", "plan", "--round", "1", "--file", str(plan)])
-    v = Path(tmp_path) / "v.json"
-    v.write_text(json.dumps({"gate": "plan", "round": 1, "verdict": "APPROVE", "summary": "ok", "findings": []}))
-    _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1", "--file", str(v)])
+    r = _run_bound_verdict(tmp_path, run_dir, "plan", 1, "APPROVE",
+                           payload="# Final plan\nDo the thing.")
+    assert r.stdout.strip() == "CONSENSUS", r.stdout + r.stderr
     return run_dir
 
 
@@ -693,16 +734,17 @@ def test_show_plan_requires_plan_consensus(tmp_path):
 
 
 def test_show_plan_renders_approved_not_latest(tmp_path):
-    # show-plan must render the plan approved at the consensus round, not a later edit.
+    # show-plan must render the plan approved at consensus, bound by artifact hash — never a later
+    # edit. Under the binding handshake a post-consensus builder_output is itself rejected (the plan
+    # gate is terminal), so the unapproved edit can never even be recorded.
     run_dir = _init(tmp_path)
     _load(run_dir, tmp_path, {"a": "pending"})
-    p1 = Path(tmp_path) / "p1.md"; p1.write_text("APPROVED PLAN v1")
-    _run(["log", "--run", run_dir, "--event", "builder_output", "--gate", "plan", "--round", "1", "--file", str(p1)])
-    vok = Path(tmp_path) / "vok.json"
-    vok.write_text(json.dumps({"gate": "plan", "round": 1, "verdict": "APPROVE", "summary": "ok", "findings": []}))
-    assert _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1", "--file", str(vok)]).stdout.strip() == "CONSENSUS"
+    assert _run_bound_verdict(tmp_path, run_dir, "plan", 1, "APPROVE",
+                              payload="APPROVED PLAN v1").stdout.strip() == "CONSENSUS"
     p2 = Path(tmp_path) / "p2.md"; p2.write_text("UNAPPROVED PLAN v2")
-    _run(["log", "--run", run_dir, "--event", "builder_output", "--gate", "plan", "--round", "99", "--file", str(p2)])
+    late = _run(["log", "--run", run_dir, "--event", "builder_output", "--gate", "plan",
+                 "--round", "99", "--file", str(p2)])
+    assert late.returncode != 0  # a post-consensus artifact cannot be logged to a terminal gate
     out = _run(["show-plan", "--run", run_dir]).stdout
     assert "APPROVED PLAN v1" in out and "UNAPPROVED PLAN v2" not in out
 
@@ -711,29 +753,29 @@ def test_show_plan_refuses_capped_plan_gate(tmp_path):
     # A CAPPED (halt) plan gate is not an approval — show-plan must refuse, not print "Approved".
     run_dir = _init(tmp_path)
     _load(run_dir, tmp_path, {"a": "pending"})
-    vcap = Path(tmp_path) / "vcap.json"
-    vcap.write_text(json.dumps({"gate": "plan", "round": 1, "verdict": "REQUEST_CHANGES",
-                    "summary": "blk", "findings": [{"id": "F1", "severity": "blocker",
-                    "location": "x", "claim": "c", "suggestion": "s"}]}))
-    assert "CAPPED" in _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1",
-                             "--max-rounds", "1", "--file", str(vcap)]).stdout
+    assert "CAPPED" in _run_bound_verdict(
+        tmp_path, run_dir, "plan", 1, "REQUEST_CHANGES",
+        findings=[{"id": "F1", "severity": "blocker", "location": "x", "claim": "c", "suggestion": "s"}],
+        max_rounds=1,
+    ).stdout
     r = _run(["show-plan", "--run", run_dir])
     assert r.returncode != 0
     assert "Approved plan" not in r.stdout
 
 
-def test_show_plan_no_preconsensus_plan_does_not_show_later_edit(tmp_path):
-    # F1 edge case: consensus with a loaded DAG but NO pre-consensus builder_output, then a
-    # post-consensus round-99 edit -> show-plan must NOT print the later unapproved payload.
+def test_plan_consensus_requires_a_pre_consensus_artifact(tmp_path):
+    # Under the binding handshake a PLAN gate cannot reach consensus without a bound Builder
+    # artifact: the verdict handshake requires one, so the old "no pre-consensus plan" placeholder
+    # path is unreachable via the CLI. A bindingless plan verdict is refused before any log append.
     run_dir = _init(tmp_path)
     _load(run_dir, tmp_path, {"a": "pending"})
     vok = Path(tmp_path) / "vok.json"
-    vok.write_text(json.dumps({"gate": "plan", "round": 1, "verdict": "APPROVE", "summary": "ok", "findings": []}))
-    assert _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1", "--file", str(vok)]).stdout.strip() == "CONSENSUS"
-    p2 = Path(tmp_path) / "p2.md"; p2.write_text("UNAPPROVED LATE PLAN")
-    _run(["log", "--run", run_dir, "--event", "builder_output", "--gate", "plan", "--round", "99", "--file", str(p2)])
-    out = _run(["show-plan", "--run", run_dir]).stdout
-    assert "UNAPPROVED LATE PLAN" not in out and "no plan artifact logged" in out
+    vok.write_text(json.dumps({"gate": "plan", "round": 1, "verdict": "APPROVE",
+                               "summary": "ok", "findings": []}))
+    r = _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1", "--file", str(vok)])
+    assert r.returncode != 0
+    assert "builder" in r.stderr.lower() or "binding" in r.stderr.lower()
+    assert "gate_consensus" not in [e["event"] for e in _events(run_dir)]
 
 
 def test_show_plan_allowed_after_proceed_with_flags(tmp_path):
@@ -741,13 +783,11 @@ def test_show_plan_allowed_after_proceed_with_flags(tmp_path):
     cfg = Path(tmp_path) / "c.json"; cfg.write_text(json.dumps({"on_cap": "proceed_with_flags"}))
     run_dir = _run(["init-run", "--goal", "g", "--base-dir", str(tmp_path), "--config", str(cfg)]).stdout.strip()
     _load(run_dir, tmp_path, {"a": "pending"})
-    plan = Path(tmp_path) / "plan.md"; plan.write_text("PROCEEDED PLAN")
-    _run(["log", "--run", run_dir, "--event", "builder_output", "--gate", "plan", "--round", "1", "--file", str(plan)])
-    vpf = Path(tmp_path) / "vpf.json"
-    vpf.write_text(json.dumps({"gate": "plan", "round": 1, "verdict": "REQUEST_CHANGES", "summary": "x",
-                   "findings": [{"id": "F1", "severity": "blocker", "location": "x", "claim": "c", "suggestion": "s"}]}))
-    assert "PROCEED_WITH_FLAGS" in _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1",
-                                         "--max-rounds", "1", "--file", str(vpf)]).stdout
+    assert "PROCEED_WITH_FLAGS" in _run_bound_verdict(
+        tmp_path, run_dir, "plan", 1, "REQUEST_CHANGES", payload="PROCEEDED PLAN",
+        findings=[{"id": "F1", "severity": "blocker", "location": "x", "claim": "c", "suggestion": "s"}],
+        max_rounds=1,
+    ).stdout
     r = _run(["show-plan", "--run", run_dir])
     assert r.returncode == 0, r.stderr
     assert "PROCEEDED PLAN" in r.stdout
@@ -761,13 +801,8 @@ def test_verdict_echoes_plan_and_dag_to_stderr_on_plan_consensus(tmp_path):
     run_dir = _init(tmp_path)
     df = Path(tmp_path) / "d.json"; df.write_text(json.dumps(_two_node_dag()))
     _run(["load-dag", "--run", run_dir, "--file", str(df)])
-    plan = Path(tmp_path) / "plan.md"; plan.write_text("# Final plan\nDo the thing.")
-    _run(["log", "--run", run_dir, "--event", "builder_output", "--gate", "plan",
-          "--round", "1", "--file", str(plan)])
-    v = Path(tmp_path) / "v.json"
-    v.write_text(json.dumps({"gate": "plan", "round": 1, "verdict": "APPROVE",
-                             "summary": "ok", "findings": []}))
-    r = _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1", "--file", str(v)])
+    r = _run_bound_verdict(tmp_path, run_dir, "plan", 1, "APPROVE",
+                           payload="# Final plan\nDo the thing.")
     assert r.returncode == 0, r.stderr
     assert r.stdout.strip() == "CONSENSUS"          # outcome token stays alone on stdout
     assert "Approved plan" in r.stderr              # plan echoed to stderr at settlement
@@ -784,11 +819,10 @@ def test_verdict_plan_changes_does_not_echo_plan(tmp_path):
     # A non-settling plan outcome (CHANGES) must NOT echo the approved plan/DAG.
     run_dir = _init(tmp_path)
     _load_two_node_dag(tmp_path, run_dir)
-    v = Path(tmp_path) / "v.json"
-    v.write_text(json.dumps({"gate": "plan", "round": 1, "verdict": "REQUEST_CHANGES",
-                             "summary": "no", "findings": [{"id": "F1", "severity": "blocker",
-                             "location": "x", "claim": "c", "suggestion": "s"}]}))
-    r = _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1", "--file", str(v)])
+    r = _run_bound_verdict(
+        tmp_path, run_dir, "plan", 1, "REQUEST_CHANGES",
+        findings=[{"id": "F1", "severity": "blocker", "location": "x", "claim": "c", "suggestion": "s"}],
+    )
     assert r.returncode == 0, r.stderr
     assert r.stdout.strip() == "CHANGES"
     assert "Approved plan" not in (r.stdout + r.stderr)
@@ -801,15 +835,11 @@ def test_verdict_plan_proceed_with_flags_echoes_plan(tmp_path):
     r0 = _run(["init-run", "--goal", "g", "--base-dir", str(tmp_path), "--config", str(cfg)])
     run_dir = r0.stdout.strip()
     _load_two_node_dag(tmp_path, run_dir)
-    plan = Path(tmp_path) / "plan.md"; plan.write_text("# Final plan\nProceed body.")
-    _run(["log", "--run", run_dir, "--event", "builder_output", "--gate", "plan",
-          "--round", "1", "--file", str(plan)])
-    v = Path(tmp_path) / "v.json"
-    v.write_text(json.dumps({"gate": "plan", "round": 1, "verdict": "REQUEST_CHANGES",
-                             "summary": "unresolved", "findings": [{"id": "F1", "severity": "blocker",
-                             "location": "x", "claim": "c", "suggestion": "s"}]}))
-    r = _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1", "--max-rounds", "1",
-              "--file", str(v)])
+    r = _run_bound_verdict(
+        tmp_path, run_dir, "plan", 1, "REQUEST_CHANGES", payload="# Final plan\nProceed body.",
+        findings=[{"id": "F1", "severity": "blocker", "location": "x", "claim": "c", "suggestion": "s"}],
+        max_rounds=1,
+    )
     assert r.returncode == 0, r.stderr
     assert "PROCEED_WITH_FLAGS" in r.stdout
     assert "Approved plan" in r.stderr and "Proceed body." in r.stderr
@@ -821,12 +851,11 @@ def test_verdict_plan_capped_does_not_echo_plan(tmp_path):
     # CAPPED (halt) does not advance past the gate, so it must NOT echo the approved plan/DAG.
     run_dir = _init(tmp_path)
     _load_two_node_dag(tmp_path, run_dir)
-    v = Path(tmp_path) / "v.json"
-    v.write_text(json.dumps({"gate": "plan", "round": 1, "verdict": "REQUEST_CHANGES",
-                             "summary": "still broken", "findings": [{"id": "F1", "severity": "blocker",
-                             "location": "x", "claim": "c", "suggestion": "s"}]}))
-    r = _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1", "--max-rounds", "1",
-              "--file", str(v)])
+    r = _run_bound_verdict(
+        tmp_path, run_dir, "plan", 1, "REQUEST_CHANGES",
+        findings=[{"id": "F1", "severity": "blocker", "location": "x", "claim": "c", "suggestion": "s"}],
+        max_rounds=1,
+    )
     assert "CAPPED" in r.stdout
     assert "Approved plan" not in (r.stdout + r.stderr)
     assert "Dependency tree" not in (r.stdout + r.stderr)
@@ -836,55 +865,61 @@ def test_verdict_dep_gate_consensus_does_not_echo_plan(tmp_path):
     # The echo is PLAN-gate only: a dependency gate reaching consensus must not echo the plan.
     run_dir = _init(tmp_path)
     _load_two_node_dag(tmp_path, run_dir)          # node "a" exists so dep:a is a real gate
-    v = Path(tmp_path) / "v.json"
-    v.write_text(json.dumps({"gate": "dep:a", "round": 1, "verdict": "APPROVE",
-                             "summary": "ok", "findings": []}))
-    r = _run(["verdict", "--run", run_dir, "--gate", "dep:a", "--round", "1", "--file", str(v)])
+    r = _run_bound_verdict(tmp_path, run_dir, "dep:a", 1, "APPROVE")
     assert r.returncode == 0, r.stderr
     assert r.stdout.strip() == "CONSENSUS"
     assert "Approved plan" not in (r.stdout + r.stderr)
 
 
-def test_verdict_plan_consensus_without_dag_does_not_crash_or_echo(tmp_path):
-    # verdict is decoupled from the DAG: a plan gate may settle with no DAG loaded. The echo is
-    # best-effort — it must skip silently (no crash, no masking placeholder) when absent.
+def test_verdict_plan_requires_a_loaded_dag_for_bindings(tmp_path):
+    # verdict binds a plan decision to the DAG: with NO DAG loaded, bindings cannot be computed, so
+    # the verdict is refused (replaces the old "PLAN consensus without a DAG succeeds" expectation).
     run_dir = _init(tmp_path)                       # deliberately NO load-dag
+    plan = Path(tmp_path) / "p.md"; plan.write_text("plan body")
+    assert _run(["log", "--run", run_dir, "--event", "builder_output", "--gate", "plan",
+                 "--round", "1", "--file", str(plan)]).returncode == 0
     v = Path(tmp_path) / "v.json"
     v.write_text(json.dumps({"gate": "plan", "round": 1, "verdict": "APPROVE",
                              "summary": "ok", "findings": []}))
     r = _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1", "--file", str(v)])
-    assert r.returncode == 0, r.stderr
-    assert r.stdout.strip() == "CONSENSUS"
-    assert "Approved plan" not in (r.stdout + r.stderr)
-    assert "no dependency tree" not in (r.stdout + r.stderr).lower()  # no masking placeholder
+    assert r.returncode != 0
+    assert "dependency tree" in r.stderr.lower() or "load-dag" in r.stderr.lower()
+    assert "gate_consensus" not in [e["event"] for e in _events(run_dir)]
 
 
-# --- robust dag.json reads: the echo/validator never crash on a bad dag.json ---
+# --- robust dag.json reads: the binding handshake rejects a bad dag.json cleanly ---
 
-def test_verdict_plan_echo_survives_corrupt_dag(tmp_path):
-    # #6: a corrupt dag.json at settlement must NOT turn a concluded plan gate into a failure.
+def test_verdict_plan_rejects_corrupt_dag_binding(tmp_path):
+    # A corrupt dag.json at verdict time cannot be bound, so the plan verdict is refused cleanly
+    # (no consensus, nothing logged) rather than certifying an unreadable tree.
     run_dir = _init(tmp_path)
     _load(run_dir, tmp_path, {"a": "pending"})
+    plan = Path(tmp_path) / "p.md"; plan.write_text("plan body")
+    assert _run(["log", "--run", run_dir, "--event", "builder_output", "--gate", "plan",
+                 "--round", "1", "--file", str(plan)]).returncode == 0
     (Path(run_dir) / "dag.json").write_text("CORRUPT{{{")          # break it after load
     v = Path(tmp_path) / "v.json"
     v.write_text(json.dumps({"gate": "plan", "round": 1, "verdict": "APPROVE", "summary": "ok", "findings": []}))
     r = _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1", "--file", str(v)])
-    assert r.returncode == 0, r.stderr           # concluded gate does not report failure
-    assert r.stdout.strip() == "CONSENSUS"
-    assert [e["event"] for e in _events(run_dir)].count("gate_consensus") == 1
+    assert r.returncode != 0
+    assert r.stderr.startswith("crucible:") and "Traceback" not in r.stderr
+    assert "gate_consensus" not in [e["event"] for e in _events(run_dir)]
 
 
-def test_verdict_plan_echo_survives_malformed_dag_missing_id(tmp_path):
-    # #6/F1: a malformed-but-valid-JSON dag.json (node missing "id" -> KeyError in DAG.from_dict)
-    # must also not fail a concluded plan gate.
+def test_verdict_plan_rejects_malformed_dag_binding(tmp_path):
+    # A malformed-but-valid-JSON dag.json (node missing "id") cannot be bound either — refused cleanly.
     run_dir = _init(tmp_path)
     _load(run_dir, tmp_path, {"a": "pending"})
+    plan = Path(tmp_path) / "p.md"; plan.write_text("plan body")
+    assert _run(["log", "--run", run_dir, "--event", "builder_output", "--gate", "plan",
+                 "--round", "1", "--file", str(plan)]).returncode == 0
     (Path(run_dir) / "dag.json").write_text(json.dumps({"nodes": [{"title": "x"}], "edges": []}))
     v = Path(tmp_path) / "v.json"
     v.write_text(json.dumps({"gate": "plan", "round": 1, "verdict": "APPROVE", "summary": "ok", "findings": []}))
     r = _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1", "--file", str(v)])
-    assert r.returncode == 0, r.stderr
-    assert r.stdout.strip() == "CONSENSUS"
+    assert r.returncode != 0
+    assert r.stderr.startswith("crucible:") and "Traceback" not in r.stderr
+    assert "gate_consensus" not in [e["event"] for e in _events(run_dir)]
 
 
 def test_verdict_dep_gate_clean_error_on_malformed_dag(tmp_path):
@@ -1179,10 +1214,7 @@ def test_verdict_rejects_invalid_gate_name(tmp_path):
 
 def test_verdict_accepts_reproduce_gate(tmp_path):
     run_dir = _init(tmp_path)
-    vfile = Path(tmp_path) / "v.json"
-    vfile.write_text(json.dumps({"gate": "reproduce", "round": 1, "verdict": "APPROVE",
-                                 "summary": "bug reproduced", "findings": []}))
-    r = _run(["verdict", "--run", run_dir, "--gate", "reproduce", "--round", "1", "--file", str(vfile)])
+    r = _run_bound_verdict(tmp_path, run_dir, "reproduce", 1, "APPROVE", payload="bug reproduced")
     assert r.returncode == 0, r.stderr
     assert r.stdout.strip() == "CONSENSUS"
 
@@ -1192,22 +1224,20 @@ def test_reproduce_gate_halts_even_with_proceed_with_flags(tmp_path):
     cfg = Path(tmp_path) / "c.json"
     cfg.write_text(json.dumps({"on_cap": "proceed_with_flags", "max_rounds_plan": 1}))
     run_dir = _run(["init-run", "--goal", "g", "--base-dir", str(tmp_path), "--config", str(cfg)]).stdout.strip()
-    vfile = Path(tmp_path) / "v.json"
-    vfile.write_text(json.dumps({"gate": "reproduce", "round": 1, "verdict": "REQUEST_CHANGES", "summary": "no repro",
-                                 "findings": [{"id": "F1", "severity": "blocker", "location": "x", "claim": "c", "suggestion": "s"}]}))
-    r = _run(["verdict", "--run", run_dir, "--gate", "reproduce", "--round", "1", "--file", str(vfile)])
+    r = _run_bound_verdict(
+        tmp_path, run_dir, "reproduce", 1, "REQUEST_CHANGES", payload="no repro",
+        findings=[{"id": "F1", "severity": "blocker", "location": "x", "claim": "c", "suggestion": "s"}],
+    )
     assert r.returncode == 0, r.stderr
     assert r.stdout.strip() == "CAPPED"
     assert not any(e["event"] == "gate_proceeded_with_flags" for e in _events(run_dir))
 
 
 def test_verdict_accepts_final_gate(tmp_path):
-    # `final` is a valid gate (round cap = max_rounds_dep).
+    # `final` is a valid gate (round cap = max_rounds_dep); its bindings require a loaded DAG.
     run_dir = _init(tmp_path)
-    vfile = Path(tmp_path) / "v.json"
-    vfile.write_text(json.dumps({"gate": "final", "round": 1, "verdict": "APPROVE",
-                                 "summary": "ok", "findings": []}))
-    r = _run(["verdict", "--run", run_dir, "--gate", "final", "--round", "1", "--file", str(vfile)])
+    _load(run_dir, tmp_path, {"a": "pending"})
+    r = _run_bound_verdict(tmp_path, run_dir, "final", 1, "APPROVE", payload="whole implementation")
     assert r.returncode == 0, r.stderr
     assert r.stdout.strip() == "CONSENSUS"
 
@@ -1297,10 +1327,7 @@ def test_verdict_dep_gate_requires_loaded_dag(tmp_path):
 def test_verdict_valid_dep_node_still_works(tmp_path):
     run_dir = _init(tmp_path)
     _load(run_dir, tmp_path, {"a": "pending"})
-    vfile = Path(tmp_path) / "v.json"
-    vfile.write_text(json.dumps({"gate": "dep:a", "round": 1, "verdict": "APPROVE",
-                                 "summary": "ok", "findings": []}))
-    r = _run(["verdict", "--run", run_dir, "--gate", "dep:a", "--round", "1", "--file", str(vfile)])
+    r = _run_bound_verdict(tmp_path, run_dir, "dep:a", 1, "APPROVE")
     assert r.returncode == 0, r.stderr
     assert r.stdout.strip() == "CONSENSUS"
 
@@ -1361,11 +1388,7 @@ def test_set_status_done_refused_without_accepted_gate(tmp_path):
 def test_set_status_done_allowed_after_gate_consensus(tmp_path):
     run_dir = _init(tmp_path)
     _load(run_dir, tmp_path, {"a": "pending"})
-    v = Path(tmp_path) / "v.json"
-    v.write_text(json.dumps({"gate": "dep:a", "round": 1, "verdict": "APPROVE",
-                             "summary": "ok", "findings": []}))
-    assert _run(["verdict", "--run", run_dir, "--gate", "dep:a", "--round", "1",
-                 "--file", str(v)]).stdout.strip() == "CONSENSUS"
+    assert _run_bound_verdict(tmp_path, run_dir, "dep:a", 1, "APPROVE").stdout.strip() == "CONSENSUS"
     assert _run(["set-status", "--run", run_dir, "--node", "a", "--status", "done"]).returncode == 0
 
 
@@ -1374,24 +1397,22 @@ def test_set_status_done_allowed_after_proceed_with_flags(tmp_path):
     r0 = _run(["init-run", "--goal", "g", "--base-dir", str(tmp_path), "--config", str(cfg)])
     run_dir = r0.stdout.strip()
     _load(run_dir, tmp_path, {"a": "pending"})
-    v = Path(tmp_path) / "v.json"
-    v.write_text(json.dumps({"gate": "dep:a", "round": 1, "verdict": "REQUEST_CHANGES",
-                             "summary": "x", "findings": [{"id": "F1", "severity": "blocker",
-                             "location": "x", "claim": "c", "suggestion": "s"}]}))
-    assert "PROCEED_WITH_FLAGS" in _run(["verdict", "--run", run_dir, "--gate", "dep:a",
-        "--round", "1", "--max-rounds", "1", "--file", str(v)]).stdout
+    assert "PROCEED_WITH_FLAGS" in _run_bound_verdict(
+        tmp_path, run_dir, "dep:a", 1, "REQUEST_CHANGES",
+        findings=[{"id": "F1", "severity": "blocker", "location": "x", "claim": "c", "suggestion": "s"}],
+        max_rounds=1,
+    ).stdout
     assert _run(["set-status", "--run", run_dir, "--node", "a", "--status", "done"]).returncode == 0
 
 
 def test_set_status_done_refused_after_gate_capped(tmp_path):
     run_dir = _init(tmp_path)
     _load(run_dir, tmp_path, {"a": "pending"})
-    v = Path(tmp_path) / "v.json"
-    v.write_text(json.dumps({"gate": "dep:a", "round": 1, "verdict": "REQUEST_CHANGES",
-                             "summary": "x", "findings": [{"id": "F1", "severity": "blocker",
-                             "location": "x", "claim": "c", "suggestion": "s"}]}))
-    assert "CAPPED" in _run(["verdict", "--run", run_dir, "--gate", "dep:a", "--round", "1",
-                             "--max-rounds", "1", "--file", str(v)]).stdout
+    assert "CAPPED" in _run_bound_verdict(
+        tmp_path, run_dir, "dep:a", 1, "REQUEST_CHANGES",
+        findings=[{"id": "F1", "severity": "blocker", "location": "x", "claim": "c", "suggestion": "s"}],
+        max_rounds=1,
+    ).stdout
     r = _run(["set-status", "--run", run_dir, "--node", "a", "--status", "done"])
     assert r.returncode != 0 and "consensus" in r.stderr.lower()
 
@@ -1435,11 +1456,9 @@ def test_set_status_force_does_not_bypass_dependency_check(tmp_path):
 def test_verdict_rejects_already_concluded_gate(tmp_path):
     # C3: once a gate logs a terminal outcome, a second verdict must not silently rewrite it.
     run_dir = _init(tmp_path)
-    vfile = Path(tmp_path) / "v.json"
-    vfile.write_text(json.dumps({"gate": "plan", "round": 1, "verdict": "APPROVE",
-                                 "summary": "first", "findings": []}))
-    assert _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1",
-                 "--file", str(vfile)]).stdout.strip() == "CONSENSUS"
+    _load(run_dir, tmp_path, {"a": "pending"})
+    assert _run_bound_verdict(tmp_path, run_dir, "plan", 1, "APPROVE").stdout.strip() == "CONSENSUS"
+    # A second verdict on the concluded gate is refused before the round/binding handshake.
     v2 = Path(tmp_path) / "v2.json"
     v2.write_text(json.dumps({"gate": "plan", "round": 2, "verdict": "APPROVE",
                               "summary": "second", "findings": []}))
@@ -1472,14 +1491,14 @@ def test_verdict_rejects_defer_of_blocking_finding(tmp_path):
 def test_verdict_defer_of_minor_finding_is_allowed(tmp_path):
     # The legitimate case: a minor (deferrable) finding can be deferred and clears the gate.
     run_dir = _init(tmp_path)
-    vfile = Path(tmp_path) / "v.json"
-    vfile.write_text(json.dumps({
-        "gate": "plan", "round": 1, "verdict": "APPROVE", "summary": "x",
-        "findings": [{"id": "F1", "severity": "minor", "location": "x", "claim": "c", "suggestion": "s"}]}))
+    _load(run_dir, tmp_path, {"a": "pending"})
     res = Path(tmp_path) / "res.json"
     res.write_text(json.dumps({"F1": {"resolution": "deferred", "rationale": "r"}}))
-    r = _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1",
-              "--file", str(vfile), "--resolutions", str(res)])
+    r = _run_bound_verdict(
+        tmp_path, run_dir, "plan", 1, "APPROVE",
+        findings=[{"id": "F1", "severity": "minor", "location": "x", "claim": "c", "suggestion": "s"}],
+        resolutions=str(res),
+    )
     assert r.returncode == 0, r.stderr
     assert r.stdout.strip() == "CONSENSUS"
 
@@ -1518,3 +1537,169 @@ def test_critic_lenses_fail_closed_on_missing_file(tmp_path):
     r = _run(["critic-lenses", "--run", run_dir])
     assert r.returncode != 0
     assert "crucible:" in r.stderr and "not found" in r.stderr
+
+
+# --- Task 2: the binding handshake (log -> bindings -> verdict) ----------------
+
+def test_bindings_command_emits_plan_hashes(tmp_path):
+    run_dir = _init(tmp_path)
+    _load(run_dir, tmp_path, {"a": "pending"})
+    plan = tmp_path / "plan.txt"
+    plan.write_text("reviewed plan")
+    logged = _run([
+        "log", "--run", run_dir, "--event", "builder_output",
+        "--gate", "plan", "--round", "1", "--file", str(plan),
+    ])
+    assert logged.returncode == 0, logged.stderr
+    result = _run(["bindings", "--run", run_dir, "--gate", "plan", "--round", "1"])
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout)
+    assert set(data) == {"artifact_sha256", "dag_sha256"}
+
+
+def test_bindings_dep_gate_includes_node_hash(tmp_path):
+    run_dir = _init(tmp_path)
+    _load(run_dir, tmp_path, {"a": "pending"})
+    data = _log_artifact_and_get_bindings(run_dir, tmp_path, "dep:a", 1, "impl a")
+    assert set(data) == {"artifact_sha256", "dag_sha256", "node_sha256"}
+
+
+def test_bindings_reproduce_gate_is_artifact_only(tmp_path):
+    run_dir = _init(tmp_path)
+    data = _log_artifact_and_get_bindings(run_dir, tmp_path, "reproduce", 1, "bug repro")
+    assert set(data) == {"artifact_sha256"}
+
+
+def test_bindings_require_a_logged_builder_output(tmp_path):
+    run_dir = _init(tmp_path)
+    _load(run_dir, tmp_path, {"a": "pending"})
+    r = _run(["bindings", "--run", run_dir, "--gate", "plan", "--round", "1"])
+    assert r.returncode != 0
+    assert "builder" in r.stderr.lower()
+
+
+def test_verdict_rejects_missing_or_mismatched_bindings_without_logging(tmp_path):
+    run_dir = _init(tmp_path)
+    _load(run_dir, tmp_path, {"a": "pending"})
+    plan = tmp_path / "plan.txt"
+    plan.write_text("reviewed plan")
+    assert _run([
+        "log", "--run", run_dir, "--event", "builder_output",
+        "--gate", "plan", "--round", "1", "--file", str(plan),
+    ]).returncode == 0
+    bindings = json.loads(_run([
+        "bindings", "--run", run_dir, "--gate", "plan", "--round", "1",
+    ]).stdout)
+    bindings["artifact_sha256"] = "0" * 64
+    verdict = tmp_path / "verdict.json"
+    verdict.write_text(json.dumps({
+        "gate": "plan", "round": 1, "verdict": "APPROVE",
+        "summary": "ok", "findings": [], **bindings,
+    }))
+    result = _run([
+        "verdict", "--run", run_dir, "--gate", "plan",
+        "--round", "1", "--file", str(verdict),
+    ])
+    assert result.returncode != 0
+    assert "binding" in result.stderr.lower()
+    assert "critic_verdict" not in [e["event"] for e in _events(run_dir)]
+
+
+def test_verdict_rejects_absent_binding_field_without_logging(tmp_path):
+    # A verdict that omits a required binding field (dag_sha256) is rejected before any log append.
+    run_dir = _init(tmp_path)
+    _load(run_dir, tmp_path, {"a": "pending"})
+    bindings = _log_artifact_and_get_bindings(run_dir, tmp_path, "plan", 1, "reviewed plan")
+    bindings.pop("dag_sha256")
+    verdict = tmp_path / "verdict.json"
+    verdict.write_text(json.dumps({
+        "gate": "plan", "round": 1, "verdict": "APPROVE",
+        "summary": "ok", "findings": [], **bindings,
+    }))
+    r = _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1", "--file", str(verdict)])
+    assert r.returncode != 0
+    assert "binding" in r.stderr.lower()
+    assert "critic_verdict" not in [e["event"] for e in _events(run_dir)]
+
+
+def test_verdict_rejects_extra_binding_field_without_logging(tmp_path):
+    # A plan gate carries no node_sha256; a verdict that adds one is an over-echo — rejected.
+    run_dir = _init(tmp_path)
+    _load(run_dir, tmp_path, {"a": "pending"})
+    bindings = _log_artifact_and_get_bindings(run_dir, tmp_path, "plan", 1, "reviewed plan")
+    bindings["node_sha256"] = "n" * 64
+    verdict = tmp_path / "verdict.json"
+    verdict.write_text(json.dumps({
+        "gate": "plan", "round": 1, "verdict": "APPROVE",
+        "summary": "ok", "findings": [], **bindings,
+    }))
+    r = _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1", "--file", str(verdict)])
+    assert r.returncode != 0
+    assert "binding" in r.stderr.lower()
+    assert "critic_verdict" not in [e["event"] for e in _events(run_dir)]
+
+
+def test_terminal_and_critic_verdict_events_persist_bindings(tmp_path):
+    # A settled gate must persist the validated bindings on both critic_verdict and the terminal.
+    run_dir = _init(tmp_path)
+    _load(run_dir, tmp_path, {"a": "pending"})
+    bindings = _log_artifact_and_get_bindings(run_dir, tmp_path, "dep:a", 1, "impl a")
+    assert _run_bound_verdict(tmp_path, run_dir, "dep:a", 1, "APPROVE",
+                              payload="impl a").stdout.strip() == "CONSENSUS"
+    events = _events(run_dir)
+    cv = [e for e in events if e["event"] == "critic_verdict"][-1]
+    term = [e for e in events if e["event"] == "gate_consensus"][-1]
+    for key in ("artifact_sha256", "dag_sha256", "node_sha256"):
+        assert cv[key] == bindings[key]
+        assert term[key] == bindings[key]
+
+
+def test_load_dag_records_dag_sha256(tmp_path):
+    run_dir = _init(tmp_path)
+    _load(run_dir, tmp_path, {"a": "pending"})
+    loaded = [e for e in _events(run_dir) if e["event"] == "dag_loaded"][-1]
+    assert len(loaded.get("dag_sha256", "")) == 64
+
+
+# --- Task 2: legacy runs refuse mutation/certification with a fresh-run instruction ----
+
+def test_load_dag_rejects_legacy_run(tmp_path):
+    run_dir = _legacy_run(tmp_path)
+    dagf = Path(tmp_path) / "dag.json"; dagf.write_text(json.dumps(_two_node_dag()))
+    r = _run(["load-dag", "--run", run_dir, "--file", str(dagf)])
+    assert r.returncode != 0
+    assert "legacy" in r.stderr.lower() and "fresh run" in r.stderr.lower()
+
+
+def test_log_rejects_legacy_run(tmp_path):
+    run_dir = _legacy_run(tmp_path)
+    art = Path(tmp_path) / "a.txt"; art.write_text("plan body")
+    r = _run(["log", "--run", run_dir, "--event", "builder_output", "--gate", "plan",
+              "--round", "1", "--file", str(art)])
+    assert r.returncode != 0
+    assert "legacy" in r.stderr.lower() and "fresh run" in r.stderr.lower()
+
+
+def test_bindings_rejects_legacy_run(tmp_path):
+    run_dir = _legacy_run(tmp_path)
+    r = _run(["bindings", "--run", run_dir, "--gate", "plan", "--round", "1"])
+    assert r.returncode != 0
+    assert "legacy" in r.stderr.lower() and "fresh run" in r.stderr.lower()
+
+
+def test_verdict_rejects_legacy_run(tmp_path):
+    run_dir = _legacy_run(tmp_path)
+    v = Path(tmp_path) / "v.json"
+    v.write_text(json.dumps({"gate": "plan", "round": 1, "verdict": "APPROVE",
+                             "summary": "ok", "findings": []}))
+    r = _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1", "--file", str(v)])
+    assert r.returncode != 0
+    assert "legacy" in r.stderr.lower() and "fresh run" in r.stderr.lower()
+    assert "critic_verdict" not in [e["event"] for e in _events(run_dir)]
+
+
+def test_show_plan_rejects_legacy_run(tmp_path):
+    run_dir = _legacy_run(tmp_path)
+    r = _run(["show-plan", "--run", run_dir])
+    assert r.returncode != 0
+    assert "legacy" in r.stderr.lower() and "fresh run" in r.stderr.lower()

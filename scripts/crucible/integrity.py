@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -93,3 +94,102 @@ def require_current_schema(run: RunLog) -> None:
             f"{RUN_SCHEMA_VERSION}); its provenance is unverified and cannot be mutated or "
             f"certified — start a fresh run"
         )
+
+
+@dataclass(frozen=True)
+class BindingSet:
+    """The deterministic content bindings that identify what a gate decision refers to: the exact
+    Builder ``artifact`` plus the relevant ``dag``/``node`` definition. Only ``artifact_sha256`` is
+    always present; ``dag_sha256``/``node_sha256`` are gate-specific (see ``current_bindings``).
+
+    ``to_dict`` drops absent fields so the CLI emits exactly the bindings a gate requires — the same
+    shape the Critic verdict must echo back — with no ``null`` placeholders for a plan's node hash.
+    """
+
+    artifact_sha256: str
+    dag_sha256: str | None = None
+    node_sha256: str | None = None
+
+    def to_dict(self) -> dict[str, str]:
+        return {key: value for key, value in asdict(self).items() if value is not None}
+
+
+def _latest_builder_artifact_sha256(run: RunLog, gate: str, round_index: int) -> str:
+    """Return the recorded ``artifact_sha256`` of the LATEST non-empty ``builder_output`` for the
+    exact ``gate``/``round_index``.
+
+    "Latest" is load-bearing: multiple Builder outputs may be logged in a non-terminal round, and
+    the newest is the candidate the Critic reviews. The lookup is keyed by exact gate AND round so a
+    later round (or a different gate) can never be substituted. Raises ``SystemExit`` when nothing
+    qualifies, when the recorded hash is absent, or when it disagrees with the stored payload bytes
+    (a hand-edited log), so a binding can never rest on a missing or forged artifact identity.
+    """
+    outputs = [
+        event
+        for event in run.read_events()
+        if event.get("event") == "builder_output"
+        and event.get("gate") == gate
+        and event.get("round") == round_index
+        and isinstance(event.get("payload"), str)
+        and event.get("payload")
+    ]
+    if not outputs:
+        raise SystemExit(
+            f"crucible: no non-empty builder artifact logged for gate {gate!r} round "
+            f"{round_index}; log the Builder output before requesting bindings"
+        )
+    latest = outputs[-1]
+    recorded = latest.get("artifact_sha256")
+    if not isinstance(recorded, str) or not recorded:
+        raise SystemExit(
+            f"crucible: builder artifact for gate {gate!r} round {round_index} has no recorded "
+            f"artifact_sha256; re-log it under the current schema"
+        )
+    # The payload is a strict UTF-8 decode of the original artifact bytes, so re-encoding it must
+    # reproduce those bytes. A mismatch means the logged payload or hash was tampered with.
+    if recorded != artifact_sha256(latest["payload"].encode("utf-8")):
+        raise SystemExit(
+            f"crucible: builder artifact for gate {gate!r} round {round_index} does not match its "
+            f"recorded artifact_sha256; the run log was altered — start a fresh run"
+        )
+    return recorded
+
+
+def current_bindings(run: RunLog, gate: str, round_index: int) -> BindingSet:
+    """The exact content bindings the CLI would certify for ``gate``/``round_index`` right now.
+
+    The artifact hash comes from the latest non-empty Builder output for that exact gate/round; the
+    DAG/node hashes are recomputed from the *current* dependency tree. Fields are gate-specific:
+
+    - ``reproduce`` → artifact only;
+    - ``plan`` / ``final`` → artifact + DAG;
+    - ``dep:<id>`` → artifact + DAG + that node.
+
+    Because DAG/node hashes are recomputed live, a plan/DAG/node substituted after the Critic
+    reviewed it yields different bindings — which the verdict handshake and ``set-status`` guard use
+    to reject stale/substituted decisions. Raises ``SystemExit`` when a required DAG is absent or the
+    ``dep:`` node is unknown.
+    """
+    from crucible.dag import DAG  # local import: dag.py has no crucible deps, so this cannot cycle
+
+    artifact = _latest_builder_artifact_sha256(run, gate, round_index)
+    dag_hash: str | None = None
+    node_hash: str | None = None
+    if gate in ("plan", "final") or gate.startswith("dep:"):
+        try:
+            dag = DAG.from_dict(run.load_dag())
+        except FileNotFoundError:
+            raise SystemExit(
+                f"crucible: gate {gate!r} bindings require a loaded dependency tree; run load-dag "
+                f"first"
+            )
+        dag_hash = dag_sha256(dag)
+        if gate.startswith("dep:"):
+            node_id = gate[len("dep:"):]
+            if node_id not in dag.nodes:
+                raise SystemExit(
+                    f"crucible: gate {gate!r} targets unknown node {node_id!r}; known nodes: "
+                    f"{sorted(dag.nodes)}"
+                )
+            node_hash = node_sha256(dag, node_id)
+    return BindingSet(artifact_sha256=artifact, dag_sha256=dag_hash, node_sha256=node_hash)
