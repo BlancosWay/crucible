@@ -21,6 +21,7 @@ from crucible.workflow import (
     require_plan_ready,
     require_plan_verdict_ready,
     workflow_issues,
+    WorkflowIssue,
 )
 
 
@@ -151,14 +152,18 @@ def test_accepted_terminal_uses_last_terminal_semantics(tmp_path):
 
 
 def test_workflow_issues_flags_missing_configured_reproduce(tmp_path):
-    # Smoke coverage for the Task 4 hand-off: a run that omits a configured phase yields an issue
-    # mentioning it, while a fully-satisfied minimal config yields none.
+    # Smoke coverage for the Task 4 hand-off: a run that omits a configured phase yields a
+    # structured WorkflowIssue mentioning it (kind "missing"), while a fully-satisfied minimal
+    # config yields none.
     cfg = Config.from_dict({"reproduce_gate": True, "final_review": False})
     run = init_run("g", cfg, base_dir=tmp_path)
     dag = _dag()
     _bind_plan(run, dag)
     issues = workflow_issues(run.read_events(), dag, cfg)
-    assert any("reproduce" in issue.lower() for issue in issues)
+    assert all(isinstance(issue, WorkflowIssue) for issue in issues)
+    assert all(issue.kind in ("missing", "invalid", "flagged") for issue in issues)
+    reproduce = [i for i in issues if "reproduce" in i.message.lower()]
+    assert reproduce and reproduce[0].kind == "missing"
 
 
 def test_workflow_issues_empty_for_satisfied_minimal_config(tmp_path):
@@ -171,3 +176,23 @@ def test_workflow_issues_empty_for_satisfied_minimal_config(tmp_path):
     run.append("gate_consensus", gate="dep:a", round=1, artifact_sha256="c" * 64,
                dag_sha256=dag_sha256(dag), node_sha256=node_sha256(dag, "a"))
     assert workflow_issues(run.read_events(), dag, cfg) == []
+
+
+def test_workflow_issues_invalid_dag_binding_and_flagged_force(tmp_path):
+    # A stale PLAN DAG binding is classified "invalid"; a forced node completion (current
+    # hashes + rationale) is classified "flagged" — the two non-"missing" kinds Task 4 consumes.
+    cfg = Config.from_dict({"final_review": False})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    dag = _dag(status="done")
+    _bind_plan(run, dag)
+    run.append("node_status_change", node="a", status="done", forced=True,
+               rationale="manual recovery", dag_sha256=dag_sha256(dag),
+               node_sha256=node_sha256(dag, "a"))
+    flagged = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "flagged" and "a" in i.message for i in flagged)
+
+    # Swap the tree after PLAN consensus: its status-free digest changes, so the PLAN binding
+    # is now stale -> an "invalid" issue that names the DAG binding.
+    run.save_dag(_dag(files=["different.py"], status="done").to_dict())
+    invalid = workflow_issues(run.read_events(), _dag(files=["different.py"], status="done"), cfg)
+    assert any(i.kind == "invalid" and "DAG binding" in i.message for i in invalid)

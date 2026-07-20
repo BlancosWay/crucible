@@ -1,5 +1,7 @@
 from crucible.config import Config, DEFAULTS
-from crucible.runlog import init_run
+from crucible.dag import DAG
+from crucible.integrity import artifact_sha256, dag_sha256, node_sha256
+from crucible.runlog import RunLog, init_run
 from crucible.report import render_markdown
 
 
@@ -318,6 +320,55 @@ def _node(nid, status="done"):
             "test_plan": "", "status": status}
 
 
+# Schema-v2 binding handshake helpers. For a schema-v2 run the Summary status is derived from the
+# run's RESOLVED CONFIGURATION and the CURRENT artifact bindings (via crucible.workflow), not merely
+# from which events happened; precedence (most severe first) is:
+#   LEGACY / UNVERIFIED > INVALID > BLOCKED > FLAGGED > CLEAN > IN PROGRESS
+# These record the same artifact/DAG/node bindings the CLI would, so a bound PLAN / dependency
+# terminal here is indistinguishable from a real run's — the config-aware validator then sees valid
+# bindings, and only the phase/ordering behavior under test drives the status.
+
+def _bound_dag(*specs):
+    """A DAG whose nodes carry non-empty immutable fields so their digests are meaningful. Each
+    spec is ``(id, status)`` or just ``id`` (defaults to ``done``)."""
+    nodes = []
+    for spec in specs:
+        nid, status = spec if isinstance(spec, tuple) else (spec, "done")
+        nodes.append({"id": nid, "title": nid.upper(), "description": f"do {nid}",
+                      "files": [f"{nid}.py"], "test_plan": "pytest", "status": status})
+    return DAG.from_dict({"nodes": nodes, "edges": []})
+
+
+def _bind_plan(run, dag, *, artifact=b"reviewed plan"):
+    """Record a schema-v2 bound PLAN gate and save the tree; return ``(artifact_sha256, dag_sha256)``."""
+    run.save_dag(dag.to_dict())
+    a, d = artifact_sha256(artifact), dag_sha256(dag)
+    run.append("builder_output", gate="plan", round=1, payload=artifact.decode("utf-8"),
+               artifact_sha256=a)
+    run.append("gate_consensus", gate="plan", round=1, artifact_sha256=a, dag_sha256=d)
+    return a, d
+
+
+def _bind_dep(run, dag, nid):
+    """Record a schema-v2 bound dependency terminal for ``nid`` against the current tree."""
+    a = artifact_sha256(f"impl {nid}".encode("utf-8"))
+    run.append("builder_output", gate=f"dep:{nid}", round=1, payload=f"impl {nid}",
+               artifact_sha256=a)
+    run.append("gate_consensus", gate=f"dep:{nid}", round=1, artifact_sha256=a,
+               dag_sha256=dag_sha256(dag), node_sha256=node_sha256(dag, nid))
+
+
+def _bind_gate(run, dag, gate, *, artifact=b"artifact"):
+    """Record a bound REPRODUCE/FINAL terminal (artifact + DAG for FINAL, artifact only otherwise)."""
+    a = artifact_sha256(artifact)
+    run.append("builder_output", gate=gate, round=1, payload=artifact.decode("utf-8"),
+               artifact_sha256=a)
+    fields = {"artifact_sha256": a}
+    if gate in ("plan", "final"):
+        fields["dag_sha256"] = dag_sha256(dag)
+    run.append("gate_consensus", gate=gate, round=1, **fields)
+
+
 def test_summary_before_dependency_tree(tmp_path):
     run = _build_run(tmp_path)
     md = render_markdown(run)
@@ -326,11 +377,13 @@ def test_summary_before_dependency_tree(tmp_path):
 
 
 def test_summary_clean_when_all_gates_consensus_and_dag_done(tmp_path):
-    cfg = Config.from_dict({})
+    # final_review off (this test is not about FINAL): a bound PLAN + bound dep:a over a done tree
+    # is a complete configured workflow -> CLEAN.
+    cfg = Config.from_dict({"final_review": False})
     run = init_run("g", cfg, base_dir=tmp_path)
-    run.save_dag({"nodes": [_node("a")], "edges": []})
-    run.append("gate_consensus", gate="plan", round=1)
-    run.append("gate_consensus", gate="dep:a", round=1)
+    dag = _bound_dag(("a", "done"))
+    _bind_plan(run, dag)
+    _bind_dep(run, dag, "a")
     block = _summary_block(render_markdown(run))
     assert "Status:** CLEAN" in block
     assert "2 total" in block and "2 consensus" in block
@@ -339,11 +392,11 @@ def test_summary_clean_when_all_gates_consensus_and_dag_done(tmp_path):
 
 def test_summary_flagged_when_done_node_lacks_review_gate(tmp_path):
     # A node marked done without an accepted dep gate (e.g. --force) must NOT render CLEAN.
-    cfg = Config.from_dict({})
+    cfg = Config.from_dict({"final_review": False})
     run = init_run("g", cfg, base_dir=tmp_path)
-    run.save_dag({"nodes": [_node("a", status="done"), _node("b", status="done")], "edges": []})
-    run.append("gate_consensus", gate="plan", round=1)
-    run.append("gate_consensus", gate="dep:a", round=1)          # a reviewed
+    dag = _bound_dag(("a", "done"), ("b", "done"))
+    _bind_plan(run, dag)
+    _bind_dep(run, dag, "a")          # a reviewed
     # b is done but has NO dep:b advance gate (forced / un-gated)
     block = _summary_block(render_markdown(run))
     assert "Status:** FLAGGED" in block
@@ -353,22 +406,22 @@ def test_summary_flagged_when_done_node_lacks_review_gate(tmp_path):
 
 def test_summary_clean_when_every_done_node_reviewed(tmp_path):
     # Regression: every done node HAS an accepted dep gate -> still CLEAN.
-    cfg = Config.from_dict({})
+    cfg = Config.from_dict({"final_review": False})
     run = init_run("g", cfg, base_dir=tmp_path)
-    run.save_dag({"nodes": [_node("a", status="done"), _node("b", status="done")], "edges": []})
-    run.append("gate_consensus", gate="plan", round=1)
-    run.append("gate_consensus", gate="dep:a", round=1)
-    run.append("gate_consensus", gate="dep:b", round=1)
+    dag = _bound_dag(("a", "done"), ("b", "done"))
+    _bind_plan(run, dag)
+    _bind_dep(run, dag, "a")
+    _bind_dep(run, dag, "b")
     block = _summary_block(render_markdown(run))
     assert "Status:** CLEAN" in block
 
 
 def test_summary_blocked_when_a_gate_capped(tmp_path):
-    cfg = Config.from_dict({})
+    cfg = Config.from_dict({"final_review": False})
     run = init_run("g", cfg, base_dir=tmp_path)
-    run.save_dag({"nodes": [_node("a", status="done"), _node("b", status="blocked")], "edges": []})
-    run.append("gate_consensus", gate="plan", round=1)
-    run.append("gate_consensus", gate="dep:a", round=1)
+    dag = _bound_dag(("a", "done"), ("b", "blocked"))
+    _bind_plan(run, dag)
+    _bind_dep(run, dag, "a")
     run.append("gate_capped", gate="dep:b", round=5, open_findings=["F1", "F3"])
     block = _summary_block(render_markdown(run))
     assert "Status:** BLOCKED" in block
@@ -379,11 +432,16 @@ def test_summary_blocked_when_a_gate_capped(tmp_path):
 
 
 def test_summary_flagged_when_proceeded_with_flags_no_capped(tmp_path):
-    cfg = Config.from_dict({"on_cap": "proceed_with_flags"})
+    cfg = Config.from_dict({"on_cap": "proceed_with_flags", "final_review": False})
     run = init_run("g", cfg, base_dir=tmp_path)
-    run.save_dag({"nodes": [_node("a")], "edges": []})
-    run.append("gate_consensus", gate="plan", round=1)
-    run.append("gate_proceeded_with_flags", gate="dep:a", round=5, open_findings=["F2"])
+    dag = _bound_dag(("a", "done"))
+    _bind_plan(run, dag)
+    # dep:a reached an advance terminal (proceeded with flags) bound to the current node, so the
+    # done node is properly review-gated (not INVALID); the flags themselves drive FLAGGED.
+    a = artifact_sha256(b"impl a")
+    run.append("builder_output", gate="dep:a", round=5, payload="impl a", artifact_sha256=a)
+    run.append("gate_proceeded_with_flags", gate="dep:a", round=5, open_findings=["F2"],
+               artifact_sha256=a, dag_sha256=dag_sha256(dag), node_sha256=node_sha256(dag, "a"))
     block = _summary_block(render_markdown(run))
     assert "Status:** FLAGGED" in block
     assert "1 flagged" in block
@@ -425,11 +483,11 @@ def test_summary_in_progress_when_consensus_but_no_dag(tmp_path):
 
 
 def test_summary_in_progress_when_node_not_done(tmp_path):
-    cfg = Config.from_dict({})
+    cfg = Config.from_dict({"final_review": False})
     run = init_run("g", cfg, base_dir=tmp_path)
-    run.save_dag({"nodes": [_node("a", status="done"), _node("b", status="in_review")], "edges": []})
-    run.append("gate_consensus", gate="plan", round=1)
-    run.append("gate_consensus", gate="dep:a", round=1)
+    dag = _bound_dag(("a", "done"), ("b", "in_review"))
+    _bind_plan(run, dag)
+    _bind_dep(run, dag, "a")
     block = _summary_block(render_markdown(run))
     assert "Status:** IN PROGRESS" in block  # a node still in_review
 
@@ -535,3 +593,100 @@ def test_summary_no_by_severity_line_when_clean(tmp_path):
     run.append("gate_consensus", gate="dep:a", round=1)
     block = _summary_block(render_markdown(run))
     assert "Unresolved by severity" not in block
+
+
+# --- Task 4: binding- and configuration-aware report status --------------------
+#
+# The schema-v2 binding handshake is recorded by the `_bind_*` helpers defined near the top of this
+# file (alongside `_node`/`_summary_block`); the tests below drive each status in the precedence
+#   LEGACY / UNVERIFIED > INVALID > BLOCKED > FLAGGED > CLEAN > IN PROGRESS
+
+
+def test_legacy_report_is_unverified_never_clean(tmp_path):
+    # A run whose run_start records no schema_version is legacy: readable, but LEGACY / UNVERIFIED
+    # and never CLEAN, even when every gate reached consensus and the tree is done.
+    run_dir = tmp_path / "legacy-run"
+    run_dir.mkdir()
+    run = RunLog(run_dir)
+    run.append("run_start", goal="legacy", config=Config.from_dict({}).to_dict())  # NO schema_version
+    run.save_dag({"nodes": [_node("a")], "edges": []})
+    run.append("gate_consensus", gate="plan", round=1)
+    run.append("gate_consensus", gate="dep:a", round=1)
+    block = _summary_block(render_markdown(run))
+    assert "Status:** LEGACY / UNVERIFIED" in block
+    assert "CLEAN" not in block
+
+
+def test_missing_configured_reproduce_approval_final_is_in_progress(tmp_path):
+    # All three optional phases are enabled and the PLAN + dependency are validly bound, but
+    # REPRODUCE, approval, and FINAL are omitted -> IN PROGRESS, naming all three phases.
+    cfg = Config.from_dict({"reproduce_gate": True, "human_approval": True, "final_review": True})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    dag = _bound_dag(("a", "done"))
+    _bind_plan(run, dag)
+    _bind_dep(run, dag, "a")
+    block = _summary_block(render_markdown(run))
+    assert "Status:** IN PROGRESS" in block
+    assert "reproduce" in block.lower()
+    assert "approval" in block.lower()
+    assert "final" in block.lower()
+
+
+def test_binding_mismatch_is_invalid(tmp_path):
+    # A fully bound run whose current dag.json is then semantically changed: the PLAN's recorded
+    # dag_sha256 no longer matches the tree -> INVALID, naming the DAG binding.
+    cfg = Config.from_dict({"final_review": False})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    dag = _bound_dag(("a", "done"))
+    _bind_plan(run, dag)
+    _bind_dep(run, dag, "a")
+    # Replace the tree with a semantic change (different files) after PLAN consensus.
+    run.save_dag(_bound_dag(("a", "done")).to_dict() | {
+        "nodes": [{"id": "a", "title": "A", "description": "do a", "files": ["changed.py"],
+                   "test_plan": "pytest", "status": "done"}]})
+    block = _summary_block(render_markdown(run))
+    assert "Status:** INVALID" in block
+    assert "DAG binding" in block
+
+
+def test_out_of_order_final_is_invalid(tmp_path):
+    # A validly bound FINAL terminal logged while the single node is still pending is out of order
+    # -> INVALID, naming FINAL.
+    cfg = Config.from_dict({"final_review": True})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    dag = _bound_dag(("a", "pending"))
+    _bind_plan(run, dag)
+    _bind_gate(run, dag, "final")
+    block = _summary_block(render_markdown(run))
+    assert "Status:** INVALID" in block
+    assert "FINAL" in block
+
+
+def test_complete_bound_configured_workflow_is_clean(tmp_path):
+    # REPRODUCE -> PLAN -> approval -> dependency done -> FINAL, all with matching hashes and in
+    # order -> CLEAN.
+    cfg = Config.from_dict({"reproduce_gate": True, "human_approval": True, "final_review": True})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    dag = _bound_dag(("a", "done"))
+    _bind_gate(run, dag, "reproduce")
+    artifact, dag_hash = _bind_plan(run, dag)
+    run.append("plan_approved", gate="plan", artifact_sha256=artifact, dag_sha256=dag_hash)
+    _bind_dep(run, dag, "a")
+    _bind_gate(run, dag, "final")
+    block = _summary_block(render_markdown(run))
+    assert "Status:** CLEAN" in block
+
+
+def test_forced_current_node_remains_flagged(tmp_path):
+    # A node completed via a forced override that records current DAG/node hashes and a rationale
+    # is backed but not review-gated -> FLAGGED, and the rationale is surfaced.
+    cfg = Config.from_dict({"final_review": False})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    dag = _bound_dag(("a", "done"))
+    _bind_plan(run, dag)
+    run.append("node_status_change", node="a", status="done", forced=True,
+               rationale="manual recovery: CI outage",
+               dag_sha256=dag_sha256(dag), node_sha256=node_sha256(dag, "a"))
+    block = _summary_block(render_markdown(run))
+    assert "Status:** FLAGGED" in block
+    assert "manual recovery: CI outage" in block

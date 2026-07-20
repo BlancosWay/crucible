@@ -6,6 +6,7 @@ from pathlib import Path
 
 from crucible.config import Config
 from crucible.dag import DAG
+from crucible.integrity import artifact_sha256, dag_sha256, node_sha256
 from crucible.report import render_markdown
 from crucible.runlog import init_run
 
@@ -184,19 +185,30 @@ def test_report_is_not_clean_when_configured_phases_are_omitted(tmp_path):
         "final_review": True,
     })
     run = init_run("missing configured phases", cfg, base_dir=tmp_path)
-    run.save_dag({
+    dag = DAG.from_dict({
         "nodes": [{
             "id": "x",
             "title": "X",
-            "description": "",
-            "files": [],
-            "test_plan": "",
+            "description": "do x",
+            "files": ["x.py"],
+            "test_plan": "pytest",
             "status": "done",
         }],
         "edges": [],
     })
-    run.append("gate_consensus", gate="plan", round=1)
-    run.append("gate_consensus", gate="dep:x", round=1)
+    run.save_dag(dag.to_dict())
+    # Valid schema-v2 PLAN and dependency bindings: the run is not-CLEAN because REPRODUCE,
+    # approval, and FINAL are omitted (config-awareness), NOT because a binding is invalid.
+    plan_artifact = artifact_sha256(b"reviewed plan")
+    run.append("builder_output", gate="plan", round=1, payload="reviewed plan",
+               artifact_sha256=plan_artifact)
+    run.append("gate_consensus", gate="plan", round=1, artifact_sha256=plan_artifact,
+               dag_sha256=dag_sha256(dag))
+    dep_artifact = artifact_sha256(b"impl x")
+    run.append("builder_output", gate="dep:x", round=1, payload="impl x",
+               artifact_sha256=dep_artifact)
+    run.append("gate_consensus", gate="dep:x", round=1, artifact_sha256=dep_artifact,
+               dag_sha256=dag_sha256(dag), node_sha256=node_sha256(dag, "x"))
 
     report = render_markdown(run)
 

@@ -21,6 +21,7 @@ Gate order (schema-v2):
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from crucible.integrity import dag_sha256, node_sha256
@@ -187,45 +188,116 @@ def _node_completion_backed(events: list[dict[str, Any]], dag: DAG, node_id: str
     return False
 
 
-def workflow_issues(events: list[dict[str, Any]], dag: DAG, cfg: Config) -> list[str]:
-    """Deterministic list of configured-workflow problems for the report (consumed by Task 4).
+def workflow_issues(events: list[dict[str, Any]], dag: DAG, cfg: Config) -> list["WorkflowIssue"]:
+    """Deterministic, structured list of configured-workflow problems for the report (Task 4).
 
-    Pure over ``(events, dag, cfg)`` — no file reads, never raises. Each string names a missing or
-    invalid required phase: a configured REPRODUCE/approval/FINAL that is absent, a PLAN that is
-    unaccepted or whose DAG binding no longer matches, a done node lacking a bound accepted review
-    (or forced override), or a FINAL logged before completion. An empty list means every configured
-    phase is present, ordered, accepted, and currently bound.
+    Pure over ``(events, dag, cfg)`` — no file reads, never raises. Each :class:`WorkflowIssue`
+    carries a ``kind`` that drives the report's status precedence and a human-readable ``message``
+    naming the offending phase/node:
+
+    - ``"missing"`` — a configured REPRODUCE/approval/FINAL phase (or PLAN) that never happened, or
+      a FINAL not yet reached though the tree is done; the run is merely *in progress*.
+    - ``"invalid"`` — a binding that no longer matches the current artifact/tree, a stale approval,
+      or an out-of-order FINAL: an integrity violation recorded in the log.
+    - ``"flagged"`` — a done node completed outside an accepted review gate (a forced override, or
+      no gate at all): an audited/unaudited bypass, not a hard violation.
+
+    An empty list means every configured phase is present, ordered, accepted, and currently bound.
     """
-    issues: list[str] = []
+    issues: list[WorkflowIssue] = []
 
     if cfg.reproduce_gate and accepted_terminal(events, "reproduce") is None:
-        issues.append("configured REPRODUCE gate never reached consensus")
+        issues.append(WorkflowIssue("missing", "configured REPRODUCE gate never reached consensus"))
 
     plan_terminal = accepted_terminal(events, "plan")
     if plan_terminal is None:
-        issues.append("PLAN gate never reached an accepted terminal")
+        issues.append(WorkflowIssue("missing", "PLAN gate never reached an accepted terminal"))
         return issues  # nothing downstream can be trusted without an accepted plan
 
     current_dag = dag_sha256(dag)
     if plan_terminal.get("dag_sha256") != current_dag:
-        issues.append("PLAN DAG binding no longer matches the current dependency tree")
+        issues.append(WorkflowIssue(
+            "invalid", "PLAN DAG binding no longer matches the current dependency tree"))
 
     if cfg.human_approval:
         approval = _latest(events, "plan_approved")
         if approval is None:
-            issues.append("configured human approval was never recorded")
+            issues.append(WorkflowIssue("missing", "configured human approval was never recorded"))
         elif (approval.get("artifact_sha256") != plan_terminal.get("artifact_sha256")
               or approval.get("dag_sha256") != plan_terminal.get("dag_sha256")):
-            issues.append("recorded plan approval does not bind the accepted plan/DAG")
+            issues.append(WorkflowIssue(
+                "invalid", "recorded plan approval does not bind the accepted plan/DAG"))
 
     for nid in dag.order:
-        if dag.nodes[nid].status == "done" and not _node_completion_backed(events, dag, nid):
-            issues.append(f"node {nid!r} is done without a bound accepted review or forced override")
+        if dag.nodes[nid].status == "done":
+            issues.extend(_node_completion_issues(events, dag, nid))
 
     if cfg.final_review:
-        if not dag.is_complete():
-            issues.append("configured FINAL gate requires every node done first")
-        elif accepted_terminal(events, "final") is None:
-            issues.append("configured FINAL gate never reached consensus")
+        final_terminal = accepted_terminal(events, "final")
+        if final_terminal is not None and not dag.is_complete():
+            issues.append(WorkflowIssue(
+                "invalid", "FINAL gate reached a terminal before every node was done"))
+        elif final_terminal is None and dag.is_complete():
+            issues.append(WorkflowIssue(
+                "missing", "configured FINAL gate never reached consensus"))
 
     return issues
+
+
+@dataclass(frozen=True)
+class WorkflowIssue:
+    """One configured-workflow problem, classified for the report's status derivation.
+
+    ``kind`` is exactly one of ``"missing"`` / ``"invalid"`` / ``"flagged"`` and orders the report
+    status (``invalid`` > ``flagged`` > ``missing``, i.e. INVALID > FLAGGED > IN PROGRESS); the CLEAN
+    status requires *no* issues at all. ``message`` names the phase/node and is rendered (sanitized)
+    in the report Summary.
+    """
+
+    kind: str  # "missing" | "invalid" | "flagged"
+    message: str
+
+
+def _node_completion_issues(
+    events: list[dict[str, Any]], dag: DAG, node_id: str
+) -> list[WorkflowIssue]:
+    """Classify how a ``done`` node's completion is (or is not) backed by a current binding.
+
+    Mirrors :func:`_node_completion_backed` (the CLI's FINAL prerequisite), but distinguishes the
+    *reason* for the report:
+
+    - a current-bound accepted ``dep:<id>`` terminal -> no issue (properly review-gated);
+    - a current-bound forced override -> ``flagged`` (an audited reviewed-gate bypass);
+    - a ``dep:<id>`` terminal or forced override whose recorded hashes are stale -> ``invalid``;
+    - neither -> ``flagged`` (done without an accepted review gate).
+    """
+    current_dag = dag_sha256(dag)
+    current_node = node_sha256(dag, node_id)
+
+    terminal = accepted_terminal(events, f"dep:{node_id}")
+    if terminal is not None:
+        if (terminal.get("dag_sha256") == current_dag
+                and terminal.get("node_sha256") == current_node):
+            return []
+        return [WorkflowIssue(
+            "invalid",
+            f"node {node_id!r} completion is bound to a stale review — its dag/node sha256 no "
+            f"longer match the current tree")]
+
+    forced = [e for e in events
+              if e.get("event") == "node_status_change" and e.get("node") == node_id
+              and e.get("forced") and e.get("status") == "done"]
+    if forced:
+        last = forced[-1]
+        if (last.get("dag_sha256") == current_dag
+                and last.get("node_sha256") == current_node):
+            return [WorkflowIssue(
+                "flagged",
+                f"node {node_id!r} was completed by a forced override (reviewed-gate bypass)")]
+        return [WorkflowIssue(
+            "invalid",
+            f"node {node_id!r} forced completion records stale dag/node sha256")]
+
+    return [WorkflowIssue(
+        "flagged",
+        f"node {node_id!r} is done without an accepted review gate or forced override")]
