@@ -173,6 +173,29 @@ class Config:
         }
 
 
+def resolved_config_shape_error(data: Any) -> str | None:
+    """Return why ``data`` is not a COMPLETE resolved config (the exact shape :meth:`Config.to_dict`
+    emits), or ``None`` when it is well-shaped.
+
+    This is stricter than :meth:`Config.from_dict`, which is for user OVERRIDE files: from_dict fills
+    missing keys from :data:`DEFAULTS`, so a partial (or empty) object parses as a full config. A
+    run's ``run_start`` records the immutable RESOLVED configuration, and certification must validate
+    against that exact recorded shape — never re-derive absent keys from defaults, which would let a
+    run whose configured phases are unknown certify anyway. So the object must carry EXACTLY the
+    resolved top-level keys and EXACTLY the nested builder/critic role keys. Value validity (severity
+    names, ``on_cap``, round caps, …) is left to :meth:`Config.from_dict`.
+    """
+    if not isinstance(data, dict):
+        return "is absent or not a JSON object"
+    if data.keys() != DEFAULT_CONFIG_KEYS:
+        return "does not carry exactly the resolved configuration keys"
+    for role in ("builder", "critic"):
+        value = data[role]
+        if not isinstance(value, dict) or value.keys() != ROLE_KEYS:
+            return f"does not carry exactly the resolved {role} role keys"
+    return None
+
+
 def load_config(path: str | Path) -> Config:
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     return Config.from_dict(data)

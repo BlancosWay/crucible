@@ -6,7 +6,11 @@ import json
 import re
 from typing import Any
 
+from crucible.config import Config, resolved_config_shape_error
+from crucible.dag import DAG
+from crucible.integrity import RUN_SCHEMA_VERSION, run_schema_version
 from crucible.runlog import RunLog
+from crucible.workflow import WorkflowIssue, workflow_issues
 
 
 # A fenced code block delimiter as emitted by ``_fenced`` (a column-0 run of >= 3 backticks).
@@ -78,15 +82,81 @@ def _events_by_gate(events: list[dict[str, Any]]) -> dict[str, list[dict[str, An
 _TERMINAL_EVENTS = ("gate_consensus", "gate_proceeded_with_flags", "gate_capped")
 
 
-def _run_summary_lines(events: list[dict[str, Any]], dag: dict[str, Any]) -> list[str]:
-    """A deterministic run-level ``## Summary`` banner derived PURELY from the run-log's own
-    terminal events (``gate_consensus`` / ``gate_proceeded_with_flags`` / ``gate_capped``) and DAG
-    node statuses — never from Critic prose. Every interpolated value is a literal label, an int
-    count, or a ``_san``-sanitized gate/finding id, so the banner adds no injection surface.
+def _config_aware_issues(
+    events: list[dict[str, Any]], dag: dict[str, Any], config: dict[str, Any]
+) -> list[WorkflowIssue]:
+    """Parse the current DAG + resolved run config and delegate to the shared workflow validator
+    (``crucible.workflow.workflow_issues``), the single owner of the stage/phase contract.
 
-    Overall status precedence (most severe first): BLOCKED (any gate capped) > FLAGGED (any gate
-    proceeded with flags) > CLEAN (>=1 gate, every gate reached consensus, no undecided gate, and
-    the DAG has >=1 node all ``done``) > IN PROGRESS (anything else, incl. an empty/missing DAG)."""
+    A schema-v2 run is only certifiable against a well-formed current dependency tree and a COMPLETE
+    resolved config. If either artifact is PRESENT but cannot be used, this fails *closed*: it returns
+    an ``invalid`` :class:`WorkflowIssue` naming the malformed artifact rather than silently returning
+    ``[]``. That is deliberate — a malformed current tree still carries raw ``status: "done"`` nodes,
+    so returning ``[]`` would let the event-based ``dag_done`` check certify the run ``CLEAN`` even
+    though nothing about it can be recomputed or bound. The caller only invokes this for a *present*
+    schema-v2 DAG (an ABSENT tree stays ``IN PROGRESS`` and never reaches here), so a parse failure
+    here means "present but malformed", never "absent".
+
+    The recorded ``config`` is validated against its COMPLETE resolved shape (exactly the
+    ``Config.to_dict`` keys and nested role keys) BEFORE it is parsed — never with ``Config.from_dict``
+    override semantics, which would silently fill an absent/partial config from defaults and certify a
+    run whose configured phases are unknown. The validator itself is pure and total over well-formed
+    inputs, and this never raises.
+    """
+    try:
+        dag_obj = DAG.from_dict(dag)
+    except (ValueError, KeyError, TypeError):
+        return [WorkflowIssue(
+            "invalid",
+            "the current dependency tree (dag.json) is malformed and cannot be parsed, bound, or "
+            "certified")]
+    shape_error = resolved_config_shape_error(config)
+    if shape_error is not None:
+        return [WorkflowIssue(
+            "invalid",
+            f"the recorded run configuration {shape_error} and cannot be validated or certified")]
+    try:
+        cfg_obj = Config.from_dict(config)
+    except (ValueError, KeyError, TypeError):
+        return [WorkflowIssue(
+            "invalid",
+            "the recorded run configuration is malformed and cannot be parsed or validated for "
+            "certification")]
+    return workflow_issues(events, dag_obj, cfg_obj)
+
+
+def _run_summary_lines(
+    events: list[dict[str, Any]],
+    dag: dict[str, Any],
+    config: dict[str, Any] | None = None,
+    schema_version: int | None = None,
+    dag_present: bool = True,
+    dag_load_error: bool = False,
+) -> list[str]:
+    """A deterministic run-level ``## Summary`` banner.
+
+    For a schema-v2 run the overall status is derived from the run's RESOLVED CONFIGURATION and the
+    CURRENT artifact bindings (via ``crucible.workflow.workflow_issues``) — not merely from which
+    events happened — with this precedence (most severe first):
+
+        LEGACY / UNVERIFIED > INVALID > BLOCKED > FLAGGED > CLEAN > IN PROGRESS
+
+    - ``LEGACY / UNVERIFIED`` — the run predates schema v2; its provenance cannot be certified (so
+      it is never ``CLEAN``, even when every gate reached consensus);
+    - ``INVALID`` — a recorded binding no longer matches the current artifact/tree, an approval is
+      stale, or a configured phase is out of order (an integrity violation in the log);
+    - ``BLOCKED`` — a gate capped with unresolved findings;
+    - ``FLAGGED`` — a gate proceeded with flags, or a node completed outside an accepted review
+      gate (a forced override or none at all);
+    - ``CLEAN`` — every configured phase is present, ordered, accepted, and currently bound, and
+      every node is ``done``;
+    - ``IN PROGRESS`` — a required configured phase or node is still incomplete.
+
+    The banner is still derived purely from the append-only run log plus the current DAG/config; it
+    does not claim tamper resistance. Every interpolated value is a literal label, an int count, or
+    a ``_san``-sanitized id/message, so it adds no injection surface even though issue messages name
+    untrusted DAG node ids.
+    """
     gates = _events_by_gate(events)
     # Each gate's authoritative outcome is its LAST terminal event (or None => undecided).
     consensus = flagged = capped = undecided = 0
@@ -110,38 +180,57 @@ def _run_summary_lines(events: list[dict[str, Any]], dag: dict[str, Any]) -> lis
     nodes = dag.get("nodes", [])
     dag_done = bool(nodes) and all(n.get("status") == "done" for n in nodes)
 
-    # A `done` node is only legitimately complete if its OWN dep:<id> gate reached an advance
-    # terminal (consensus/proceed). A node marked done without that — e.g. `set-status --force` —
-    # bypassed review, so an otherwise-CLEAN run is flagged (not CLEAN) and the node(s) are named.
-    advance_gates = {
-        gate for gate, evs in gates.items()
-        if any(e["event"] in ("gate_consensus", "gate_proceeded_with_flags") for e in evs)
-    }
-    unreviewed_done = [n.get("id") for n in nodes
-                       if n.get("status") == "done" and f"dep:{n.get('id')}" not in advance_gates]
-    clean_but_unreviewed = (not capped and not flagged and bool(total) and consensus == total
-                            and dag_done and bool(unreviewed_done))
+    # Schema/config-aware validation (schema-v2 only). Legacy runs skip this entirely and are never
+    # CLEAN. For a schema-v2 run a `done` node with no current-bound review, and every
+    # out-of-order/stale binding, surfaces here. A PRESENT current tree that cannot even be loaded as
+    # a JSON object (`dag_load_error`) fails closed to an `invalid` issue directly; a present tree
+    # that loads but is structurally malformed (or a partial/absent resolved config) fails closed
+    # inside `_config_aware_issues`. Either way the raw `dag_done` CLEAN check below can never certify
+    # an uncertifiable run. An ABSENT tree is not routed here at all and stays IN PROGRESS below.
+    schema_current = schema_version is not None and schema_version >= RUN_SCHEMA_VERSION
+    issues: list[WorkflowIssue] = []
+    if schema_current:
+        if dag_load_error:
+            issues = [WorkflowIssue(
+                "invalid",
+                "the current dependency tree (dag.json) is present but is not a well-formed JSON "
+                "object and cannot be parsed, bound, or certified")]
+        elif dag_present:
+            issues = _config_aware_issues(events, dag, config)
+    invalid = [i for i in issues if i.kind == "invalid"]
+    missing = [i for i in issues if i.kind == "missing"]
+    flagged_issues = [i for i in issues if i.kind == "flagged"]
 
-    if capped:
+    if not schema_current:
+        status = (f"LEGACY / UNVERIFIED — this run predates schema v{RUN_SCHEMA_VERSION}; its "
+                  f"provenance is unverified and can never be certified")
+    elif invalid:
+        status = (f"INVALID — {len(invalid)} workflow integrity violation(s) recorded in the run "
+                  f"log")
+    elif capped:
         status = f"BLOCKED — {capped} of {total} gate(s) capped with unresolved findings"
     elif flagged:
         status = f"FLAGGED — {flagged} of {total} gate(s) proceeded with unresolved findings"
-    elif clean_but_unreviewed:
-        status = (f"FLAGGED — {len(unreviewed_done)} node(s) marked done without an accepted "
-                  f"review gate")
-    elif total and consensus == total and dag_done:
+    elif flagged_issues:
+        status = (f"FLAGGED — {len(flagged_issues)} node(s) completed outside an accepted review "
+                  f"gate")
+    elif not missing and total and consensus == total and dag_done:
         status = f"CLEAN — all {total} gate(s) reached consensus"
     else:
-        status = "IN PROGRESS — the run has not settled every gate"
+        status = "IN PROGRESS — the run has not settled every configured phase"
 
     counts = f"{total} total \u00b7 {consensus} consensus \u00b7 {flagged} flagged \u00b7 {capped} capped"
     if undecided:
         counts += f" \u00b7 {undecided} undecided"
 
     lines = ["## Summary", "", f"**Status:** {status}", "", f"**Gates:** {counts}"]
-    if clean_but_unreviewed:
-        ids = ", ".join(_san(n) for n in unreviewed_done)
-        lines.append(f"**Nodes done without an accepted review gate:** {len(unreviewed_done)} ({ids})")
+
+    # List every configured-workflow problem explicitly (design: "the summary lists missing/invalid
+    # required phases"). Messages name untrusted DAG node ids, so each is `_san`-sanitized (flattens
+    # newlines, escapes &<>| and backticks) — same non-injection convention as the findings block.
+    if issues:
+        lines.append(f"**Workflow issues:** {len(issues)}")
+        lines.extend(f"- [{issue.kind}] {_san(issue.message)}" for issue in issues)
 
     total_open = sum(len(ids) for _, ids in findings)
     if total_open:
@@ -230,7 +319,12 @@ def render_markdown(run: RunLog) -> str:
     events = run.read_events()
     start = next((e for e in events if e["event"] == "run_start"), {})
     goal = start.get("goal", "(unknown goal)")
-    config = start.get("config", {})
+    # The recorded resolved config. Coerce a missing/null/non-object value to `{}` so the header can
+    # render (it degrades to `?`); the schema-aware Summary separately fails such a run closed
+    # because `{}` is not a complete resolved config shape (see `_config_aware_issues`).
+    config = start.get("config")
+    if not isinstance(config, dict):
+        config = {}
 
     lines: list[str] = []
     lines.append("# Crucible Run Report")
@@ -244,12 +338,31 @@ def render_markdown(run: RunLog) -> str:
     )
     lines.append("")
 
+    # Load the current dependency tree, fail-closed. Three outcomes drive the Summary:
+    #   - ABSENT (FileNotFoundError) -> IN PROGRESS (no tree to certify yet);
+    #   - PRESENT but not a well-formed JSON object (a JSON syntax/decoding error, or valid JSON that
+    #     is not an object) -> INVALID, with an empty tree table and NO traceback;
+    #   - PRESENT and loadable -> validated by the schema-aware Summary (a structurally malformed but
+    #     loadable tree still fails closed inside `_run_summary_lines`).
+    dag_present = True
+    dag_load_error = False
     try:
         dag = run.load_dag()
     except FileNotFoundError:
         dag = {"nodes": []}
+        dag_present = False
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        dag = {"nodes": []}
+        dag_load_error = True
+    else:
+        if not isinstance(dag, dict):
+            dag = {"nodes": []}
+            dag_load_error = True
 
-    lines.extend(_run_summary_lines(events, dag))
+    lines.extend(_run_summary_lines(
+        events, dag, config=config, schema_version=run_schema_version(events),
+        dag_present=dag_present, dag_load_error=dag_load_error,
+    ))
 
     lines.append("## Dependency tree")
     lines.append("")

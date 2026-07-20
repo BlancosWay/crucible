@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from crucible.config import Config
+from crucible.integrity import RUN_SCHEMA_VERSION
 
 
 def _fsync_dir(dirpath: Path) -> None:
@@ -138,5 +139,5 @@ def init_run(goal: str, cfg: Config, base_dir: str | Path = "runs") -> RunLog:
     _atomic_write_text(run_dir / "config.json",
                        json.dumps(cfg.to_dict(), indent=2, ensure_ascii=False))
     run = RunLog(run_dir)
-    run.append("run_start", goal=goal, config=cfg.to_dict())
+    run.append("run_start", schema_version=RUN_SCHEMA_VERSION, goal=goal, config=cfg.to_dict())
     return run

@@ -10,6 +10,20 @@ from typing import Any
 # pending -> in_progress -> done. It is intentionally part of the vocabulary, not dead.
 VALID_STATUSES = ("pending", "in_progress", "in_review", "done", "blocked")
 
+# The legal node-status transitions Crucible enforces (schema-v2 workflow contract). A node begins
+# `pending`; `done` is terminal (no legal exit). `in_review` shares `in_progress`'s exits so a node
+# under review can be sent back, finished, blocked, or reset. Same-status transitions are always
+# idempotent no-ops (see `set_status`). `set-status --force --status done` is the explicit
+# reviewed-gate bypass (`force=True` below) and is the ONLY way to reach `done` off this table — and
+# even it can never mutate an already-`done` node.
+ALLOWED_TRANSITIONS: dict[str, set[str]] = {
+    "pending": {"in_progress", "blocked"},
+    "in_progress": {"in_review", "done", "blocked", "pending"},
+    "in_review": {"in_progress", "done", "blocked", "pending"},
+    "blocked": {"pending"},
+    "done": set(),
+}
+
 
 class CycleError(ValueError):
     """Raised when the dependency graph contains a cycle."""
@@ -161,11 +175,38 @@ class DAG:
             return ("in_flight", None)
         return ("stuck", None)
 
-    def set_status(self, node_id: str, status: str) -> None:
+    def set_status(self, node_id: str, status: str, *, force: bool = False) -> None:
+        """Transition a node's status, enforcing ``ALLOWED_TRANSITIONS``.
+
+        Same-status calls are idempotent no-ops (even for terminal ``done``). ``force=True`` is the
+        explicit reviewed-gate bypass used by ``set-status --force --status done``: it skips the
+        transition table for a NON-done node, but never mutates an already-``done`` node (``done`` is
+        terminal — reopening it would erase a completed review). Raises ``ValueError`` naming both
+        the current and target status for an illegal transition."""
         if node_id not in self.nodes:
             raise ValueError(f"unknown node: {node_id}")
         if status not in VALID_STATUSES:
             raise ValueError(f"invalid status: {status}")
+        current = self.nodes[node_id].status
+        if status == current:
+            return  # idempotent: setting a node to its current status is always a no-op
+        if current == "done":
+            # `done` is terminal for both normal and forced transitions; a forced override may start
+            # from any OTHER state but can never change a node that is already done.
+            raise ValueError(
+                f"illegal status transition for node {node_id!r}: done -> {status} "
+                f"(done is terminal; a completed node cannot be reopened, even with --force)"
+            )
+        if force:
+            self.nodes[node_id].status = status
+            return
+        allowed = ALLOWED_TRANSITIONS.get(current, set())
+        if status not in allowed:
+            allowed_txt = ", ".join(sorted(allowed)) or "none (terminal)"
+            raise ValueError(
+                f"illegal status transition for node {node_id!r}: {current} -> {status} "
+                f"(allowed from {current}: {allowed_txt})"
+            )
         self.nodes[node_id].status = status
 
     def progress(self) -> dict[str, int]:
@@ -182,4 +223,42 @@ class DAG:
                 for nid in self.order
                 for dep in sorted(self.deps[nid])
             ],
+        }
+
+    def definition_dict(self) -> dict[str, Any]:
+        """Canonical, status-free view of the whole tree for content binding.
+
+        Nodes appear in declared order (order is load-bearing: it breaks ties among
+        otherwise-ready nodes) with only their immutable fields; edges list each node's
+        dependencies in sorted order. Mutable ``status`` is deliberately excluded so a
+        digest over this view stays stable as work progresses.
+        """
+        return {
+            "nodes": [
+                {
+                    "id": n.id,
+                    "title": n.title,
+                    "description": n.description,
+                    "files": list(n.files),
+                    "test_plan": n.test_plan,
+                }
+                for n in (self.nodes[nid] for nid in self.order)
+            ],
+            "edges": [
+                {"from": nid, "depends_on": dep}
+                for nid in self.order
+                for dep in sorted(self.deps[nid])
+            ],
+        }
+
+    def node_definition_dict(self, node_id: str) -> dict[str, Any]:
+        """Canonical, status-free view of one node: its immutable fields plus sorted deps."""
+        n = self.node(node_id)
+        return {
+            "id": n.id,
+            "title": n.title,
+            "description": n.description,
+            "files": list(n.files),
+            "test_plan": n.test_plan,
+            "depends_on": sorted(self.deps[node_id]),
         }

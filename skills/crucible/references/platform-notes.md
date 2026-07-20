@@ -28,6 +28,27 @@ checklist "lenses" (`critic_checklists`): extra domain risk priors an operator o
   evidence of which lens content applied is wanted, have the Critic echo the lens `sha256` in its
   verdict `summary`.
 
+## Binding handshake (every Critic dispatch)
+
+At **every** gate, after logging the Builder artifact, capture the deterministic bindings and append
+them to the Critic seed:
+
+```bash
+BINDINGS=$(PYTHONPATH=scripts python3 -m crucible bindings --run "$RUN" --gate "$GATE" --round N)
+```
+
+- **Trusted CLI metadata, not artifact content.** `$BINDINGS` is the exact `crucible bindings` JSON —
+  `artifact_sha256` plus the gate-specific `dag_sha256`/`node_sha256`. Append it to the seed as
+  **trusted CLI metadata**; it is **not content copied from the reviewed (untrusted) artifact**, so it
+  keeps its authority even though the artifact under *Untrusted input* does not.
+- **The verdict must echo it.** Require the Critic to copy those `*_sha256` fields verbatim into its
+  verdict JSON. `crucible verdict` recomputes the bindings from run history + the current tree and
+  rejects a missing or mismatched value **before** recording any decision, proving the verdict refers
+  to the exact artifact/DAG/node the CLI selected.
+- **Ordering.** The bindings block sits alongside the reviewer template + `critic-prompt.md` (and any
+  operator lenses); like the lenses it never overrides the verdict schema — the Critic still emits
+  exactly one verdict JSON.
+
 ## Copilot CLI (primary)
 
 - **Resolve models first:** read `"$RUN"/config.json`. Dispatch with `model` =

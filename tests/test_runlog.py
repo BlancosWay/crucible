@@ -24,6 +24,13 @@ def test_init_run_creates_dir_and_files(tmp_path):
     assert saved == cfg.to_dict()
 
 
+def test_init_run_records_schema_version(tmp_path):
+    run = init_run("g", Config.from_dict({}), base_dir=tmp_path)
+    start = run.read_events()[0]
+    assert start["event"] == "run_start"
+    assert start["schema_version"] == 2
+
+
 def test_append_event_is_append_only_and_full_text(tmp_path):
     cfg = Config.from_dict({})
     run = init_run("g", cfg, base_dir=tmp_path)

@@ -20,6 +20,20 @@ def test_parse_minimal_approve():
     v = _verdict("APPROVE", [])
     assert v.verdict == "APPROVE"
     assert v.findings == []
+    # Binding fields are optional so legacy verdict objects (no schema-2 bindings) still parse.
+    assert v.artifact_sha256 is None
+    assert v.dag_sha256 is None
+    assert v.node_sha256 is None
+
+
+def test_parse_optional_binding_fields():
+    v = Verdict.from_dict({
+        "gate": "dep:a", "round": 1, "verdict": "APPROVE", "summary": "s", "findings": [],
+        "artifact_sha256": "a" * 64, "dag_sha256": "d" * 64, "node_sha256": "n" * 64,
+    })
+    assert v.artifact_sha256 == "a" * 64
+    assert v.dag_sha256 == "d" * 64
+    assert v.node_sha256 == "n" * 64
 
 
 def test_invalid_verdict_value_raises():

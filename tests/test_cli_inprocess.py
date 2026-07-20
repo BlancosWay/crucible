@@ -8,6 +8,9 @@ from pathlib import Path
 import pytest
 
 from crucible.cli import _finding_line, _load_resolutions, _validate_gate, main
+from crucible.dag import DAG
+from crucible.integrity import artifact_sha256, current_bindings
+from crucible.runlog import RunLog
 
 
 def _init(tmp_path) -> str:
@@ -133,9 +136,11 @@ def test_main_init_run_non_object_config_returns_1(tmp_path, capsys):
 
 def test_main_verdict_consensus_returns_0(tmp_path, capsys):
     run = _init(tmp_path)
-    capsys.readouterr()  # drain the init-run path print
+    _prepare_plan_binding(run, 1)
+    binding = current_bindings(RunLog(run), "plan", 1).to_dict()
+    capsys.readouterr()  # drain the init-run path print (setup above emits nothing to stdout)
     vfile = _write(tmp_path, "v.json", {"gate": "plan", "round": 1, "verdict": "APPROVE",
-                                        "summary": "ok", "findings": []})
+                                        "summary": "ok", "findings": [], **binding})
     rc = main(["verdict", "--run", run, "--gate", "plan", "--round", "1", "--file", vfile])
     assert rc == 0
     assert capsys.readouterr().out.strip() == "CONSENSUS"
@@ -157,9 +162,24 @@ def _find(fid, severity, location="cli.py:1", claim="c", suggestion="s"):
             "suggestion": suggestion}
 
 
+def _prepare_plan_binding(run, round_index):
+    """Set up a schema-2 plan binding directly via RunLog (no stdout to pollute capsys): a loaded
+    DAG (round 1 only) plus a Builder artifact for this round, so `verdict`'s binding handshake has a
+    non-empty artifact + DAG to bind the decision to."""
+    r = RunLog(run)
+    if round_index == 1:
+        r.save_dag(DAG.from_dict({"nodes": [{"id": "a", "title": "A", "description": "",
+                   "files": [], "test_plan": "", "status": "pending"}], "edges": []}).to_dict())
+    body = f"plan body round {round_index}".encode("utf-8")
+    r.append("builder_output", gate="plan", round=round_index, payload=body.decode("utf-8"),
+             artifact_sha256=artifact_sha256(body))
+
+
 def _run_verdict(tmp_path, run, findings, verdict_label, resolutions=None, round="1"):
+    _prepare_plan_binding(run, int(round))
+    binding = current_bindings(RunLog(run), "plan", int(round)).to_dict()
     vfile = _write(tmp_path, "v.json", {"gate": "plan", "round": int(round), "verdict": verdict_label,
-                                        "summary": "s", "findings": findings})
+                                        "summary": "s", "findings": findings, **binding})
     argv = ["verdict", "--run", run, "--gate", "plan", "--round", round, "--file", vfile]
     if resolutions is not None:
         rfile = _write(tmp_path, "res.json", resolutions)
@@ -229,7 +249,9 @@ def test_verdict_wontfix_default_clears_prints_no_sections(tmp_path, capsys):
     out = capsys.readouterr()
     assert rc == 0
     assert out.out.strip() == "CONSENSUS"  # default strict_rebuttal=false -> wontfix clears
-    assert out.err.strip() == ""
+    # No finding-list sections (the plan-consensus plan echo to stderr is separate/expected).
+    assert "Findings the Builder will fix" not in out.err
+    assert "Unresolved blocking findings" not in out.err
 
 
 def test_verdict_clean_approve_prints_no_sections(tmp_path, capsys):
@@ -239,7 +261,9 @@ def test_verdict_clean_approve_prints_no_sections(tmp_path, capsys):
     out = capsys.readouterr()
     assert rc == 0
     assert out.out.strip() == "CONSENSUS"
-    assert out.err.strip() == ""  # regression guard: stdout-only, no stderr noise
+    # regression guard: no finding-list noise (plan echo to stderr is separate/expected)
+    assert "Findings the Builder will fix" not in out.err
+    assert "Unresolved blocking findings" not in out.err
 
 
 def test_verdict_strict_rebuttal_wontfix_shows_in_unresolved_with_tag(tmp_path, capsys):
@@ -265,22 +289,18 @@ def test_finding_line_format():
     assert _finding_line(g) == "  F2 [minor]"
 
 
-# --- _print_approved_plan renders plan + a given DAG to any stream ------------
+# --- _print_approved_plan renders a resolved payload + a given DAG to any stream ------
 
 def test_print_approved_plan_renders_to_given_stream():
     import io
     from crucible.cli import _print_approved_plan
     from crucible.dag import DAG
 
-    class _FakeRun:
-        def read_events(self):
-            return [{"gate": "plan", "event": "builder_output", "payload": "PLAN BODY TEXT"}]
-
     dag = DAG.from_dict({"nodes": [{"id": "a", "title": "Node A"},
                                    {"id": "b", "title": "Node B"}],
                          "edges": [{"from": "b", "depends_on": "a"}]})
     buf = io.StringIO()
-    _print_approved_plan(_FakeRun(), dag, buf)
+    _print_approved_plan("PLAN BODY TEXT", dag, buf)
     out = buf.getvalue()
     assert "=== Approved plan ===" in out
     assert "PLAN BODY TEXT" in out
@@ -293,13 +313,31 @@ def test_print_approved_plan_without_plan_artifact_uses_placeholder():
     from crucible.cli import _print_approved_plan
     from crucible.dag import DAG
 
-    class _FakeRun:
-        def read_events(self):
-            return []
-
     dag = DAG.from_dict({"nodes": [{"id": "a", "title": "Node A"}], "edges": []})
     buf = io.StringIO()
-    _print_approved_plan(_FakeRun(), dag, buf)
+    _print_approved_plan(None, dag, buf)
     out = buf.getvalue()
     assert "(no plan artifact logged)" in out
     assert "a: Node A" in out
+
+
+# --- _bound_plan_payload selects the approved artifact by content hash, never by round ------
+
+def test_bound_plan_payload_selects_by_artifact_hash():
+    from crucible.cli import _bound_plan_payload
+    events = [
+        {"gate": "plan", "event": "builder_output", "round": 1, "payload": "OLD",
+         "artifact_sha256": "a" * 64},
+        {"gate": "plan", "event": "builder_output", "round": 1, "payload": "REVIEWED",
+         "artifact_sha256": "b" * 64},
+        {"gate": "plan", "event": "gate_consensus", "round": 1,
+         "artifact_sha256": "b" * 64, "dag_sha256": "d" * 64},
+    ]
+    assert _bound_plan_payload(events) == "REVIEWED"
+
+
+def test_bound_plan_payload_is_none_without_advance_terminal():
+    from crucible.cli import _bound_plan_payload
+    events = [{"gate": "plan", "event": "builder_output", "round": 1, "payload": "X",
+               "artifact_sha256": "a" * 64}]
+    assert _bound_plan_payload(events) is None

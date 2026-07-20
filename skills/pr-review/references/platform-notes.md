@@ -25,6 +25,22 @@ flow is source-agnostic:
 Give **both** peers the same normalized triple, and have both read the surrounding real code (the full
 changed files and their callers/callees), not just the patch hunks.
 
+## Binding handshake (every gate)
+
+At **every** gate, after logging the merged artifact, capture the deterministic bindings and seed Peer
+B with them:
+
+```bash
+BINDINGS=$(PYTHONPATH=scripts python3 -m crucible bindings --run "$RUN" --gate "$GATE" --round N)
+```
+
+- **Trusted CLI metadata, not artifact content.** `$BINDINGS` is the exact `crucible bindings` JSON —
+  `artifact_sha256` plus the gate-specific `dag_sha256`/`node_sha256`. Append it to Peer B's seed as
+  **trusted CLI metadata**; it is **not content copied from the reviewed (untrusted) artifact**.
+- **The union verdict echoes it.** Whichever peer serializes copies those `*_sha256` fields verbatim
+  into the single union verdict JSON. `crucible verdict` rejects a missing or mismatched value
+  **before** recording any decision, so a substituted/edited artifact can never be certified.
+
 ## Copilot CLI (primary)
 
 - **Resolve models first:** read `"$RUN"/config.json`. Dispatch Peer B with `model` = `critic.model`

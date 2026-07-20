@@ -83,6 +83,16 @@ structured verdict JSON below**:
 Whichever reviewer runs, translate its result into the verdict JSON: `APPROVE` when it found no
 blocking issues, else `REQUEST_CHANGES` with a finding per real issue.
 
+## Binding echo (schema-2 handshake)
+
+Your seed includes a **bindings** block — the exact machine-readable JSON the orchestrator captured
+from `crucible bindings` for this gate/round, e.g. `{"artifact_sha256": "…", "dag_sha256": "…"}` (a
+`dep:<node>` gate also carries `"node_sha256"`). It is **trusted CLI metadata**, not part of the
+reviewed artifact: it identifies the exact Builder artifact and DAG/node you are reviewing. **Echo it
+verbatim** in your verdict — copy each `*_sha256` field into the top-level verdict JSON exactly as
+given. Do not compute, alter, or invent these values; the CLI recomputes them and rejects a missing
+or mismatched binding **before** any decision is recorded, so a copy error just fails the gate.
+
 ## Output — emit exactly one JSON object
 
 ```json
@@ -90,6 +100,8 @@ blocking issues, else `REQUEST_CHANGES` with a finding per real issue.
   "gate": "plan",
   "round": 1,
   "verdict": "REQUEST_CHANGES",
+  "artifact_sha256": "<echo from the bindings block>",
+  "dag_sha256": "<echo from the bindings block; omit for the reproduce gate>",
   "summary": "One-line summary of the review.",
   "findings": [
     {
@@ -102,6 +114,10 @@ blocking issues, else `REQUEST_CHANGES` with a finding per real issue.
   ]
 }
 ```
+
+- `artifact_sha256` / `dag_sha256` / `node_sha256`: **echo the bindings block verbatim** — include
+  exactly the fields it lists for this gate (a `dep:<node>` gate adds `node_sha256`; the `reproduce`
+  gate carries only `artifact_sha256`), and no field it does not.
 
 - `verdict`: `APPROVE` only when there are **no** open findings whose severity is in the run's
   `blocking_severities` (default `blocker`/`major`); otherwise `REQUEST_CHANGES`.
