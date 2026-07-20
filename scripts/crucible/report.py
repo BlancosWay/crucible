@@ -88,15 +88,30 @@ def _config_aware_issues(
     """Parse the current DAG + resolved run config and delegate to the shared workflow validator
     (``crucible.workflow.workflow_issues``), the single owner of the stage/phase contract.
 
-    Returns ``[]`` if the tree or config cannot be parsed: a malformed artifact is not *certified*
-    here (the event-based status still applies) and the report never raises. The validator itself
-    is pure and total over well-formed inputs.
+    A schema-v2 run is only certifiable against a well-formed current dependency tree and a
+    parseable resolved config. If either artifact is PRESENT but cannot be parsed, this fails
+    *closed*: it returns an ``invalid`` :class:`WorkflowIssue` naming the malformed artifact rather
+    than silently returning ``[]``. That is deliberate — a malformed current tree still carries raw
+    ``status: "done"`` nodes, so returning ``[]`` would let the event-based ``dag_done`` check
+    certify the run ``CLEAN`` even though nothing about it can be recomputed or bound. The caller
+    only invokes this for a *present* schema-v2 DAG (an ABSENT tree stays ``IN PROGRESS`` and never
+    reaches here), so a parse failure here means "present but malformed", never "absent". The
+    validator itself is pure and total over well-formed inputs, and this never raises.
     """
     try:
         dag_obj = DAG.from_dict(dag)
+    except (ValueError, KeyError, TypeError):
+        return [WorkflowIssue(
+            "invalid",
+            "the current dependency tree (dag.json) is malformed and cannot be parsed, bound, or "
+            "certified")]
+    try:
         cfg_obj = Config.from_dict(config)
     except (ValueError, KeyError, TypeError):
-        return []
+        return [WorkflowIssue(
+            "invalid",
+            "the recorded run configuration is malformed and cannot be parsed or validated for "
+            "certification")]
     return workflow_issues(events, dag_obj, cfg_obj)
 
 
@@ -154,9 +169,12 @@ def _run_summary_lines(
     nodes = dag.get("nodes", [])
     dag_done = bool(nodes) and all(n.get("status") == "done" for n in nodes)
 
-    # Schema/config-aware validation (schema-v2 only, and only when a current DAG + resolved config
-    # are available to validate against). Legacy runs skip this entirely and are never CLEAN. A
-    # `done` node with no current-bound review, and every out-of-order/stale binding, surfaces here.
+    # Schema/config-aware validation (schema-v2 only, and only when a current DAG is PRESENT and a
+    # resolved config is available to validate against). Legacy runs skip this entirely and are
+    # never CLEAN. A `done` node with no current-bound review, and every out-of-order/stale binding,
+    # surfaces here. A present-but-malformed current tree/config fails closed to an `invalid` issue
+    # (see `_config_aware_issues`), so the raw `dag_done` CLEAN check below can never certify an
+    # unparseable tree. An ABSENT tree is not routed here at all and stays IN PROGRESS below.
     schema_current = schema_version is not None and schema_version >= RUN_SCHEMA_VERSION
     issues: list[WorkflowIssue] = []
     if schema_current and dag_present and config is not None:

@@ -1,6 +1,6 @@
 from crucible.config import Config, DEFAULTS
 from crucible.dag import DAG
-from crucible.integrity import artifact_sha256, dag_sha256, node_sha256
+from crucible.integrity import RUN_SCHEMA_VERSION, artifact_sha256, dag_sha256, node_sha256
 from crucible.runlog import RunLog, init_run
 from crucible.report import render_markdown
 
@@ -727,6 +727,58 @@ def test_dep_terminal_unbound_artifact_is_invalid(tmp_path):
     _bind_plan(run, dag)
     run.append("gate_consensus", gate="dep:a", round=1, artifact_sha256="0" * 64,
                dag_sha256=dag_sha256(dag), node_sha256=node_sha256(dag, "a"))
+    block = _summary_block(render_markdown(run))
+    assert "Status:** INVALID" in block
+    assert "CLEAN" not in block
+
+
+def test_malformed_current_dag_missing_node_id_is_invalid_never_clean(tmp_path):
+    # F5: after an otherwise consensus-like history, the CURRENT dag.json is malformed — a node with
+    # no `id`. Such a tree cannot be parsed, bound, or certified, so it must NEVER read CLEAN even
+    # though its raw node status is "done" (the certification path must outrank raw dag_done).
+    cfg = Config.from_dict({"final_review": False})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    run.append("gate_consensus", gate="plan", round=1)
+    run.append("gate_consensus", gate="dep:a", round=1)
+    # A present-but-malformed current tree: the sole node has status "done" but no `id`.
+    run.save_dag({"nodes": [{"status": "done"}], "edges": []})
+    block = _summary_block(render_markdown(run))
+    assert "Status:** INVALID" in block
+    assert "dependency tree" in block  # the issue names the malformed tree
+    assert "CLEAN" not in block
+
+
+def test_malformed_current_dag_edge_is_invalid_never_clean(tmp_path):
+    # F5: after an otherwise consensus-like history, the CURRENT dag.json has a malformed edge
+    # (missing `depends_on`). An unparseable tree cannot be certified: INVALID, never CLEAN.
+    cfg = Config.from_dict({"final_review": False})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    run.append("gate_consensus", gate="plan", round=1)
+    run.append("gate_consensus", gate="dep:a", round=1)
+    run.save_dag({
+        "nodes": [{"id": "a", "title": "A", "description": "do a", "files": ["a.py"],
+                   "test_plan": "pytest", "status": "done"}],
+        "edges": [{"from": "a"}],  # malformed: missing `depends_on`
+    })
+    block = _summary_block(render_markdown(run))
+    assert "Status:** INVALID" in block
+    assert "dependency tree" in block
+    assert "CLEAN" not in block
+
+
+def test_malformed_run_config_is_invalid_never_clean(tmp_path):
+    # F5 (fail closed): a schema-v2 run whose recorded resolved config cannot be parsed cannot be
+    # validated against, so — even with a valid current tree and a consensus-like history — it must
+    # never certify: INVALID, never CLEAN.
+    run_dir = tmp_path / "bad-config-run"
+    run_dir.mkdir()
+    run = RunLog(run_dir)
+    run.append("run_start", schema_version=RUN_SCHEMA_VERSION, goal="g",
+               config={"unknown_key": 1})  # not a parseable resolved run config
+    dag = _bound_dag(("a", "done"))
+    run.save_dag(dag.to_dict())
+    run.append("gate_consensus", gate="plan", round=1)
+    run.append("gate_consensus", gate="dep:a", round=1)
     block = _summary_block(render_markdown(run))
     assert "Status:** INVALID" in block
     assert "CLEAN" not in block
