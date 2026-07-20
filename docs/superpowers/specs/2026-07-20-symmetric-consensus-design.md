@@ -280,6 +280,15 @@ raises instead of silently ordering the ghost gate after known nodes. The scope-
 partial union used by **in-progress reports** deliberately does not enforce this (it has no DAG);
 scope enforcement is exclusively the Finish-time path's job.
 
+Scope enforcement spans the **whole symmetric protocol**, not only accepted sets: any out-of-scope
+`dep:<id>` gate (or a `final` gate while FINAL is disabled) that records a `symmetric_verdict` or an
+advancing/capped/proceeded-with-flags terminal is rejected the same way. A capped or
+proceeded-with-flags ghost gate therefore cannot inject an **unresolved blocking objection** into the
+PR recommendation without persisting an accepted set — `unresolved_objections` is derived from the
+configured workflow's in-scope gates and the Finish-time result path fails closed on any out-of-scope
+protocol gate, so the recommendation only ever reflects the current DAG's accepted findings and
+objections.
+
 ## Report behavior
 
 For symmetric workflows:

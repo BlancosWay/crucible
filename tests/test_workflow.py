@@ -614,3 +614,40 @@ def test_workflow_issues_flags_final_trio_when_final_review_disabled(tmp_path):
                 {"artifact_sha256": "c" * 64, "dag_sha256": dag_sha256(dag)})
     issues = workflow_issues(run.read_events(), dag, cfg)
     assert any(i.kind == "invalid" and "final" in i.message.lower() for i in issues)
+
+
+def _forge_objection_gate(run, gate, terminal, objections, bindings):
+    """Append a forged ``symmetric_verdict -> capped/proceeded terminal`` pair carrying objections
+    but NO accepted set (a CAPPED halt persists no accepted set) — the out-of-scope history a real
+    CLI write path never produces. ``terminal`` is ``gate_capped`` or ``gate_proceeded_with_flags``."""
+    outcome = "PROCEED_WITH_FLAGS" if terminal == "gate_proceeded_with_flags" else "CAPPED"
+    run.append("symmetric_verdict", gate=gate, round=1, outcome=outcome, objections=objections,
+               candidate={"summary": "", "findings": []}, **bindings)
+    run.append(terminal, gate=gate, round=1, open_findings=[o["id"] for o in objections], **bindings)
+
+
+def _obj(oid="A:G1", severity="blocker"):
+    return {"id": oid, "severity": severity, "location": "candidate:F1", "claim": "c",
+            "suggestion": "s"}
+
+
+def test_workflow_issues_flags_out_of_scope_capped_dependency_gate(tmp_path):
+    # Round-4: a forged dep:ghost gate that CAPS with a blocking objection but persists NO accepted
+    # set. The accepted-set scope guard would miss it (no accepted set); the protocol-wide guard flags
+    # it invalid so an out-of-scope objection can never reach the recommendation.
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")  # one done node 'a', final_review off
+    _forge_objection_gate(run, "dep:ghost", "gate_capped", [_obj("A:G1", "blocker")],
+                          {"artifact_sha256": "e" * 64, "dag_sha256": dag_sha256(dag),
+                           "node_sha256": "f" * 64})
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "invalid" and "ghost" in i.message for i in issues)
+
+
+def test_workflow_issues_flags_out_of_scope_proceeded_dependency_gate(tmp_path):
+    # Round-4: same, but the forged out-of-scope ghost gate PROCEEDS WITH FLAGS.
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    _forge_objection_gate(run, "dep:ghost", "gate_proceeded_with_flags", [_obj("A:G1", "blocker")],
+                          {"artifact_sha256": "e" * 64, "dag_sha256": dag_sha256(dag),
+                           "node_sha256": "f" * 64})
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "invalid" and "ghost" in i.message for i in issues)

@@ -682,3 +682,144 @@ def test_require_complete_symmetric_run_accepts_in_scope_final_when_enabled():
     )
     # When FINAL is configured, the in-scope FINAL set does not trip the out-of-scope guard.
     require_complete_symmetric_run(events, dag, require_final=True, final_enabled=True)
+
+
+# --- round-4: shared protocol-wide scope guard over objection-bearing gates -------------------
+#
+# The accepted-set scope guard (out_of_scope_accepted_gates) only sees gates that persisted an
+# accepted finding SET. A CAPPED (halt) gate — and a forged out-of-scope trio that only records a
+# symmetric_verdict + capped/proceeded terminal — carries the peers' objections but NO accepted set,
+# so it slips past the accepted-set guard entirely while its objections still feed the recommendation.
+# The protocol-wide guard closes that gap over ANY symmetric_verdict/accepted/terminal event.
+
+def test_out_of_scope_protocol_gates_detects_capped_ghost_and_disabled_final():
+    from crucible.symmetric import out_of_scope_accepted_gates, out_of_scope_protocol_gates
+
+    dag = _one_done_dag("a")
+    events = (
+        _dep_events("a", findings=[_finding("dep:a", "F1")], bindings=_bindings("a", "d", "na"))
+        + _dep_events("ghost", outcome="CAPPED", objections=[_obj("A:G1", "blocker")],
+                      bindings=_bindings("g", "d", "ng"))
+        + _gate_events("final", outcome="CAPPED", objections=[_obj("A:C1", "blocker")],
+                       bindings=_bindings("f", "d", "nf"))
+    )
+    # These capped gates carry objections but NO accepted set, so the accepted-set guard misses them.
+    assert out_of_scope_accepted_gates(events, dag, final_enabled=False) == []
+    # The protocol-wide guard catches both: the ghost dep, and — with FINAL off — the FINAL gate.
+    assert out_of_scope_protocol_gates(events, dag, final_enabled=False) == ["dep:ghost", "final"]
+    # FINAL enabled => only the ghost dep remains out of scope.
+    assert out_of_scope_protocol_gates(events, dag, final_enabled=True) == ["dep:ghost"]
+
+
+def test_out_of_scope_protocol_gates_ignores_in_scope_and_non_finding_gates():
+    from crucible.symmetric import out_of_scope_protocol_gates
+
+    dag = _one_done_dag("a")
+    events = (
+        # An in-scope PLAN symmetric decision must never be flagged (it is not a dependency/FINAL
+        # finding gate; it is validated by the PLAN checks in workflow_issues).
+        _gate_events("plan", outcome="CAPPED", objections=[_obj("A:P1", "blocker")],
+                     bindings=_bindings("p", "d", "np"))
+        + _dep_events("a", outcome="PROCEED_WITH_FLAGS", objections=[_obj("A:F1", "blocker")],
+                      bindings=_bindings("a", "d", "na"))
+    )
+    assert out_of_scope_protocol_gates(events, dag, final_enabled=False) == []
+
+
+def test_unresolved_objections_fails_closed_on_out_of_scope_ghost_dep():
+    from crucible.symmetric import unresolved_objections
+
+    dag = _one_done_dag("a")
+    events = (
+        _dep_events("a", outcome="PROCEED_WITH_FLAGS", objections=[_obj("A:F1", "blocker")],
+                    bindings=_bindings("a", "d", "na"))
+        + _dep_events("ghost", outcome="CAPPED", objections=[_obj("A:G1", "blocker")],
+                      bindings=_bindings("g", "d", "ng"))
+    )
+    # Fail closed — never silently drop the forged objection, never publish it.
+    with pytest.raises(ValueError, match="ghost"):
+        unresolved_objections(events, dag, final_enabled=False)
+
+
+def test_unresolved_objections_fails_closed_on_forbidden_final_objection():
+    from crucible.symmetric import unresolved_objections
+
+    dag = _one_done_dag("a")
+    events = (
+        _dep_events("a", outcome="PROCEED_WITH_FLAGS", objections=[_obj("A:F1", "blocker")],
+                    bindings=_bindings("a", "d", "na"))
+        + _gate_events("final", outcome="CAPPED", objections=[_obj("A:C1", "blocker")],
+                       bindings=_bindings("f", "d", "nf"))
+    )
+    # FINAL is off => a FINAL objection is a configured-forbidden phase; refuse to publish it.
+    with pytest.raises(ValueError, match="final"):
+        unresolved_objections(events, dag, final_enabled=False)
+    # FINAL on => the same objection is in scope and retained (both peers' disputes survive).
+    objs = unresolved_objections(events, dag, final_enabled=True)
+    assert {o["id"] for o in objs} == {"A:F1", "A:C1"}
+
+
+def test_unresolved_objections_retains_in_scope_objections_with_dag():
+    from crucible.symmetric import unresolved_objections
+
+    dag = _one_done_dag("a")
+    events = _dep_events("a", outcome="PROCEED_WITH_FLAGS", objections=[_obj("A:F1", "blocker")],
+                         bindings=_bindings("a", "d", "na"))
+    assert [o["id"] for o in unresolved_objections(events, dag, final_enabled=False)] == ["A:F1"]
+
+
+def test_unresolved_objections_without_dag_is_unvalidated_partial_helper():
+    from crucible.symmetric import unresolved_objections
+
+    # No DAG => no scope to validate against (mirrors accepted_findings' no-DAG partial helper): the
+    # legacy/direct call cannot fail closed on scope, so it just returns objections in log order.
+    events = _dep_events("ghost", outcome="CAPPED", objections=[_obj("A:G1", "blocker")],
+                         bindings=_bindings("g", "d", "ng"))
+    assert [o["id"] for o in unresolved_objections(events)] == ["A:G1"]
+
+
+def test_require_complete_symmetric_run_rejects_capped_out_of_scope_dependency_gate():
+    from crucible.symmetric import require_complete_symmetric_run
+
+    dag = _one_done_dag("a")
+    events = (
+        _dep_events("a", findings=[_finding("dep:a", "F1")], bindings=_bindings("a", "d", "na"))
+        + _dep_events("ghost", outcome="CAPPED", objections=[_obj("A:G1", "blocker")],
+                      bindings=_bindings("g", "d", "ng"))
+    )
+    with pytest.raises(ValueError, match="incomplete symmetric workflow"):
+        require_complete_symmetric_run(events, dag, require_final=False, final_enabled=False)
+
+
+def test_require_complete_symmetric_run_rejects_capped_final_when_final_review_disabled():
+    from crucible.symmetric import require_complete_symmetric_run
+
+    dag = _one_done_dag("a")
+    events = (
+        _dep_events("a", findings=[_finding("dep:a", "F1")], bindings=_bindings("a", "d", "na"))
+        + _gate_events("final", outcome="CAPPED", objections=[_obj("A:C1", "blocker")],
+                       bindings=_bindings("f", "d", "nf"))
+    )
+    with pytest.raises(ValueError, match="incomplete symmetric workflow"):
+        require_complete_symmetric_run(events, dag, require_final=False, final_enabled=False)
+
+
+def test_review_result_fails_closed_on_out_of_scope_objection_with_dag():
+    dag = _one_done_dag("a")
+    events = (
+        _dep_events("a", outcome="PROCEED_WITH_FLAGS", objections=[_obj("A:F1", "blocker")],
+                    bindings=_bindings("a", "d", "na"))
+        + _dep_events("ghost", outcome="CAPPED", objections=[_obj("A:G1", "blocker")],
+                      bindings=_bindings("g", "d", "ng"))
+    )
+    with pytest.raises(ValueError, match="ghost"):
+        review_result(events, Config.from_dict({"final_review": False}), "pr-review", dag)
+
+
+def test_review_result_retains_in_scope_objection_with_dag():
+    dag = _one_done_dag("a")
+    events = _dep_events("a", outcome="PROCEED_WITH_FLAGS", objections=[_obj("A:F1", "blocker")],
+                         bindings=_bindings("a", "d", "na"))
+    result = review_result(events, Config.from_dict({"final_review": False}), "pr-review", dag)
+    assert result["recommendation"] == "REQUEST_CHANGES"
+    assert [o["id"] for o in result["unresolved_objections"]] == ["A:F1"]

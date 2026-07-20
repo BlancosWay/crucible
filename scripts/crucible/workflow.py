@@ -30,7 +30,7 @@ from crucible.symmetric import (
     FindingSet,
     accepted_finding_set_for_gate,
     accepted_findings,
-    out_of_scope_accepted_gates,
+    out_of_scope_protocol_gates,
     resolve_gate_acceptance,
     validate_final_finding_set,
     workflow_kind,
@@ -396,10 +396,11 @@ def _symmetric_accepted_set_issues(
     - an accepted set with no advancing terminal, or recorded AFTER its terminal (orphan/post-terminal
       crash residue that must never count as accepted state).
 
-    An accepted set for a gate OUTSIDE the configured workflow is also ``invalid``: a ``dep:<id>``
-    whose node is absent from the current tree (a ghost gate) is flagged here (round-3 F2); a forged
-    FINAL set while ``final_review`` is off is a configured-forbidden phase reported by the FINAL
-    terminal check in :func:`workflow_issues` (round-3 F1). When the resolver selects an effective
+    A gate OUTSIDE the configured workflow is also ``invalid``: a ``dep:<id>`` whose node is absent
+    from the current tree (a ghost gate) is flagged here — whether it persists an accepted set
+    (round-3 F2) OR only records a verdict + capped/proceeded terminal carrying objections (round-4);
+    a forged FINAL gate while ``final_review`` is off is a configured-forbidden phase reported by the
+    FINAL terminal check in :func:`workflow_issues` (round-3 F1). When the resolver selects an effective
     set, its payload is additionally checked for validity here, and — when FINAL is configured — the
     accepted FINAL set must include every accepted dependency finding unchanged and add only
     ``source_gate: final`` extras (:func:`_final_inclusion_issues`). PLAN gates carry a text artifact
@@ -421,16 +422,18 @@ def _symmetric_accepted_set_issues(
                     "invalid",
                     f"symmetric gate {gate!r} accepted finding set payload is not a valid finding "
                     f"set (malformed)"))
-    # Out-of-scope accepted DEPENDENCY sets: a fully bound-looking dep:<id> trio whose node is absent
-    # from the current tree is a ghost gate that must never be silently accepted (round-3 F2). A
-    # forged FINAL set while final_review is off is reported as a configured-forbidden phase by the
-    # FINAL terminal check in workflow_issues, so it is skipped here to avoid a duplicate message.
-    for gate in out_of_scope_accepted_gates(events, dag, final_enabled=cfg.final_review):
+    # Out-of-scope DEPENDENCY protocol gates: a fully bound-looking dep:<id> whose node is absent from
+    # the current tree is a ghost gate that must never be silently accepted (round-3 F2) — whether it
+    # persists an accepted set OR only CAPS/proceeds with objections (round-4). The protocol-wide scope
+    # guard spans every symmetric_verdict/accepted/terminal, so a capped ghost gate (no accepted set)
+    # is caught too. A forged FINAL gate while final_review is off is reported as a configured-forbidden
+    # phase by the FINAL terminal check in workflow_issues, so it is skipped here to avoid a duplicate.
+    for gate in out_of_scope_protocol_gates(events, dag, final_enabled=cfg.final_review):
         if gate == "final":
             continue
         issues.append(WorkflowIssue(
             "invalid",
-            f"symmetric gate {gate!r} records an accepted finding set for a dependency absent from "
+            f"symmetric gate {gate!r} records review protocol events for a dependency absent from "
             f"the current tree (out-of-scope/ghost gate)"))
     if cfg.final_review:
         issues.extend(_final_inclusion_issues(events, dag))

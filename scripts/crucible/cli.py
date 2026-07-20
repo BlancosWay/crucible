@@ -980,7 +980,7 @@ def cmd_review_result(args) -> int:
     require_complete_symmetric_run(events, dag, require_final=cfg.final_review,
                                    final_enabled=cfg.final_review)
     _reject_stale_result_bindings(events, dag, cfg, "review-result")
-    print(json.dumps(review_result(events, cfg, workflow)))
+    print(json.dumps(review_result(events, cfg, workflow, dag)))
     return 0
 
 

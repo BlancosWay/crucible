@@ -2751,3 +2751,56 @@ def test_result_commands_reject_final_trio_when_final_review_disabled(tmp_path):
     for command in ("accepted-findings", "review-result"):
         r = _run([command, "--run", run_dir])
         assert r.returncode != 0, command
+
+
+def _forge_objection_events(run_dir, gate, terminal, objections, bindings):
+    """Append a forged symmetric_verdict + capped/proceeded terminal (carrying objections but NO
+    accepted set — a CAPPED halt persists none) directly to the run-log: the out-of-scope history the
+    CLI write path never produces. ``terminal`` is ``gate_capped`` or ``gate_proceeded_with_flags``."""
+    outcome = "PROCEED_WITH_FLAGS" if terminal == "gate_proceeded_with_flags" else "CAPPED"
+    _append_raw_event(run_dir, {"event": "symmetric_verdict", "gate": gate, "round": 1,
+                                "outcome": outcome, "objections": objections,
+                                "candidate": {"summary": "", "findings": []}, **bindings})
+    _append_raw_event(run_dir, {"event": terminal, "gate": gate, "round": 1,
+                                "open_findings": [o["id"] for o in objections], **bindings})
+
+
+def _blocking_objection(oid="A:G1"):
+    return {"id": oid, "severity": "blocker", "location": "candidate:F1",
+            "claim": "Injected blocker.", "suggestion": "n/a"}
+
+
+def test_result_commands_reject_out_of_scope_objection_dependency_gate(tmp_path):
+    # Round-4: a final_review=False run, then a forged dep:ghost gate that caps / proceeds-with-flags
+    # with a blocking objection but NO accepted set (so the accepted-set scope guard would miss it).
+    # Its objection would otherwise force REQUEST_CHANGES; both Finish-time result commands must fail
+    # closed on the out-of-scope protocol gate instead.
+    for terminal in ("gate_capped", "gate_proceeded_with_flags"):
+        base = tmp_path / terminal
+        base.mkdir()
+        run_dir = _complete_one_node_symmetric(base, "auth",
+                                               findings=[_accepted_finding("dep:auth", "F1", "minor")])
+        _forge_objection_events(run_dir, "dep:ghost", terminal, [_blocking_objection("A:G1")],
+                                {"artifact_sha256": "e" * 64, "dag_sha256": "d" * 64,
+                                 "node_sha256": "f" * 64})
+        for command in ("accepted-findings", "review-result"):
+            r = _run([command, "--run", run_dir])
+            assert r.returncode != 0, (terminal, command)
+            assert "ghost" in (r.stdout + r.stderr) or "incomplete" in r.stderr.lower(), \
+                (terminal, command)
+
+
+def test_result_commands_reject_out_of_scope_final_objection_when_disabled(tmp_path):
+    # Round-4: final_review is off, so a forged FINAL objection gate (capped / proceeded, no accepted
+    # set) is a configured-forbidden phase. Both result commands must fail closed rather than let its
+    # blocking objection reach the recommendation.
+    for terminal in ("gate_capped", "gate_proceeded_with_flags"):
+        base = tmp_path / f"final-{terminal}"
+        base.mkdir()
+        run_dir = _complete_one_node_symmetric(base, "auth",
+                                               findings=[_accepted_finding("dep:auth", "F1", "minor")])
+        _forge_objection_events(run_dir, "final", terminal, [_blocking_objection("A:C1")],
+                                {"artifact_sha256": "c" * 64, "dag_sha256": "d" * 64})
+        for command in ("accepted-findings", "review-result"):
+            r = _run([command, "--run", run_dir])
+            assert r.returncode != 0, (terminal, command)
