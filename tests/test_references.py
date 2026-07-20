@@ -58,6 +58,40 @@ def test_consensus_rubric_lists_stop_criteria():
     assert "wontfix" in text
 
 
+def test_critic_prompt_verdict_echoes_cli_bindings():
+    # Schema-2: the verdict JSON must ECHO the deterministic content bindings the CLI selected
+    # (`crucible bindings`) for the reviewed artifact/DAG/node, so `crucible verdict` can prove the
+    # decision refers to the exact reviewed content. The schema example and prose must carry the
+    # binding fields.
+    text = (REF / "critic-prompt.md").read_text()
+    low = text.lower()
+    assert "artifact_sha256" in low
+    assert "dag_sha256" in low
+    assert "node_sha256" in low
+    assert "bindings" in low
+    assert "echo" in low
+
+
+def test_platform_notes_bindings_are_trusted_cli_metadata():
+    # The bindings appended to the Critic seed are TRUSTED CLI METADATA — the exact `crucible
+    # bindings` JSON — and are explicitly NOT content copied from the reviewed (untrusted) artifact.
+    text = (REF / "platform-notes.md").read_text()
+    low = " ".join(text.lower().split())
+    assert "crucible bindings" in low
+    assert "trusted cli metadata" in low
+    assert "not content copied from the reviewed" in low
+
+
+def test_consensus_rubric_records_binding_handshake():
+    # The stop-criteria doc must record that a settled decision is bound to the reviewed artifact:
+    # the verdict echoes the CLI bindings and a missing/mismatched binding is rejected before any
+    # decision is recorded.
+    low = " ".join((REF / "consensus-rubric.md").read_text().lower().split())
+    assert "bindings" in low
+    assert "artifact_sha256" in low
+    assert "echo" in low
+
+
 def test_dependency_tree_doc_has_schema_keys():
     text = (REF / "dependency-tree.md").read_text()
     for key in ["nodes", "edges", "depends_on", "topological"]:

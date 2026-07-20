@@ -38,8 +38,31 @@ def test_skill_requires_resolved_run_config():
 
 def test_skill_reuses_crucible_cli_for_decisions():
     text = SKILL.read_text()
-    for cmd in ["init-run", "load-dag", "next", "verdict", "set-status", "report"]:
+    for cmd in ["init-run", "load-dag", "next", "verdict", "set-status", "report", "bindings"]:
         assert cmd in text, f"SKILL.md should reference `crucible {cmd}`"
+
+
+def test_skill_binds_every_gate_to_merged_artifact():
+    # Schema-2 binding handshake (symmetric): every gate logs the merged artifact, asks the CLI for
+    # the deterministic bindings, seeds Peer B with that JSON as TRUSTED CLI METADATA, and the single
+    # serialized union verdict must ECHO the bound artifact/DAG hashes.
+    text = SKILL.read_text()
+    low = text.lower()
+    assert "crucible bindings --run" in text
+    assert "--gate" in text and "--round" in text
+    assert "trusted cli metadata" in low
+    assert "echo" in low
+    assert "artifact_sha256" in low
+    assert "dag_sha256" in low
+
+
+def test_skill_records_human_approval_with_approve_plan():
+    # When human_approval is enabled the accepted review plan/graph is approved deterministically via
+    # `approve-plan` (only after an explicit human OK); a changed accepted plan/DAG requires a fresh run.
+    text = SKILL.read_text()
+    low = text.lower()
+    assert "crucible approve-plan --run" in text
+    assert "fresh run" in low
 
 
 def test_skill_does_not_hardcode_round_cap_override():

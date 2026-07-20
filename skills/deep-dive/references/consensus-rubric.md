@@ -20,6 +20,14 @@ the merged candidate finding set → **both peers review it** → repeat. Consen
 - Findings whose severity is in `defer_severities` (default `["minor", "nit"]`) do not block and may
   be deferred.
 
+## A decision is bound to the reviewed artifact
+
+The union verdict `crucible verdict` adjudicates must **echo** the gate's `crucible bindings`
+(`artifact_sha256`, plus `dag_sha256` and — for a `dep:<thread>` gate — `node_sha256`) as trusted CLI
+metadata. A missing or mismatched binding is rejected **before** any outcome is recorded, so a
+settled decision is always bound to the exact merged artifact both peers reviewed; the accepted
+plan/thread-graph and each reviewed thread are immutable thereafter (a change requires a fresh run).
+
 ## Resolving a dispute — no `wontfix`
 
 When one peer disputes another's finding, it is resolved **only** by evidence: the disputed claim is

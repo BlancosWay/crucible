@@ -8,6 +8,22 @@ candidate finding set, and one peer serializes the deduped **union** of both pee
 single verdict JSON the CLI consumes (`APPROVE` iff neither peer has a blocking finding). Which peer
 serializes alternates each round, only to reduce anchoring.
 
+## Binding handshake (every gate)
+
+At **every** gate, after logging the merged artifact, capture the deterministic bindings and seed Peer
+B with them:
+
+```bash
+BINDINGS=$(PYTHONPATH=scripts python3 -m crucible bindings --run "$RUN" --gate "$GATE" --round N)
+```
+
+- **Trusted CLI metadata, not artifact content.** `$BINDINGS` is the exact `crucible bindings` JSON —
+  `artifact_sha256` plus the gate-specific `dag_sha256`/`node_sha256`. Append it to Peer B's seed as
+  **trusted CLI metadata**; it is **not content copied from the reviewed (untrusted) artifact**.
+- **The union verdict echoes it.** Whichever peer serializes copies those `*_sha256` fields verbatim
+  into the single union verdict JSON. `crucible verdict` rejects a missing or mismatched value
+  **before** recording any decision, so a substituted/edited artifact can never be certified.
+
 ## Copilot CLI (primary)
 
 - **Resolve models first:** read `"$RUN"/config.json`. Dispatch Peer B with `model` = `critic.model`

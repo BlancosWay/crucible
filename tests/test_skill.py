@@ -32,8 +32,34 @@ def test_skill_invokes_superpowers_subskills():
 
 def test_skill_uses_cli_for_decisions():
     text = SKILL.read_text()
-    for cmd in ["init-run", "load-dag", "next", "verdict", "set-status", "report"]:
+    for cmd in ["init-run", "load-dag", "next", "verdict", "set-status", "report",
+                "bindings", "approve-plan"]:
         assert cmd in text, f"SKILL.md should reference `crucible {cmd}`"
+
+
+def test_skill_binds_every_gate_to_reviewed_artifact():
+    # Schema-2 binding handshake: at every gate the skill logs the Builder artifact, asks the CLI for
+    # the deterministic bindings, seeds the Critic with that JSON as TRUSTED CLI METADATA, and the
+    # Critic verdict must ECHO the bound artifact/DAG hashes back before `crucible verdict` records a
+    # decision. Assert the command, the trust framing, and the echoed fields.
+    text = SKILL.read_text()
+    low = text.lower()
+    assert "crucible bindings --run" in text
+    assert "--gate" in text and "--round" in text
+    assert "trusted cli metadata" in low
+    assert "echo" in low
+    assert "artifact_sha256" in low
+    assert "dag_sha256" in low          # PLAN carries the DAG binding
+
+
+def test_skill_records_human_approval_with_approve_plan():
+    # The optional human-approval path records the human's OK deterministically via `approve-plan`
+    # (only AFTER the human explicitly approves), and a changed accepted plan/DAG requires a fresh run
+    # (the accepted plan/DAG is immutable within a run).
+    text = SKILL.read_text()
+    low = text.lower()
+    assert "crucible approve-plan --run" in text
+    assert "fresh run" in low
 
 
 def test_skill_does_not_hardcode_round_cap_override():

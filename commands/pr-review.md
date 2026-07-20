@@ -18,7 +18,10 @@ to consensus or cap) -> optional FINAL gate -> run report + assembled findings +
 recommendation. Two **equal peers** (no Builder/Critic asymmetry); the recorded verdict each round is
 the union of both peers' findings, and consensus is grounded in re-verifiable citations — never a vote
 or an average. Resolve models, effort, caps, and policies from the `RUN/config.json` written by
-`init-run`; shipped values live in `config.defaults.json`.
+`init-run`; shipped values live in `config.defaults.json`. Every gate decision is **bound** to the
+exact merged artifact both peers reviewed (schema v2): the CLI hashes it into SHA-256 bindings the
+union verdict must echo, and the accepted review plan/graph is frozen (a legacy pre-schema-2 run is
+read-only, `LEGACY / UNVERIFIED`).
 
 **Engineering tool — never advance a gate without consensus unless `on_cap: proceed_with_flags`, and
 never clear a blocking peer dispute with a rebuttal; resolve it against the cited source or flag both

@@ -8,6 +8,27 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
 ## [Unreleased]
 
 ### Added
+- **Workflow integrity: every gate decision is bound to the exact reviewed artifact (schema v2).**
+  New runs record `schema_version: 2` and bind each gate to canonical SHA-256 **content bindings** —
+  `artifact_sha256` over the exact Builder-artifact bytes (CRLF-preserving) and `dag_sha256` /
+  `node_sha256` over the status-free DAG / node definition. The CLI gains `bindings` (the trusted
+  metadata the Critic verdict must **echo**) and `approve-plan` (records human approval of the
+  accepted plan/DAG); `verdict` rejects a missing or mismatched binding before recording any decision.
+  It enforces the configured **phase order** (REPRODUCE → PLAN → optional approval → dependencies →
+  optional FINAL) and legal node **transitions** — `pending -> done`, reviewing a `pending` node, and
+  FINAL before completion are now rejected — and **freezes** the accepted plan/DAG and each reviewed
+  node (any change requires a fresh run). `report` is configuration-aware: `CLEAN` requires every
+  configured phase present, ordered, accepted, and currently bound, with new
+  `INVALID` / `BLOCKED` / `FLAGGED` / `IN PROGRESS` statuses surfacing violations. A pre-schema-2
+  **legacy** run stays readable (`report`/`status`/`clean`/`critic-lenses`) but is `LEGACY /
+  UNVERIFIED`, never `CLEAN`, and refuses mutation — start a fresh run (no migration is inferred). All
+  three skills (`crucible`, `deep-dive`, `pr-review`) and their references now run the binding
+  handshake (log the artifact → `crucible bindings` → seed as trusted CLI metadata → the Critic/peer
+  verdict echoes the hashes). Design:
+  `docs/superpowers/specs/2026-07-19-workflow-integrity-design.md`; plan:
+  `docs/superpowers/plans/2026-07-19-workflow-integrity.md`. Guarded by `tests/test_integrity.py`,
+  `tests/test_workflow.py`, `tests/test_workflow_integrity.py`, `tests/test_report.py`, and the
+  skill/reference/docs guards.
 - **New independent `pr-review` skill (`skills/pr-review/`, `/pr-review <pr-or-diff>`).** A two-model
   **symmetric** adversarial *review* of a pull request: two **equal peers** (no Builder/Critic
   asymmetry) review a **GitHub PR** (via `gh`) or a **local diff** independently against the real
@@ -32,6 +53,14 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
   only; no CLI/behavior change. Guarded by `tests/test_references.py`.
 
 ### Security
+- **Gate decisions are content-bound and phase-ordered (schema v2), not eyeballed.** The CLI now
+  binds every gate decision to the exact reviewed artifact via canonical SHA-256 content bindings the
+  Critic verdict must echo, enforces the configured phase order and legal node transitions, and
+  freezes the accepted plan/DAG/node — so a substituted or edited artifact is rejected rather than
+  certified, and `CLEAN` requires a complete, ordered, currently-bound workflow. This is a determinism
+  guarantee derived from the append-only run log, not a defense against an operator who can rewrite
+  arbitrary files or run-log bytes (no signing key, no sandbox); pre-schema-2 legacy runs are
+  read-only and reported `LEGACY / UNVERIFIED`. See `SECURITY.md` and `docs/cli.md`.
 - **`pr-review` gates reviewed-code execution on explicit consent (execution trust boundary).**
   Reviewing a change is now separated from executing it: a **GitHub PR URL/number** and a
   **diff-file** review are **static/CI-only** and never execute the reviewed code locally. Running

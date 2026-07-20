@@ -1,6 +1,8 @@
 # Workflow Integrity and Artifact Binding — Design
 
-**Status:** proposed. **Type:** deterministic CLI/run-log contract hardening.
+**Status:** implemented. **Type:** deterministic CLI/run-log contract hardening.
+**Companion plan:**
+[`docs/superpowers/plans/2026-07-19-workflow-integrity.md`](../plans/2026-07-19-workflow-integrity.md).
 
 ## Problem
 
@@ -106,7 +108,10 @@ Add a focused `scripts/crucible/integrity.py` owner for canonicalization and val
 
 ### Text artifacts
 
-`artifact_sha256` is SHA-256 over the exact UTF-8 bytes of the non-empty `builder_output` payload.
+`artifact_sha256` is SHA-256 over the exact bytes of the non-empty UTF-8 artifact file. The CLI reads
+the file with `Path.read_bytes()`, hashes those bytes, then strictly decodes the same bytes as UTF-8
+for the run-log payload. It never uses universal-newline text reads before hashing, so CRLF and LF
+artifacts remain distinct.
 
 ### DAG definition
 

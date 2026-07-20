@@ -33,6 +33,15 @@ by `crucible verdict` — the skill never eyeballs it. Pass the Builder's per-fi
 `crucible verdict --resolutions "$RUN"/res.json` (`{"F1": "wontfix"}`); `decide()` then applies
 `defer_severities` and `strict_rebuttal` and records a `builder_resolution` event.
 
+## A decision is bound to the reviewed artifact
+
+Consensus is recorded only against the **exact** artifact/DAG/node the Critic reviewed. The verdict
+JSON must **echo** the `crucible bindings` fields (`artifact_sha256`, plus `dag_sha256` and — for a
+`dep:<node>` gate — `node_sha256`) as trusted CLI metadata; `crucible verdict` rejects a missing or
+mismatched binding **before** it records any outcome. So `CONSENSUS`/`PROCEED_WITH_FLAGS` cannot
+certify a substituted or edited artifact, and the accepted plan/DAG/node is immutable thereafter — a
+change requires a fresh run.
+
 ## Undischarged load-bearing assumptions block consensus
 
 A **load-bearing analytical claim** — one that gates durable, cross-version, or concurrent state, or

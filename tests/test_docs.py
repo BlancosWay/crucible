@@ -87,3 +87,56 @@ def test_live_docs_do_not_restate_builder_or_critic_defaults():
     inline_default = re.compile(r"\b(?:Defaults:\s*)?(?:Builder|Critic)\s*=\s*", re.IGNORECASE)
     for path in LIVE_DEFAULT_DOCS:
         assert not inline_default.search(path.read_text()), f"{path} restates role defaults"
+
+
+# --- Workflow-integrity (schema-2) documentation guards -------------------------------------------
+# The public docs must document the artifact-binding handshake and the schema-2 legacy behavior so an
+# operator can trust (and debug) the deterministic contract: content bindings, `bindings` /
+# `approve-plan`, legal transitions, accepted-DAG immutability, legacy read-only, and report statuses.
+
+def test_cli_docs_document_bindings_approval_and_legacy():
+    low = (ROOT / "docs" / "cli.md").read_text().lower()
+    assert "bindings" in low                       # the `bindings` command
+    assert "approve-plan" in low                    # the `approve-plan` command
+    assert "artifact_sha256" in low                 # the content binding
+    assert "schema" in low                          # schema version 2
+    assert "legacy" in low                          # legacy read-only behavior
+    assert "transition" in low                      # legal node transitions
+    assert "immutab" in low or "cannot change" in low  # accepted DAG immutability
+
+
+def test_cli_docs_document_report_statuses():
+    low = (ROOT / "docs" / "cli.md").read_text().lower()
+    for status in ("clean", "flagged", "blocked", "invalid", "legacy", "in progress"):
+        assert status in low, f"docs/cli.md omits the {status!r} report status"
+
+
+def test_readme_documents_artifact_binding_and_legacy():
+    low = (ROOT / "README.md").read_text().lower()
+    assert "bound" in low or "binding" in low       # gate decisions bound to reviewed artifacts
+    assert "schema" in low                          # schema-2 runs
+    assert "legacy" in low                          # legacy read-only / unverified
+
+
+def test_security_names_binding_and_phase_enforcement_without_overclaim():
+    sec = (ROOT / "SECURITY.md").read_text()
+    low = sec.lower()
+    assert "binding" in low                          # content bindings
+    assert "phase" in low or "transition" in low     # configured phase / transition enforcement
+    # Honest scope: never claim tamper-proofing against an operator who can rewrite files/log bytes.
+    assert "tamper-proof" not in low
+    assert "tamper-resistant" not in low
+    assert "tamper resistance" not in low
+
+
+def test_changelog_records_workflow_integrity():
+    low = (ROOT / "CHANGELOG.md").read_text().lower()
+    assert "bind" in low                             # artifact/content binding
+    assert "schema" in low                           # schema-2 runs
+    assert "legacy" in low                           # legacy read-only behavior
+
+
+def test_command_docs_mention_artifact_binding():
+    for name in ("crucible", "deep-dive", "pr-review"):
+        low = (ROOT / "commands" / f"{name}.md").read_text().lower()
+        assert "bound" in low or "binding" in low, f"commands/{name}.md omits the binding handshake"

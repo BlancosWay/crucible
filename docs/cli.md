@@ -25,7 +25,19 @@ is the path `init-run` printed.
   review is **static/CI-only** for a PR-URL or diff-file target and executes a reviewed change only
   for a **trusted local checkout** after exact-command **consent** (a skill-level Execution Safety
   Gate, not a CLI feature).
-- **Node statuses** — `pending`, `in_progress`, `in_review`, `done`, `blocked`.
+- **Node statuses** — `pending`, `in_progress`, `in_review`, `done`, `blocked`. Transitions are
+  enforced: `pending -> in_progress | blocked`, `in_progress -> in_review | done | blocked | pending`,
+  `in_review -> in_progress | done | blocked | pending`, `blocked -> pending`, and `done` is terminal.
+  An illegal jump (e.g. `pending -> done`, or reviewing a node while `pending`) is rejected;
+  `set-status --force --status done` remains the explicit, rationale-bearing recovery override.
+- **Schema version & legacy runs** — new runs record `schema_version: 2` in `run_start` (not user
+  configuration; it cannot be overridden). Schema-2 binds every gate decision to the exact reviewed
+  artifact via canonical SHA-256 **content bindings** (`artifact_sha256`, `dag_sha256`, `node_sha256`)
+  and enforces the configured phase order; the accepted plan/DAG and each reviewed node are
+  **immutable** after acceptance. A run with no schema version (or `< 2`) is **legacy**: `report`,
+  `status`, `clean`, and `critic-lenses` stay readable but the report is `LEGACY / UNVERIFIED` (never
+  `CLEAN`), and the mutating commands (`load-dag`, `log`, `verdict`, `set-status`, `approve-plan`,
+  `show-plan`) refuse — start a fresh run. No migration command is provided.
 - **Exit codes** — `0` on success unless noted. `next` and the `should-*` switches use exit codes as
   signals (below).
 
@@ -48,8 +60,18 @@ is the path `init-run` printed.
 
 | Command | Arguments | Behavior |
 |---------|-----------|----------|
-| `log` | `--run RUN`, `--event EVENT`, `--gate GATE`, `--round ROUND` (required), `--file FILE` | Append a Builder or Critic transcript to the run log. `--event` is `builder_output` or `critic_output` (other events are written by their own commands). `--file` supplies the payload; omit it for an empty payload. |
-| `verdict` | `--run RUN`, `--gate GATE`, `--round ROUND` (required), `--max-rounds M`, `--resolutions FILE`, `--file FILE` (required) | Adjudicate the Critic's verdict deterministically into `CONSENSUS`, `CHANGES`, `PROCEED_WITH_FLAGS`, or `CAPPED`, honoring `blocking_severities`, `defer_severities`, and `strict_rebuttal`. `--round` must equal the CLI-derived next round for the gate (one past the number of prior `critic_verdict` events, i.e. consecutive starting at 1); a mismatch is rejected, so the round cap cannot be bypassed by skipping to the cap or repeating a round. `--resolutions` is the Builder's per-finding map (`id` → `fixed` / `deferred` / `wontfix`; a `wontfix` or `deferred` entry must use the object form `{"resolution": "wontfix", "rationale": "…"}` with a non-empty `rationale`, since it clears a finding without a fix — a bare `"wontfix"`/`"deferred"` is rejected); `--max-rounds` overrides the cap (defaults to `max_rounds_plan`/`max_rounds_dep` by gate). Prints the outcome, the findings the Builder will fix, and any unresolved blocking findings; when the PLAN gate settles it also echoes the approved plan + DAG. |
+| `log` | `--run RUN`, `--event EVENT`, `--gate GATE`, `--round ROUND` (required), `--file FILE` | Append a Builder or Critic transcript to the run log. `--event` is `builder_output` or `critic_output` (other events are written by their own commands). A schema-2 `builder_output` **requires `--file`** with a non-empty payload, must be logged for the CLI-derived current round, is rejected after that gate has a terminal event, and records the artifact's `artifact_sha256` (the exact bytes are hashed, CRLF-preserving). `critic_output` payload is optional (omit `--file` for empty). |
+| `verdict` | `--run RUN`, `--gate GATE`, `--round ROUND` (required), `--max-rounds M`, `--resolutions FILE`, `--file FILE` (required) | Adjudicate the Critic's verdict deterministically into `CONSENSUS`, `CHANGES`, `PROCEED_WITH_FLAGS`, or `CAPPED`, honoring `blocking_severities`, `defer_severities`, and `strict_rebuttal`. The verdict JSON must **echo** the gate's content bindings (`artifact_sha256` + gate-specific `dag_sha256`/`node_sha256` from `bindings`); a missing or mismatched binding is rejected **before** any decision is logged. `--round` must equal the CLI-derived next round for the gate (one past the number of prior `critic_verdict` events, i.e. consecutive starting at 1); a mismatch is rejected, so the round cap cannot be bypassed by skipping to the cap or repeating a round. `--resolutions` is the Builder's per-finding map (`id` → `fixed` / `deferred` / `wontfix`; a `wontfix` or `deferred` entry must use the object form `{"resolution": "wontfix", "rationale": "…"}` with a non-empty `rationale`, since it clears a finding without a fix — a bare `"wontfix"`/`"deferred"` is rejected); `--max-rounds` overrides the cap (defaults to `max_rounds_plan`/`max_rounds_dep` by gate). Prints the outcome, the findings the Builder will fix, and any unresolved blocking findings; when the PLAN gate settles it also echoes the approved plan + DAG. The validated bindings are persisted on `critic_verdict` and every terminal event for provenance. |
+
+## Content bindings & human approval
+
+Schema-2 commands that bind a gate decision to the exact reviewed artifact. Both require the current
+schema (a legacy run has no verifiable bindings/approval).
+
+| Command | Arguments | Behavior |
+|---------|-----------|----------|
+| `bindings` | `--run RUN`, `--gate GATE`, `--round ROUND` (all required) | Print the deterministic content bindings for a gate/round as machine-readable JSON — `artifact_sha256` for `reproduce`; `artifact_sha256` + `dag_sha256` for `plan`/`final`; `artifact_sha256` + `dag_sha256` + `node_sha256` for `dep:<id>`. The orchestrator appends this JSON to the Critic seed as **trusted CLI metadata**; the Critic echoes it and `verdict` requires an exact match. Validates the same stage prerequisites the `log`/`verdict` handshake enforces. |
+| `approve-plan` | `--run RUN` (required) | Record human approval of the accepted plan as a `plan_approved` event binding the accepted plan/DAG hashes. Requires `human_approval: true`, an accepted PLAN gate whose `dag_sha256` still matches the current tree, and rejects a duplicate or stale approval (and rejects entirely when `human_approval` is disabled). When configured, dependency and FINAL gates then require this recorded approval. Skills call it only **after the human explicitly approves**. |
 
 ## Config-driven gate switches
 
@@ -70,6 +92,21 @@ eyeballing it. All take `--run RUN` (required).
 | `report` | `--run RUN` (required), `--html`, `--open` | Render the run report from the log (Markdown, or HTML with `--html`), print it, and write it into the run dir. `--open` also opens it in a browser (best-effort). |
 | `clean` | `--run RUN` (required), `--force` | Delete a finished run's directory. Refuses any path that isn't a run dir (must contain `runlog.jsonl`) and any run still in progress unless `--force` is given. |
 | `critic-lenses` | `--run RUN` (required) | Print the operator's configured Critic lenses (`critic_checklists`) as one fenced block — each lens file's contents, labelled with size + a short sha256 — for the orchestrator to append to the Critic seed as additive DATA (subordinate to `critic-prompt.md` and the verdict schema). Fail-closed: a missing / relative / symlink / oversized lens prints to stderr and exits non-zero. Prints nothing when `critic_checklists` is unset. |
+
+## Report statuses
+
+For a schema-2 run, `report` derives its status from the run's resolved configuration and the
+append-only log, in this precedence (highest first):
+
+1. **`LEGACY / UNVERIFIED`** — a pre-schema-2 run; its provenance cannot be content-bound (never `CLEAN`).
+2. **`INVALID`** — a recorded binding no longer matches the current artifact/tree, an approval is stale, or an illegal/out-of-order transition is in the log.
+3. **`BLOCKED`** — a required gate capped with unresolved findings.
+4. **`FLAGGED`** — a gate proceeded with flags, or a node completed outside an accepted review gate (`--force`).
+5. **`CLEAN`** — every configured phase is present, ordered, accepted, and currently bound, and all nodes are `done`.
+6. **`IN PROGRESS`** — a required configured phase or node is still incomplete.
+
+The summary names any missing or invalid required phase explicitly. The report is deterministic from
+the log plus the current DAG; it does not claim tamper resistance.
 
 See the [README](../README.md) for the high-level workflow and configuration, and
 [`skills/crucible/SKILL.md`](../skills/crucible/SKILL.md) for the full orchestration spec.

@@ -30,6 +30,16 @@ A node advances (its dependents unblock) only once its own gate reaches consensu
 proceeds-with-flags; `crucible set-status --force` is an explicit human recovery override that
 marks a node `done` without that — recorded only in run-log provenance, not normal gate advancement.
 
+**Every gate decision is bound to the exact reviewed artifact.** New runs are **schema v2**: the CLI
+hashes the Builder artifact and the DAG/node definition into canonical SHA-256 **content bindings**,
+the Critic verdict must **echo** those `artifact_sha256`/`dag_sha256`/`node_sha256` values, and the
+configured phase order (REPRODUCE → PLAN → optional approval → dependencies → optional FINAL) and
+legal node transitions are enforced. The accepted plan/DAG and each reviewed node cannot change after
+acceptance, so a `CLEAN` report means every configured phase was present, ordered, accepted, and still
+bound to the current artifacts; human approval, when enabled, is recorded with `crucible approve-plan`.
+A pre-schema-2 **legacy** run stays readable but reports `LEGACY / UNVERIFIED` and cannot be mutated
+(start a fresh run). See [SECURITY.md](SECURITY.md) and [docs/cli.md](docs/cli.md).
+
 ## Configuration
 
 Every setting has a shipped default in [`config.defaults.json`](config.defaults.json). Override any
@@ -83,8 +93,10 @@ The skill drives the loop and calls the deterministic CLI for every decision:
 ```bash
 RUN=$(PYTHONPATH=scripts python3 -m crucible init-run --goal "add a rate limiter")
 PYTHONPATH=scripts python3 -m crucible load-dag --run "$RUN" --file "$RUN"/dag.json
-PYTHONPATH=scripts python3 -m crucible next --run "$RUN"
+PYTHONPATH=scripts python3 -m crucible log --run "$RUN" --event builder_output --gate plan --round 1 --file "$RUN"/plan.md
+BINDINGS=$(PYTHONPATH=scripts python3 -m crucible bindings --run "$RUN" --gate plan --round 1)   # Critic echoes these
 PYTHONPATH=scripts python3 -m crucible verdict --run "$RUN" --gate plan --round 1 --file "$RUN"/verdict.json
+PYTHONPATH=scripts python3 -m crucible next --run "$RUN"        # first ready node — only after PLAN is accepted
 PYTHONPATH=scripts python3 -m crucible report --run "$RUN" --html
 ```
 

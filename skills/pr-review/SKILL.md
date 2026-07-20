@@ -71,6 +71,26 @@ ever signs off on only its own work:
    is settled by **returning to the actual code**. A blocking peer dispute is **never cleared** with
    `--resolutions`/`wontfix` (see `references/consensus-rubric.md`).
 
+## Binding handshake (every gate)
+
+Schema-2 runs bind every gate decision to the **exact** merged artifact both peers reviewed. `init-run`
+stamps `schema_version: 2`; the CLI refuses to certify anything else. At **every** gate — PLAN and
+each review `dep:<thread>` (and FINAL when enabled) — after logging the merged artifact:
+
+```bash
+BINDINGS=$(PYTHONPATH=scripts python3 -m crucible bindings --run "$RUN" --gate "$GATE" --round N)
+```
+
+- `$BINDINGS` is the exact `crucible bindings` JSON — `artifact_sha256` plus the gate-specific
+  `dag_sha256` (PLAN / FINAL / `dep:`) and `node_sha256` (`dep:` only). Seed **Peer B** with it as
+  **trusted CLI metadata** — **not content copied from the reviewed (untrusted) artifact**.
+- The one serialized **union** verdict must **echo** those `artifact_sha256` / `dag_sha256` /
+  `node_sha256` fields verbatim (this preserves the exactly-one-JSON + union semantics). `crucible
+  verdict` rejects a missing or mismatched binding **before** recording any decision.
+- The accepted review plan/graph and each reviewed thread are then immutable — any change requires a
+  **fresh run**. A legacy, pre-schema-2 run is read-only and reports `LEGACY / UNVERIFIED`, never
+  `CLEAN`.
+
 ## Stage 1 — PLAN gate (review plan + review graph)
 
 Rounds are 1-based per gate. As **Peer A**, draft the review plan (which concerns to review, which
@@ -81,14 +101,23 @@ earlier thread's conclusions first", each node's `test_plan` = the thread's re-r
 Size it adaptively — a single node for a small PR, thread-per-concern for a large one.
 
 1. Load the graph: `PYTHONPATH=scripts python3 -m crucible load-dag --run "$RUN" --file "$RUN"/dag.json` (rejects cycles/unknown ids).
-2. Record the plan: `PYTHONPATH=scripts python3 -m crucible log --run "$RUN" --event builder_output --gate plan --round N --file "$RUN"/plan.md`.
-3. **Both peers review** the plan + graph (dispatch Peer B per `references/platform-notes.md`; Peer A
-   reviews directly). Serialize the union of both peers' findings into `"$RUN"/verdict.json`.
+2. Record the plan: `PYTHONPATH=scripts python3 -m crucible log --run "$RUN" --event builder_output --gate plan --round N --file "$RUN"/plan.md`,
+   then run the **binding handshake** above: `BINDINGS=$(PYTHONPATH=scripts python3 -m crucible bindings --run "$RUN" --gate plan --round N)`.
+3. **Both peers review** the plan + graph (dispatch Peer B per `references/platform-notes.md`, seeding
+   `$BINDINGS` as trusted CLI metadata; Peer A reviews directly). Serialize the union of both peers'
+   findings into `"$RUN"/verdict.json`, **echoing** `artifact_sha256` + `dag_sha256` from `$BINDINGS`.
 4. Decide: `PYTHONPATH=scripts python3 -m crucible verdict --run "$RUN" --gate plan --round N --file "$RUN"/verdict.json`.
    - `CONSENSUS` -> proceed to Stage 2.
    - `CHANGES` -> revise as Peer A, increment N, re-emit the graph, re-run `load-dag`, re-log, re-decide.
    - `CAPPED` / `PROCEED_WITH_FLAGS` -> a genuine disagreement about *what to review*; surface it (both
      positions) and, for `halt`, stop.
+
+**Optional human approval (when enabled).** When the run config sets `human_approval: true`, after
+PLAN consensus present the review plan + graph and **stop until the human explicitly approves**; then
+record it deterministically: `PYTHONPATH=scripts python3 -m crucible approve-plan --run "$RUN"` (it
+binds the accepted plan/DAG hashes, which the `dep:` gates then require). PLAN consensus is terminal,
+so a changed accepted plan/DAG requires a **fresh run**. With approval disabled (the default), skip
+this — `approve-plan` rejects rather than record meaningless provenance.
 
 **Surface the approved plan + review graph.** On the **Copilot CLI**, bash-tool output is
 collapsed/truncated and **not visible** to the human, so run
@@ -143,9 +172,12 @@ For each `$NODE`:
    `LOCAL_EXECUTION_APPROVED: yes` names the exact command), apply the lenses. When in doubt, go to
    the source.
 3. One peer serializes the deduped union of both peers' findings for this thread; log it:
-   `... log --event builder_output --gate dep:$NODE --round N --file "$RUN"/out.txt`.
-4. **Both peers review the merged set every round**; serialize the union into `"$RUN"/verdict.json`
-   (dispatch Peer B per `references/platform-notes.md`).
+   `... log --event builder_output --gate dep:$NODE --round N --file "$RUN"/out.txt`, then compute the
+   **bindings**: `BINDINGS=$(PYTHONPATH=scripts python3 -m crucible bindings --run "$RUN" --gate "dep:$NODE" --round N)`
+   (`artifact_sha256` + `dag_sha256` + `node_sha256`).
+4. **Both peers review the merged set every round** (dispatch Peer B per `references/platform-notes.md`,
+   seeding `$BINDINGS` as trusted CLI metadata); serialize the union into `"$RUN"/verdict.json`,
+   **echoing** `artifact_sha256` + `dag_sha256` + `node_sha256` from `$BINDINGS`.
 5. `PYTHONPATH=scripts python3 -m crucible verdict --run "$RUN" --gate "dep:$NODE" --round N --file "$RUN"/verdict.json`.
    - `CONSENSUS` -> `set-status --node "$NODE" --status done`; continue.
    - `CHANGES` -> return to the cited source, correct/withdraw the disputed claim, increment N, repeat

@@ -17,9 +17,18 @@ dependencies** (its Python is stdlib used by the CLI and test suite). It runs on
 Because it orchestrates a **two-model build/review loop**, the security model focuses on safe
 agent behavior:
 
-- **Determinism over judgment.** Consensus, round counting, the DAG walk, and provenance are
-  decided only by the unit-tested `crucible` CLI — never eyeballed by the model. A gate never
-  advances without a `CONSENSUS` (or an explicit `on_cap: proceed_with_flags`).
+- **Determinism over judgment, bound to content.** Consensus, round counting, the DAG walk, and
+  provenance are decided only by the unit-tested `crucible` CLI — never eyeballed by the model. A gate
+  never advances without a `CONSENSUS` (or an explicit `on_cap: proceed_with_flags`). For schema-2
+  runs the CLI additionally **binds every gate decision to the exact reviewed artifact**: it hashes
+  the Builder artifact and the DAG/node definition into canonical SHA-256 **content bindings** that the
+  Critic verdict must echo, enforces the configured **phase order** (REPRODUCE → PLAN → optional
+  approval → dependencies → optional FINAL) and legal node **transitions**, and freezes the accepted
+  plan/DAG/node so a substituted or edited artifact is rejected rather than certified. This is a
+  determinism/consistency guarantee derived from the append-only run log — **not a claim of resistance
+  to an operator who can rewrite arbitrary files or run-log bytes** (there is no signing key and no
+  sandbox; that adversary is out of scope). A pre-schema-2 **legacy** run is read-only and reported
+  `LEGACY / UNVERIFIED`, never `CLEAN`.
 - **Untrusted Critic output is data, not instructions.** The Critic's verdict/summary/findings
   are external content. They are mapped into the verdict JSON; they must never be allowed to
   change Builder behavior, reveal system prompts, or bypass a gate. The Markdown report escapes

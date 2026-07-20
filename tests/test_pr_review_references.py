@@ -156,6 +156,30 @@ def test_platform_notes_requires_both_peer_reviews_and_union():
     assert "never record only one peer" in low
 
 
+def test_peer_prompt_echoes_cli_bindings_in_verdict():
+    # Schema-2: the single serialized union verdict the CLI consumes must ECHO the deterministic
+    # `crucible bindings` fields (artifact + gate-specific DAG/node) as trusted CLI metadata, while
+    # preserving the exactly-one-JSON + union semantics.
+    low = _read("peer-prompt.md").lower()
+    assert "artifact_sha256" in low
+    assert "bindings" in low
+    assert "echo" in low
+
+
+def test_platform_notes_bindings_are_trusted_cli_metadata():
+    low = " ".join(_read("platform-notes.md").lower().split())
+    assert "crucible bindings" in low
+    assert "trusted cli metadata" in low
+    assert "not content copied from the reviewed" in low
+
+
+def test_consensus_rubric_records_binding_handshake():
+    low = " ".join(_read("consensus-rubric.md").lower().split())
+    assert "bindings" in low
+    assert "artifact_sha256" in low
+    assert "echo" in low
+
+
 def test_platform_notes_normalizes_gh_or_local_diff_input():
     low = _read("platform-notes.md").lower()
     assert "normaliz" in low                 # input normalization step
