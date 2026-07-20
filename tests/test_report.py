@@ -650,16 +650,86 @@ def test_binding_mismatch_is_invalid(tmp_path):
 
 
 def test_out_of_order_final_is_invalid(tmp_path):
-    # A validly bound FINAL terminal logged while the single node is still pending is out of order
-    # -> INVALID, naming FINAL.
+    # A FINAL terminal recorded BEFORE the dependency completes is out of order even though the tree
+    # later ends done: log FINAL first, then append the dependency terminal and the node's done
+    # transition and save the completed tree. The status is derived from the RECORDED log order, not
+    # merely the final DAG snapshot -> INVALID, naming FINAL.
     cfg = Config.from_dict({"final_review": True})
     run = init_run("g", cfg, base_dir=tmp_path)
-    dag = _bound_dag(("a", "pending"))
+    dag = _bound_dag(("a", "done"))
     _bind_plan(run, dag)
-    _bind_gate(run, dag, "final")
+    _bind_gate(run, dag, "final")   # FINAL terminal logged now, before the dependency completes
+    # Later in log order: the dependency is reviewed and the node is marked done; tree ends done.
+    _bind_dep(run, dag, "a")
+    run.append("node_status_change", node="a", status="done",
+               dag_sha256=dag_sha256(dag), node_sha256=node_sha256(dag, "a"))
     block = _summary_block(render_markdown(run))
     assert "Status:** INVALID" in block
     assert "FINAL" in block
+
+
+def test_missing_builder_output_artifact_is_invalid(tmp_path):
+    # A PLAN terminal that carries an artifact_sha256 but has NO same-gate/same-round builder_output
+    # to bind it to is an unbound (unreviewable) artifact -> INVALID, never CLEAN.
+    cfg = Config.from_dict({"final_review": False})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    dag = _bound_dag(("a", "done"))
+    run.save_dag(dag.to_dict())
+    a = artifact_sha256(b"reviewed plan")
+    # PLAN consensus with an artifact hash, but no builder_output logged for plan/round 1.
+    run.append("gate_consensus", gate="plan", round=1, artifact_sha256=a, dag_sha256=dag_sha256(dag))
+    _bind_dep(run, dag, "a")
+    block = _summary_block(render_markdown(run))
+    assert "Status:** INVALID" in block
+    assert "CLEAN" not in block
+
+
+def test_wrong_artifact_sha256_is_invalid(tmp_path):
+    # The PLAN terminal's artifact_sha256 disagrees with the bytes of its same-gate/same-round
+    # builder_output payload (a tampered/stale binding) -> INVALID, never CLEAN.
+    cfg = Config.from_dict({"final_review": False})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    dag = _bound_dag(("a", "done"))
+    run.save_dag(dag.to_dict())
+    run.append("builder_output", gate="plan", round=1, payload="reviewed plan",
+               artifact_sha256=artifact_sha256(b"reviewed plan"))
+    # The terminal records a DIFFERENT artifact hash than the payload bytes hash to.
+    run.append("gate_consensus", gate="plan", round=1, artifact_sha256="0" * 64,
+               dag_sha256=dag_sha256(dag))
+    _bind_dep(run, dag, "a")
+    block = _summary_block(render_markdown(run))
+    assert "Status:** INVALID" in block
+    assert "CLEAN" not in block
+
+
+def test_wrong_round_artifact_is_invalid(tmp_path):
+    # The only PLAN builder_output is logged under a different round than the accepted terminal, so
+    # the terminal has no same-gate/same-round artifact to bind -> INVALID, never CLEAN.
+    cfg = Config.from_dict({"final_review": False})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    dag = _bound_dag(("a", "done"))
+    run.save_dag(dag.to_dict())
+    a = artifact_sha256(b"reviewed plan")
+    run.append("builder_output", gate="plan", round=2, payload="reviewed plan", artifact_sha256=a)
+    run.append("gate_consensus", gate="plan", round=1, artifact_sha256=a, dag_sha256=dag_sha256(dag))
+    _bind_dep(run, dag, "a")
+    block = _summary_block(render_markdown(run))
+    assert "Status:** INVALID" in block
+    assert "CLEAN" not in block
+
+
+def test_dep_terminal_unbound_artifact_is_invalid(tmp_path):
+    # A dependency terminal that is DAG/node-bound but whose artifact_sha256 has no backing
+    # builder_output is an unbound completion -> INVALID, never CLEAN.
+    cfg = Config.from_dict({"final_review": False})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    dag = _bound_dag(("a", "done"))
+    _bind_plan(run, dag)
+    run.append("gate_consensus", gate="dep:a", round=1, artifact_sha256="0" * 64,
+               dag_sha256=dag_sha256(dag), node_sha256=node_sha256(dag, "a"))
+    block = _summary_block(render_markdown(run))
+    assert "Status:** INVALID" in block
+    assert "CLEAN" not in block
 
 
 def test_complete_bound_configured_workflow_is_clean(tmp_path):

@@ -172,8 +172,9 @@ def test_workflow_issues_empty_for_satisfied_minimal_config(tmp_path):
     dag = _dag(status="done")
     # a bound plan + a bound accepted dep gate for the single done node
     _bind_plan(run, dag)
-    run.append("builder_output", gate="dep:a", round=1, payload="impl", artifact_sha256="c" * 64)
-    run.append("gate_consensus", gate="dep:a", round=1, artifact_sha256="c" * 64,
+    impl = artifact_sha256(b"impl")
+    run.append("builder_output", gate="dep:a", round=1, payload="impl", artifact_sha256=impl)
+    run.append("gate_consensus", gate="dep:a", round=1, artifact_sha256=impl,
                dag_sha256=dag_sha256(dag), node_sha256=node_sha256(dag, "a"))
     assert workflow_issues(run.read_events(), dag, cfg) == []
 
@@ -196,3 +197,70 @@ def test_workflow_issues_invalid_dag_binding_and_flagged_force(tmp_path):
     run.save_dag(_dag(files=["different.py"], status="done").to_dict())
     invalid = workflow_issues(run.read_events(), _dag(files=["different.py"], status="done"), cfg)
     assert any(i.kind == "invalid" and "DAG binding" in i.message for i in invalid)
+
+
+def test_workflow_issues_flags_unbound_terminal_artifact(tmp_path):
+    # A PLAN terminal whose artifact_sha256 has no same-gate/same-round builder_output to bind it is
+    # an "invalid" artifact-binding issue (the accepted decision refers to no reviewed artifact).
+    cfg = Config.from_dict({"final_review": False})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    dag = _dag(status="done")
+    run.save_dag(dag.to_dict())
+    # PLAN consensus is DAG-bound and carries an artifact hash, but NO builder_output backs it.
+    run.append("gate_consensus", gate="plan", round=1, artifact_sha256="a" * 64,
+               dag_sha256=dag_sha256(dag))
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "invalid" and "PLAN" in i.message for i in issues)
+
+
+def test_workflow_issues_flags_stale_artifact_binding(tmp_path):
+    # The PLAN terminal's artifact_sha256 disagrees with the bytes of its same-gate/same-round
+    # builder_output payload -> an "invalid" artifact-binding issue.
+    cfg = Config.from_dict({"final_review": False})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    dag = _dag(status="done")
+    run.save_dag(dag.to_dict())
+    run.append("builder_output", gate="plan", round=1, payload="reviewed plan",
+               artifact_sha256=artifact_sha256(b"reviewed plan"))
+    run.append("gate_consensus", gate="plan", round=1, artifact_sha256="b" * 64,
+               dag_sha256=dag_sha256(dag))
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "invalid" and "PLAN" in i.message for i in issues)
+
+
+def test_workflow_issues_flags_out_of_order_final(tmp_path):
+    # FINAL recorded before the node's dependency terminal / done transition, though the tree ends
+    # done, is an "invalid" out-of-order issue naming FINAL (log order, not just current DAG state).
+    cfg = Config.from_dict({"final_review": True})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    dag = _dag(status="done")
+    _bind_plan(run, dag)
+    fa = artifact_sha256(b"final artifact")
+    run.append("builder_output", gate="final", round=1, payload="final artifact", artifact_sha256=fa)
+    run.append("gate_consensus", gate="final", round=1, artifact_sha256=fa, dag_sha256=dag_sha256(dag))
+    # The dependency terminal and the node's done transition are appended AFTER the FINAL terminal.
+    da = artifact_sha256(b"impl a")
+    run.append("builder_output", gate="dep:a", round=1, payload="impl a", artifact_sha256=da)
+    run.append("gate_consensus", gate="dep:a", round=1, artifact_sha256=da,
+               dag_sha256=dag_sha256(dag), node_sha256=node_sha256(dag, "a"))
+    run.append("node_status_change", node="a", status="done",
+               dag_sha256=dag_sha256(dag), node_sha256=node_sha256(dag, "a"))
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "invalid" and "FINAL" in i.message for i in issues)
+
+
+def test_workflow_issues_flags_dep_terminal_after_done(tmp_path):
+    # A dependency terminal recorded AFTER the node's non-forced done transition is out of order
+    # (the node was marked done before its review reached consensus) -> "invalid".
+    cfg = Config.from_dict({"final_review": False})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    dag = _dag(status="done")
+    _bind_plan(run, dag)
+    run.append("node_status_change", node="a", status="done",
+               dag_sha256=dag_sha256(dag), node_sha256=node_sha256(dag, "a"))
+    da = artifact_sha256(b"impl a")
+    run.append("builder_output", gate="dep:a", round=1, payload="impl a", artifact_sha256=da)
+    run.append("gate_consensus", gate="dep:a", round=1, artifact_sha256=da,
+               dag_sha256=dag_sha256(dag), node_sha256=node_sha256(dag, "a"))
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "invalid" and "a" in i.message for i in issues)
