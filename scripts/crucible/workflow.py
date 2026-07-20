@@ -24,12 +24,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from crucible.integrity import artifact_sha256, dag_sha256, node_sha256
+from crucible.integrity import artifact_sha256, dag_sha256, event_bindings, node_sha256
 from crucible.symmetric import (
     SYMMETRIC_WORKFLOWS,
     FindingSet,
     accepted_finding_set_for_gate,
     accepted_findings,
+    peer_decision_binds,
     validate_final_finding_set,
     workflow_kind,
 )
@@ -377,6 +378,8 @@ def _symmetric_accepted_set_issues(
 
     - a terminal with no pre-terminal accepted set (the gate certified without persisting its result);
     - a pre-terminal accepted set whose bindings do not match the terminal (bound to another artifact);
+    - a pre-terminal accepted set whose preceding ``symmetric_verdict`` bound a different
+      artifact/DAG/node (the accepted result is not the candidate the two peers reviewed);
     - a pre-terminal accepted set whose payload is not a valid finding set (malformed);
     - an accepted set recorded AFTER its advancing terminal, or with no advancing terminal at all
       (orphan/post-terminal crash residue that must never count as accepted state);
@@ -411,25 +414,27 @@ def _symmetric_accepted_set_issues(
     return issues
 
 
-def _symmetric_bindings(event: dict[str, Any]) -> dict[str, Any]:
-    """The content bindings recorded on an event (absent fields dropped), for exact comparison."""
-    return {key: event[key] for key in ("artifact_sha256", "dag_sha256", "node_sha256")
-            if event.get(key) is not None}
-
-
 def _accepted_set_content_issues(
     events: list[dict[str, Any]], gate: str, terminal: dict[str, Any], pre_terminal: list[int]
 ) -> list[WorkflowIssue]:
-    """Binding-match and payload-validity of a gate's pre-terminal accepted finding set."""
-    want = _symmetric_bindings(terminal)
-    bound = [i for i in pre_terminal if _symmetric_bindings(events[i]) == want]
+    """Binding-match, peer-decision binding, and payload-validity of a gate's pre-terminal accepted
+    finding set."""
+    want = event_bindings(terminal)
+    bound = [i for i in pre_terminal if event_bindings(events[i]) == want]
     if not bound:
         return [WorkflowIssue(
             "invalid",
             f"symmetric gate {gate!r} accepted finding set does not bind the same artifact/DAG/node "
             f"as its accepted terminal")]
+    accepted_idx = bound[-1]
+    if not peer_decision_binds(events, accepted_idx, gate, events[accepted_idx].get("round"), want):
+        return [WorkflowIssue(
+            "invalid",
+            f"symmetric gate {gate!r} accepted finding set is not bound to a matching peer decision "
+            f"(no symmetric_verdict for this gate/round echoes the same artifact/DAG/node — the two "
+            f"peers reviewed a different candidate)")]
     try:
-        FindingSet.from_dict(events[bound[-1]].get("payload"))
+        FindingSet.from_dict(events[accepted_idx].get("payload"))
     except (ValueError, TypeError):
         return [WorkflowIssue(
             "invalid",

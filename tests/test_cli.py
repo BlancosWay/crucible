@@ -2444,6 +2444,28 @@ def _append_raw_event(run_dir, record):
         fh.write(json.dumps(record) + "\n")
 
 
+def _rewrite_events(run_dir, mutate):
+    """Read the run-log, apply ``mutate`` to the parsed records in place, and rewrite it. Used to
+    forge corrupt history the CLI never writes (e.g. a peer decision bound to a different artifact
+    than the accepted set it brackets)."""
+    path = Path(run_dir) / "runlog.jsonl"
+    records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
+               if line.strip()]
+    mutate(records)
+    path.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
+
+
+def _mutate_run_dag(run_dir, node_id, mutate_node):
+    """Edit the run's current dag.json node definition after acceptance (status-preserving), so its
+    status-free node/DAG sha256 changes and the accepted terminals bind a now-stale tree."""
+    dag_path = Path(run_dir) / "dag.json"
+    dag = json.loads(dag_path.read_text())
+    for node in dag["nodes"]:
+        if node["id"] == node_id:
+            mutate_node(node)
+    dag_path.write_text(json.dumps(dag))
+
+
 def test_result_commands_reject_build_run(tmp_path):
     run_dir = _init(tmp_path)
     _load(run_dir, tmp_path, {"a": "pending"})
@@ -2485,6 +2507,54 @@ def test_result_commands_reject_orphan_accepted_set(tmp_path):
         r = _run([command, "--run", run_dir])
         assert r.returncode != 0, command
         assert "incomplete" in r.stderr.lower()
+
+
+def test_result_commands_reject_binding_mismatched_peer_decision(tmp_path):
+    # F1: corrupt history where the dependency's symmetric_verdict (the two peers' decision) binds a
+    # different artifact than its accepted finding set + terminal. The accepted result is not the
+    # candidate the peers reviewed, so it is never effective and BOTH result commands fail closed.
+    run_dir = _complete_one_node_symmetric(tmp_path, "auth",
+                                           findings=[_accepted_finding("dep:auth", "F1", "major")])
+
+    def _mutate(records):
+        for record in records:
+            if record.get("event") == "symmetric_verdict" and record.get("gate") == "dep:auth":
+                record["artifact_sha256"] = "9" * 64
+    _rewrite_events(run_dir, _mutate)
+    for command in ("accepted-findings", "review-result"):
+        r = _run([command, "--run", run_dir])
+        assert r.returncode != 0, command
+        assert "incomplete" in r.stderr.lower()
+
+
+def test_result_commands_reject_stale_node_definition(tmp_path):
+    # F2: after a valid accepted dependency, the current node definition is mutated (dag.json edited),
+    # so the accepted dependency terminal now binds a stale dag/node sha256. Both Finish-time result
+    # commands must fail closed rather than publish a stale review result.
+    run_dir = _complete_one_node_symmetric(tmp_path, "auth",
+                                           findings=[_accepted_finding("dep:auth", "F1", "major")])
+    _mutate_run_dag(run_dir, "auth",
+                    lambda node: node.__setitem__("files", list(node.get("files", [])) + ["x.py"]))
+    for command in ("accepted-findings", "review-result"):
+        r = _run([command, "--run", run_dir])
+        assert r.returncode != 0, command
+        assert "invalid" in r.stderr.lower()
+
+
+def test_review_result_rejects_stale_final_dag_binding(tmp_path):
+    # F2 (FINAL dimension): a complete run WITH FINAL whose tree is mutated after FINAL consensus.
+    # The accepted FINAL terminal now binds a stale dag_sha256, so review-result fails closed.
+    run_dir = _complete_one_node_symmetric(tmp_path, "auth", final_review=True,
+                                           findings=[_accepted_finding("dep:auth", "F1", "major")])
+    union = json.loads(_run(["accepted-findings", "--run", run_dir]).stdout)
+    candidate = {"summary": "final",
+                 "findings": union["findings"] + [_accepted_finding("final", "C1", "nit")]}
+    assert _symmetric_final_verdict(run_dir, tmp_path, candidate).stdout.strip() == "CONSENSUS"
+    _mutate_run_dag(run_dir, "auth",
+                    lambda node: node.__setitem__("files", list(node.get("files", [])) + ["x.py"]))
+    r = _run(["review-result", "--run", run_dir])
+    assert r.returncode != 0
+    assert "invalid" in r.stderr.lower()
 
 
 def test_review_result_requires_accepted_final_when_enabled(tmp_path):

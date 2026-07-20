@@ -66,6 +66,23 @@ def node_sha256(dag: DAG, node_id: str) -> str:
     return canonical_json_sha256(dag.node_definition_dict(node_id))
 
 
+# The content bindings recorded on a schema-v2 decision event: the reviewed ``artifact`` plus the
+# relevant ``dag``/``node`` identity. Owned here so the symmetric result projection
+# (``crucible.symmetric``) and the workflow integrity checks (``crucible.workflow``) compare gate
+# events by the SAME shape instead of each re-spelling the key tuple.
+BINDING_KEYS = ("artifact_sha256", "dag_sha256", "node_sha256")
+
+
+def event_bindings(event: dict[str, Any]) -> dict[str, str]:
+    """The content bindings recorded on ``event`` (absent fields dropped), for exact comparison.
+
+    A gate compares only the bindings it actually carries — a ``plan``/``final`` event has no
+    ``node_sha256`` — so dropping ``None`` fields avoids a spurious mismatch on a binding the gate
+    never records.
+    """
+    return {key: event[key] for key in BINDING_KEYS if event.get(key) is not None}
+
+
 def run_schema_version(events: list[dict[str, Any]]) -> int | None:
     """Return the schema version recorded on the run's first ``run_start`` event, or ``None`` when
     it is absent or malformed (a legacy / unverified run)."""

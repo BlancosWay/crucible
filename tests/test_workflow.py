@@ -446,10 +446,13 @@ def _af(source_gate="dep:a", fid="F1", severity="major"):
             "location": "src/a.py:1", "claim": "c", "suggestion": "s"}
 
 
-def _symmetric_run(tmp_path, *, accepted="valid", final=None):
+def _symmetric_run(tmp_path, *, accepted="valid", final=None, verdict="match"):
     """A pr-review run with one done node 'a' backed by a symmetric dependency gate, plus optional
     FINAL. ``accepted`` selects a dependency accepted-set fault: ``"valid"``, ``"binding"`` (its
     bindings differ from the terminal), or ``"malformed"`` (its payload is not a valid finding set).
+    ``verdict`` selects a peer-decision fault: ``"match"`` (the symmetric_verdict binds the same
+    artifact/DAG/node as the accepted set + terminal) or ``"mismatch"`` (it binds a different
+    artifact, so the accepted result is not the candidate the peers reviewed).
     ``final`` selects the FINAL accepted-set inclusion: ``None`` (no FINAL gate), ``"valid"`` (adds a
     ``source_gate: final`` extra), or ``"drops"`` (omits the accepted dependency finding)."""
     cfg = Config.from_dict({"final_review": final is not None})
@@ -467,8 +470,9 @@ def _symmetric_run(tmp_path, *, accepted="valid", final=None):
     cand_art = artifact_sha256(cand_text.encode("utf-8"))
     dep_bind = {"artifact_sha256": cand_art, "dag_sha256": dsha, "node_sha256": nsha}
     run.append("builder_output", gate="dep:a", round=1, payload=cand_text, artifact_sha256=cand_art)
+    ver_bind = dep_bind if verdict == "match" else {**dep_bind, "artifact_sha256": "9" * 64}
     run.append("symmetric_verdict", gate="dep:a", round=1, outcome="CONSENSUS", objections=[],
-               candidate=candidate, **dep_bind)
+               candidate=candidate, **ver_bind)
     acc_bind = dep_bind if accepted != "binding" else {**dep_bind, "artifact_sha256": "0" * 64}
     acc_payload = candidate if accepted != "malformed" else {"findings": "not-a-list"}
     run.append("accepted_finding_set", gate="dep:a", round=1, payload=acc_payload, **acc_bind)
@@ -501,6 +505,14 @@ def test_workflow_issues_clean_for_valid_symmetric_run_with_final(tmp_path):
 
 def test_workflow_issues_flags_symmetric_binding_mismatched_accepted_set(tmp_path):
     run, dag, cfg = _symmetric_run(tmp_path, accepted="binding")
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "invalid" and "dep:a" in i.message for i in issues)
+
+
+def test_workflow_issues_flags_symmetric_peer_decision_binding_mismatch(tmp_path):
+    # F1: the symmetric_verdict (the two peers' decision) binds a different artifact than the
+    # accepted set + terminal it brackets, so the accepted result is not the reviewed candidate.
+    run, dag, cfg = _symmetric_run(tmp_path, verdict="mismatch")
     issues = workflow_issues(run.read_events(), dag, cfg)
     assert any(i.kind == "invalid" and "dep:a" in i.message for i in issues)
 

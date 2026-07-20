@@ -382,6 +382,29 @@ def test_accepted_findings_excludes_binding_mismatched_accepted_set():
     assert accepted_findings(events).findings == []
 
 
+def test_accepted_findings_excludes_peer_decision_binding_mismatch():
+    # F1: the two peers' symmetric_verdict binds artifact A, but the accepted set + terminal bind
+    # artifact B (consistent with each other). The accepted result is NOT the candidate the peers
+    # reviewed, so it is corrupt history and never effective.
+    events = _dep_events("auth", findings=[_finding("dep:auth", "F1")], bindings=_bindings())
+    for e in events:
+        if e["event"] == "symmetric_verdict":
+            e["artifact_sha256"] = "0" * 64
+    assert accepted_findings(events).findings == []
+
+
+def test_accepted_finding_set_for_gate_excludes_peer_decision_binding_mismatch():
+    # The single-gate lookup mirrors the union: a binding-mismatched peer decision yields no
+    # effective accepted set for the gate.
+    from crucible.symmetric import accepted_finding_set_for_gate
+
+    events = _dep_events("auth", findings=[_finding("dep:auth", "F1")], bindings=_bindings())
+    for e in events:
+        if e["event"] == "symmetric_verdict":
+            e["dag_sha256"] = "0" * 64
+    assert accepted_finding_set_for_gate(events, "dep:auth") is None
+
+
 def test_accepted_findings_rejects_duplicate_composite_keys_across_events():
     b = _bindings()
     events = _dep_events("auth", findings=[_finding("dep:auth", "F1")], bindings=b)

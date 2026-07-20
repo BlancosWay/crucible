@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from crucible.config import Config
+from crucible.integrity import event_bindings
 from crucible.verdict import (
     VALID_SEVERITIES,
     VALID_VERDICTS,
@@ -325,12 +326,28 @@ def decide_symmetric(
 
 _ADVANCE_TERMINALS = ("gate_consensus", "gate_proceeded_with_flags")
 _TERMINAL_EVENTS = ("gate_consensus", "gate_proceeded_with_flags", "gate_capped")
-_BINDING_KEYS = ("artifact_sha256", "dag_sha256", "node_sha256")
 
 
-def _bindings_of(event: dict[str, Any]) -> dict[str, Any]:
-    """The content bindings recorded on an event (absent fields dropped), for exact comparison."""
-    return {key: event[key] for key in _BINDING_KEYS if event.get(key) is not None}
+def peer_decision_binds(
+    events: list[dict[str, Any]], before_idx: int, gate: str, round_index: Any,
+    bindings: dict[str, Any],
+) -> bool:
+    """Whether a ``symmetric_verdict`` for ``gate``/``round_index`` echoing exactly ``bindings`` is
+    recorded before ``before_idx``.
+
+    The two peers' recorded decision must bind the SAME artifact/DAG/node as the accepted finding set
+    (and terminal) it brackets — otherwise the accepted result is not the candidate the peers
+    reviewed (a corrupt log attesting to artifact A but accepting/certifying artifact B). Shared by
+    the projection here and ``workflow._accepted_set_content_issues`` (which imports it) so the
+    peer-decision binding rule lives in exactly one place.
+    """
+    return any(
+        e.get("event") == "symmetric_verdict"
+        and e.get("gate") == gate
+        and e.get("round") == round_index
+        and event_bindings(e) == bindings
+        for e in events[:before_idx]
+    )
 
 
 def _last_terminal(
@@ -363,24 +380,25 @@ def _is_effective_accepted(events: list[dict[str, Any]], idx: int) -> bool:
     """Whether the ``accepted_finding_set`` at ``events[idx]`` is complete, accepted state.
 
     It counts only when it is bracketed by its gate's atomic decision: a matching
-    ``symmetric_verdict`` (same gate/round) is recorded BEFORE it, and the gate's authoritative
-    ADVANCING terminal (same gate/round/bindings) is recorded AFTER it. An orphan (no advancing
-    terminal), a pre-terminal event with no later terminal, a post-terminal event, or one whose
-    bindings differ from the terminal is incomplete/residual history, never accepted state.
+    ``symmetric_verdict`` (same gate/round AND same artifact/DAG/node bindings) is recorded BEFORE
+    it, and the gate's authoritative ADVANCING terminal (same gate/round/bindings) is recorded AFTER
+    it. An orphan (no advancing terminal), a pre-terminal event with no later terminal, a
+    post-terminal event, one whose bindings differ from the terminal, or one whose preceding peer
+    decision bound a DIFFERENT candidate (so the accepted result was never the reviewed one) is
+    incomplete/corrupt history, never accepted state.
     """
     event = events[idx]
     gate = event.get("gate")
     round_index = event.get("round")
-    binding = _bindings_of(event)
-    if not any(v.get("event") == "symmetric_verdict" and v.get("gate") == gate
-               and v.get("round") == round_index for v in events[:idx]):
+    binding = event_bindings(event)
+    if not peer_decision_binds(events, idx, gate, round_index, binding):
         return False
     terminal, terminal_idx = _authoritative_accepted_terminal(events, gate)
     if terminal is None or terminal_idx is None or terminal_idx <= idx:
         return False
     if terminal.get("round") != round_index:
         return False
-    return _bindings_of(terminal) == binding
+    return event_bindings(terminal) == binding
 
 
 def _effective_accepted_events(

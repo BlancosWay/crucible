@@ -43,6 +43,7 @@ from crucible.workflow import (
     require_plan_ready,
     require_plan_verdict_ready,
     require_reproduce_ready,
+    workflow_issues,
 )
 
 # Events that `crucible log` may append. All other events are emitted by their own
@@ -917,20 +918,45 @@ def _load_result_dag(run: RunLog) -> DAG:
         raise ValueError("incomplete symmetric workflow: no dependency tree is loaded")
 
 
+def _reject_stale_result_bindings(events: list[dict], dag: DAG, cfg: Config, command: str) -> None:
+    """Fail a Finish-time result command closed when the recorded history is INVALID against the
+    CURRENT tree.
+
+    ``workflow_issues`` is the single owner of schema-v2 binding validity: it flags a PLAN/dependency
+    node/FINAL binding that no longer matches the current artifact/tree (a plan/DAG/node substituted
+    after acceptance), and — Task 3 fix — a symmetric accepted set whose peer decision bound a
+    different candidate. A result is a certified Finish-time output, so it must not be published from
+    history the report would render ``INVALID``. Reusing that owner (rather than re-deriving the
+    current-binding checks here) keeps the rule in one place and avoids a ``symmetric`` -> ``workflow``
+    import cycle. Only ``invalid`` issues fail closed; ``missing``/``flagged`` are handled by the
+    completeness guard (an in-progress run) or are audited bypasses.
+    """
+    invalid = [issue.message for issue in workflow_issues(events, dag, cfg)
+               if issue.kind == "invalid"]
+    if invalid:
+        raise SystemExit(
+            f"crucible: {command} refuses to publish a result from invalid workflow history — the "
+            f"recorded decisions no longer bind the current plan/tree: {'; '.join(invalid)}"
+        )
+
+
 def cmd_accepted_findings(args) -> int:
     """Emit the deterministic union of accepted DEPENDENCY finding sets as canonical JSON.
 
     A Finish-time output (design): it requires the current schema, a symmetric workflow, and a
     complete run (every node done and backed by a valid accepted dependency set, no orphan accepted
-    events) before emitting the topologically-ordered union the FINAL artifact is assembled from. It
-    does NOT require FINAL (it precedes it).
+    events) whose recorded decisions still bind the current plan/tree before emitting the
+    topologically-ordered union the FINAL artifact is assembled from. It does NOT require FINAL (it
+    precedes it).
     """
     run = RunLog(args.run)
     require_current_schema(run)
     events = run.read_events()
     _require_symmetric_result_workflow(events, "accepted-findings")
     dag = _load_result_dag(run)
+    cfg = load_config(run.path / "config.json")
     require_complete_symmetric_run(events, dag, require_final=False)
+    _reject_stale_result_bindings(events, dag, cfg, "accepted-findings")
     print(json.dumps(accepted_findings(events, dag).to_dict()))
     return 0
 
@@ -941,7 +967,8 @@ def cmd_review_result(args) -> int:
 
     A Finish-time output (design): it requires the current schema, a symmetric workflow, and a
     complete run — additionally requiring an accepted FINAL gate when ``final_review`` is configured —
-    before deriving the recommendation from the accepted finding set (never from workflow status).
+    whose recorded decisions still bind the current plan/tree before deriving the recommendation from
+    the accepted finding set (never from workflow status).
     """
     run = RunLog(args.run)
     require_current_schema(run)
@@ -950,6 +977,7 @@ def cmd_review_result(args) -> int:
     workflow = _require_symmetric_result_workflow(events, "review-result")
     dag = _load_result_dag(run)
     require_complete_symmetric_run(events, dag, require_final=cfg.final_review)
+    _reject_stale_result_bindings(events, dag, cfg, "review-result")
     print(json.dumps(review_result(events, cfg, workflow)))
     return 0
 
