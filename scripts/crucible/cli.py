@@ -356,6 +356,17 @@ def cmd_set_status(args) -> int:
     dag = DAG.from_dict(run.load_dag())
     if args.node not in dag.nodes:
         raise ValueError(f"unknown node: {args.node}")
+    # --force is the reviewed-gate bypass for a COMPLETION only: its whole purpose is to force a node
+    # to `done` within an accepted plan (recording current DAG/node hashes + rationale). Forcing any
+    # other target (in_progress/in_review/pending/blocked) is not a supported operation — reject it up
+    # front so `--force` can never skip the legal transition table for a non-done node or start work
+    # outside the plan/approval gate.
+    if args.force and args.status != "done":
+        raise SystemExit(
+            f"set-status: --force is only valid with --status done — it is the reviewed-gate "
+            f"completion bypass (records the override + current hashes); refusing to force "
+            f"{args.status!r}."
+        )
     # C2: a node cannot begin or finish work (in_progress/in_review/done) while a dependency
     # is unfinished — that would let `next` schedule its dependents and skip the dependency's
     # work. `pending`/`blocked` are not work statuses and stay settable for recovery. Checked even
@@ -376,7 +387,15 @@ def cmd_set_status(args) -> int:
             "(it bypasses the node's review gate; the reason is recorded in the run log)."
         )
     forced_bindings: dict[str, str] = {}
-    if args.status == "done":
+    # Starting or advancing node work (in_progress/in_review) requires the accepted+bound PLAN the
+    # Critic reviewed — and, when human_approval is configured, the recorded approval — to be in
+    # place first: never begin implementation before the plan/approval gate. Dependencies were
+    # already enforced above (C2, so an unmet dep still reports the dependency problem). Recovery
+    # statuses (`pending`/`blocked`) are intentionally left ungated so a run can always be reset or
+    # unblocked.
+    if args.status in ("in_progress", "in_review"):
+        require_plan_ready(run, load_config(run.path / "config.json"))
+    elif args.status == "done":
         cfg = load_config(run.path / "config.json")
         if args.force:
             # A forced completion is the explicit reviewed-gate bypass, but it still happens WITHIN
@@ -409,7 +428,10 @@ def cmd_set_status(args) -> int:
                     f"gate {node_gate!r} was accepted). The plan/DAG/node was changed after review; "
                     f"re-review the current node or start a fresh run."
                 )
-    dag.set_status(args.node, args.status, force=args.force)
+    # `--force` only ever bypasses the transition table for a `done` completion (guarded above so a
+    # non-done target already exited); every other status must follow the legal ALLOWED_TRANSITIONS
+    # table. Pass the conjunction so DAG.set_status can never skip the table for a non-done node.
+    dag.set_status(args.node, args.status, force=args.force and args.status == "done")
     run.save_dag(dag.to_dict())
     run.append("node_status_change", node=args.node, status=args.status,
                forced=bool(args.force), rationale=rationale, **forced_bindings)

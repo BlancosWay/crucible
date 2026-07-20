@@ -1525,6 +1525,53 @@ def test_set_status_force_does_not_bypass_dependency_check(tmp_path):
     assert "dependenc" in r.stderr.lower()
 
 
+# --- F1: starting node work requires an accepted (and, if configured, approved) PLAN ----
+
+def test_set_status_in_progress_refused_before_plan(tmp_path):
+    # Marking a node in_progress STARTS its implementation (next then schedules it), so it must wait
+    # for the accepted+bound PLAN the Critic reviewed — never begin work before the plan is settled.
+    # The single node has no deps, so the plan prerequisite is the ONLY unmet gate.
+    run_dir = _init(tmp_path)
+    _load(run_dir, tmp_path, {"a": "pending"})
+    r = _run(["set-status", "--run", run_dir, "--node", "a", "--status", "in_progress"])
+    assert r.returncode != 0
+    assert "plan" in r.stderr.lower()
+    assert not any(e["event"] == "node_status_change" for e in _events(run_dir))
+
+
+def test_set_status_in_progress_refused_before_plan_approval(tmp_path):
+    # Under human_approval, an accepted PLAN is not enough to start work — the recorded approval gates
+    # implementation. With the plan settled but approve-plan omitted, in_progress is refused.
+    run_dir = _approval_run(tmp_path)          # human_approval=True, plan settled, NOT approved
+    r = _run(["set-status", "--run", run_dir, "--node", "a", "--status", "in_progress"])
+    assert r.returncode != 0
+    assert "approval" in r.stderr.lower()
+    assert not any(e["event"] == "node_status_change" for e in _events(run_dir))
+
+
+def test_set_status_force_in_review_rejected(tmp_path):
+    # --force is ONLY the reviewed-gate bypass for a `done` completion; forcing any non-done status
+    # (e.g. in_review) is not a supported operation and is rejected even with a rationale — otherwise
+    # DAG.set_status(force=True) would skip the transition table outside the plan/approval gate.
+    run_dir = _init(tmp_path)
+    _load(run_dir, tmp_path, {"a": "pending"})
+    r = _run(["set-status", "--run", run_dir, "--node", "a", "--status", "in_review",
+              "--force", "--rationale", "x"])
+    assert r.returncode != 0
+    assert "force" in r.stderr.lower() and "done" in r.stderr.lower()
+    assert not any(e["event"] == "node_status_change" for e in _events(run_dir))
+
+
+def test_set_status_recovery_statuses_ungated_by_plan(tmp_path):
+    # Recovery semantics: `blocked`/`pending` are not work-start statuses, so they stay settable even
+    # before the PLAN gate is settled (a run must always be resettable/unblockable). Neither triggers
+    # the plan prerequisite.
+    run_dir = _init(tmp_path)
+    _load(run_dir, tmp_path, {"a": "pending"})
+    assert _run(["set-status", "--run", run_dir, "--node", "a", "--status", "blocked"]).returncode == 0
+    assert _run(["set-status", "--run", run_dir, "--node", "a", "--status", "pending"]).returncode == 0
+
+
 # --- C3: a concluded gate cannot be re-decided --------------------------------
 
 def test_verdict_rejects_already_concluded_gate(tmp_path):
