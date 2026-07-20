@@ -747,6 +747,108 @@ def test_complete_bound_configured_workflow_is_clean(tmp_path):
     assert "Status:** CLEAN" in block
 
 
+def test_final_missing_dag_binding_is_invalid(tmp_path):
+    # F3: an otherwise-complete, otherwise-valid run whose FINAL terminal carries a valid artifact
+    # but NO dag_sha256 binding must not certify — FINAL's DAG binding is required, so a missing one
+    # is INVALID, never CLEAN (a final review over an unspecified tree cannot certify the current run).
+    cfg = Config.from_dict({"final_review": True})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    dag = _bound_dag(("a", "done"))
+    _bind_plan(run, dag)
+    _bind_dep(run, dag, "a")
+    fa = artifact_sha256(b"final artifact")
+    run.append("builder_output", gate="final", round=1, payload="final artifact", artifact_sha256=fa)
+    run.append("gate_consensus", gate="final", round=1, artifact_sha256=fa)  # NO dag_sha256
+    block = _summary_block(render_markdown(run))
+    assert "Status:** INVALID" in block
+    assert "CLEAN" not in block
+    assert "FINAL" in block and "DAG binding" in block
+
+
+def test_final_wrong_dag_binding_is_invalid(tmp_path):
+    # F3: an otherwise-complete, otherwise-valid run whose FINAL terminal binds a WRONG dag_sha256 (a
+    # final review recorded over a different implementation tree) must not certify -> INVALID, never
+    # CLEAN.
+    cfg = Config.from_dict({"final_review": True})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    dag = _bound_dag(("a", "done"))
+    _bind_plan(run, dag)
+    _bind_dep(run, dag, "a")
+    fa = artifact_sha256(b"final artifact")
+    run.append("builder_output", gate="final", round=1, payload="final artifact", artifact_sha256=fa)
+    run.append("gate_consensus", gate="final", round=1, artifact_sha256=fa, dag_sha256="0" * 64)
+    block = _summary_block(render_markdown(run))
+    assert "Status:** INVALID" in block
+    assert "CLEAN" not in block
+    assert "FINAL" in block and "DAG binding" in block
+
+
+def test_plan_artifact_after_terminal_is_invalid(tmp_path):
+    # F4: a PLAN terminal whose only matching same-gate/same-round builder_output is appended AFTER
+    # the terminal could not have been the artifact the Critic reviewed for that decision -> INVALID,
+    # never CLEAN (a forged log records consensus first, then a matching artifact later).
+    cfg = Config.from_dict({"final_review": False})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    dag = _bound_dag(("a", "done"))
+    run.save_dag(dag.to_dict())
+    a = artifact_sha256(b"reviewed plan")
+    # Terminal FIRST, then a matching builder_output for the same gate/round appended after it.
+    run.append("gate_consensus", gate="plan", round=1, artifact_sha256=a, dag_sha256=dag_sha256(dag))
+    run.append("builder_output", gate="plan", round=1, payload="reviewed plan", artifact_sha256=a)
+    _bind_dep(run, dag, "a")
+    block = _summary_block(render_markdown(run))
+    assert "Status:** INVALID" in block
+    assert "CLEAN" not in block
+
+
+def test_dep_artifact_after_terminal_is_invalid(tmp_path):
+    # F4 (downstream gate): a dependency terminal whose only matching builder_output is appended AFTER
+    # the terminal is an unreviewable binding -> INVALID, never CLEAN.
+    cfg = Config.from_dict({"final_review": False})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    dag = _bound_dag(("a", "done"))
+    _bind_plan(run, dag)
+    da = artifact_sha256(b"impl a")
+    run.append("gate_consensus", gate="dep:a", round=1, artifact_sha256=da,
+               dag_sha256=dag_sha256(dag), node_sha256=node_sha256(dag, "a"))
+    run.append("builder_output", gate="dep:a", round=1, payload="impl a", artifact_sha256=da)
+    block = _summary_block(render_markdown(run))
+    assert "Status:** INVALID" in block
+    assert "CLEAN" not in block
+
+
+def test_final_artifact_after_terminal_is_invalid(tmp_path):
+    # F4 (downstream gate): a FINAL terminal whose only matching builder_output is appended AFTER the
+    # terminal is an unreviewable binding -> INVALID, never CLEAN (even with a correct DAG binding).
+    cfg = Config.from_dict({"final_review": True})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    dag = _bound_dag(("a", "done"))
+    _bind_plan(run, dag)
+    _bind_dep(run, dag, "a")
+    fa = artifact_sha256(b"final artifact")
+    run.append("gate_consensus", gate="final", round=1, artifact_sha256=fa, dag_sha256=dag_sha256(dag))
+    run.append("builder_output", gate="final", round=1, payload="final artifact", artifact_sha256=fa)
+    block = _summary_block(render_markdown(run))
+    assert "Status:** INVALID" in block
+    assert "CLEAN" not in block
+
+
+def test_valid_artifact_survives_later_post_terminal_output(tmp_path):
+    # F4 (pre-terminal-only guard): validation considers pre-terminal Builder outputs only. A valid
+    # pre-terminal PLAN binding is neither replaced nor bypassed by a later same-gate/same-round
+    # builder_output appended after the terminal — the exact terminal binding stands and the run
+    # stays CLEAN (the post-terminal artifact is ignored, not used to flip the outcome either way).
+    cfg = Config.from_dict({"final_review": False})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    dag = _bound_dag(("a", "done"))
+    _bind_plan(run, dag)  # valid pre-terminal PLAN artifact ("reviewed plan") binds the terminal
+    _bind_dep(run, dag, "a")
+    run.append("builder_output", gate="plan", round=1, payload="tampered later plan",
+               artifact_sha256=artifact_sha256(b"tampered later plan"))
+    block = _summary_block(render_markdown(run))
+    assert "Status:** CLEAN" in block
+
+
 def test_forced_current_node_remains_flagged(tmp_path):
     # A node completed via a forced override that records current DAG/node hashes and a rationale
     # is backed but not review-gated -> FLAGGED, and the rationale is surfaced.

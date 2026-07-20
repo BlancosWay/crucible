@@ -264,3 +264,71 @@ def test_workflow_issues_flags_dep_terminal_after_done(tmp_path):
                dag_sha256=dag_sha256(dag), node_sha256=node_sha256(dag, "a"))
     issues = workflow_issues(run.read_events(), dag, cfg)
     assert any(i.kind == "invalid" and "a" in i.message for i in issues)
+
+
+def _bind_dep_a(run, dag, *, payload=b"impl a"):
+    """Record a schema-v2 bound ``dep:a`` terminal (builder_output + gate_consensus) against ``dag``."""
+    a = artifact_sha256(payload)
+    run.append("builder_output", gate="dep:a", round=1, payload=payload.decode("utf-8"),
+               artifact_sha256=a)
+    run.append("gate_consensus", gate="dep:a", round=1, artifact_sha256=a,
+               dag_sha256=dag_sha256(dag), node_sha256=node_sha256(dag, "a"))
+
+
+def test_workflow_issues_flags_final_missing_dag_binding(tmp_path):
+    # F3: a FINAL terminal with a valid artifact but NO dag_sha256 over a done, otherwise-valid tree
+    # is an "invalid" DAG-binding issue naming FINAL (a final review not bound to the current tree).
+    cfg = Config.from_dict({"final_review": True})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    dag = _dag(status="done")
+    _bind_plan(run, dag)
+    _bind_dep_a(run, dag)
+    fa = artifact_sha256(b"final artifact")
+    run.append("builder_output", gate="final", round=1, payload="final artifact", artifact_sha256=fa)
+    run.append("gate_consensus", gate="final", round=1, artifact_sha256=fa)  # NO dag_sha256
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "invalid" and "FINAL" in i.message and "DAG binding" in i.message
+               for i in issues)
+
+
+def test_workflow_issues_flags_final_wrong_dag_binding(tmp_path):
+    # F3: a FINAL terminal binding a WRONG dag_sha256 is an "invalid" DAG-binding issue naming FINAL.
+    cfg = Config.from_dict({"final_review": True})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    dag = _dag(status="done")
+    _bind_plan(run, dag)
+    _bind_dep_a(run, dag)
+    fa = artifact_sha256(b"final artifact")
+    run.append("builder_output", gate="final", round=1, payload="final artifact", artifact_sha256=fa)
+    run.append("gate_consensus", gate="final", round=1, artifact_sha256=fa, dag_sha256="0" * 64)
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "invalid" and "FINAL" in i.message and "DAG binding" in i.message
+               for i in issues)
+
+
+def test_workflow_issues_flags_artifact_after_terminal(tmp_path):
+    # F4: a PLAN terminal whose only same-gate/same-round builder_output is appended AFTER the
+    # terminal has no pre-terminal reviewed artifact -> "invalid" artifact-binding issue naming PLAN.
+    cfg = Config.from_dict({"final_review": False})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    dag = _dag(status="done")
+    run.save_dag(dag.to_dict())
+    a = artifact_sha256(b"reviewed plan")
+    run.append("gate_consensus", gate="plan", round=1, artifact_sha256=a, dag_sha256=dag_sha256(dag))
+    run.append("builder_output", gate="plan", round=1, payload="reviewed plan", artifact_sha256=a)
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "invalid" and "PLAN" in i.message for i in issues)
+
+
+def test_workflow_issues_ignores_post_terminal_builder_output(tmp_path):
+    # F4 (pre-terminal-only guard): a valid pre-terminal PLAN artifact binds the terminal; a later
+    # same-gate/same-round builder_output appended AFTER the terminal is ignored and does not turn a
+    # satisfied minimal config into an issue (the exact terminal binding cannot be replaced/bypassed).
+    cfg = Config.from_dict({"final_review": False})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    dag = _dag(status="done")
+    _bind_plan(run, dag)
+    _bind_dep_a(run, dag)
+    run.append("builder_output", gate="plan", round=1, payload="tampered later plan",
+               artifact_sha256=artifact_sha256(b"tampered later plan"))
+    assert workflow_issues(run.read_events(), dag, cfg) == []

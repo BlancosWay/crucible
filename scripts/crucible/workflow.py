@@ -230,11 +230,12 @@ def workflow_issues(events: list[dict[str, Any]], dag: DAG, cfg: Config) -> list
       no gate at all): an audited/unaudited bypass, not a hard violation.
 
     Every accepted terminal (REPRODUCE / PLAN / ``dep:*`` / FINAL) is validated two ways: its
-    ``artifact_sha256`` must bind a same-gate/same-round Builder output (:func:`_artifact_binding_issues`),
-    and the configured phases must appear in log order (REPRODUCE before PLAN, approval after PLAN,
-    each dependency review before its non-forced ``done``, FINAL after every node's backing and
-    ``done`` events). An empty list means every configured phase is present, ordered, accepted, and
-    currently bound.
+    ``artifact_sha256`` must bind a same-gate/same-round Builder output recorded BEFORE the terminal
+    (:func:`_artifact_binding_issues`), and the configured phases must appear in log order (REPRODUCE
+    before PLAN, approval after PLAN, each dependency review before its non-forced ``done``, FINAL
+    after every node's backing and ``done`` events). PLAN and FINAL terminals must additionally bind
+    the CURRENT dependency tree (``dag_sha256``). An empty list means every configured phase is
+    present, ordered, accepted, and currently bound.
     """
     issues: list[WorkflowIssue] = []
 
@@ -245,14 +246,14 @@ def workflow_issues(events: list[dict[str, Any]], dag: DAG, cfg: Config) -> list
                 "missing", "configured REPRODUCE gate never reached consensus"))
         else:
             issues.extend(_artifact_binding_issues(events, "reproduce", reproduce_terminal,
-                                                   "REPRODUCE"))
+                                                   reproduce_idx, "REPRODUCE"))
 
     plan_terminal, plan_idx = _accepted_terminal_with_index(events, "plan")
     if plan_terminal is None:
         issues.append(WorkflowIssue("missing", "PLAN gate never reached an accepted terminal"))
         return issues  # nothing downstream can be trusted without an accepted plan
 
-    issues.extend(_artifact_binding_issues(events, "plan", plan_terminal, "PLAN"))
+    issues.extend(_artifact_binding_issues(events, "plan", plan_terminal, plan_idx, "PLAN"))
 
     current_dag = dag_sha256(dag)
     if plan_terminal.get("dag_sha256") != current_dag:
@@ -292,24 +293,33 @@ def workflow_issues(events: list[dict[str, Any]], dag: DAG, cfg: Config) -> list
 
 
 def _artifact_binding_issues(
-    events: list[dict[str, Any]], gate: str, terminal: dict[str, Any], label: str
+    events: list[dict[str, Any]], gate: str, terminal: dict[str, Any],
+    terminal_idx: int | None, label: str
 ) -> list[WorkflowIssue]:
     """Validate an accepted terminal's ``artifact_sha256`` against its Builder output — the single
     owner of this check for every gate (never a per-gate duplicated loop).
 
     The terminal's recorded ``artifact_sha256`` must equal the digest recomputed from the exact
-    bytes of the LATEST same-gate/same-round ``builder_output`` payload. ``runlog`` stores that
-    payload as a strict UTF-8 decode of the original artifact bytes (via ``read_artifact``), so
-    re-encoding it recovers those exact bytes — CRLF included — and the digest matches iff the
-    accepted decision refers to the reviewed artifact. A terminal with no recorded hash, no
-    same-gate/same-round Builder output, or a hash that disagrees with the payload is an ``invalid``
-    binding (an unreviewable or tampered artifact), never allowed to reach ``CLEAN``.
+    bytes of the LATEST same-gate/same-round ``builder_output`` payload recorded BEFORE the terminal
+    (``terminal_idx``). ``runlog`` stores that payload as a strict UTF-8 decode of the original
+    artifact bytes (via ``read_artifact``), so re-encoding it recovers those exact bytes — CRLF
+    included — and the digest matches iff the accepted decision refers to the reviewed artifact.
+
+    Only PRE-terminal Builder outputs count: an artifact logged after the terminal could not have
+    been reviewed by the Critic for that decision, so a forged log that records ``gate_consensus``
+    first and appends a matching ``builder_output`` later must not satisfy the binding, and a later
+    post-terminal output can neither replace nor bypass the exact pre-terminal binding. A terminal
+    with no recorded hash, no same-gate/same-round Builder output before it, or a hash that disagrees
+    with that payload is an ``invalid`` binding (unreviewable or tampered), never allowed to reach
+    ``CLEAN``.
     """
     recorded = terminal.get("artifact_sha256")
     round_index = terminal.get("round")
     outputs = [
-        e for e in events
-        if e.get("event") == "builder_output"
+        e
+        for i, e in enumerate(events)
+        if (terminal_idx is None or i < terminal_idx)
+        and e.get("event") == "builder_output"
         and e.get("gate") == gate
         and e.get("round") == round_index
         and isinstance(e.get("payload"), str)
@@ -327,20 +337,26 @@ def _artifact_binding_issues(
 
 
 def _final_issues(events: list[dict[str, Any]], dag: DAG) -> list[WorkflowIssue]:
-    """Configured FINAL phase problems: presence, artifact binding, and LOG ORDER.
+    """Configured FINAL phase problems: presence, artifact binding, DAG binding, and LOG ORDER.
 
-    FINAL certifies the whole implementation, so it must be recorded AFTER every node's completion.
-    A FINAL terminal logged before a node's backing dep/force event or its ``done`` transition is
-    out of order even if the tree later ends done — the recorded log order, not just the current DAG
-    snapshot, decides. An absent FINAL over a done tree is merely ``missing`` (still in progress);
-    an absent FINAL over an unfinished tree is not yet expected.
+    FINAL certifies the whole implementation, so its accepted terminal must (1) bind a same-gate
+    Builder artifact recorded before it, (2) bind the CURRENT dependency tree (``dag_sha256``), and
+    (3) be recorded AFTER every node's completion. A FINAL terminal whose ``dag_sha256`` is missing
+    or no longer matches the current tree certifies a different implementation tree and is
+    ``invalid``. A FINAL terminal logged before a node's backing dep/force event or its ``done``
+    transition is out of order even if the tree later ends done — the recorded log order, not just
+    the current DAG snapshot, decides. An absent FINAL over a done tree is merely ``missing`` (still
+    in progress); an absent FINAL over an unfinished tree is not yet expected.
     """
     final_terminal, final_idx = _accepted_terminal_with_index(events, "final")
     if final_terminal is None:
         if dag.is_complete():
             return [WorkflowIssue("missing", "configured FINAL gate never reached consensus")]
         return []
-    issues = _artifact_binding_issues(events, "final", final_terminal, "FINAL")
+    issues = _artifact_binding_issues(events, "final", final_terminal, final_idx, "FINAL")
+    if final_terminal.get("dag_sha256") != dag_sha256(dag):
+        issues.append(WorkflowIssue(
+            "invalid", "FINAL DAG binding no longer matches the current dependency tree"))
     if not dag.is_complete():
         issues.append(WorkflowIssue(
             "invalid", "FINAL gate reached a terminal before every node was done"))
@@ -431,7 +447,8 @@ def _node_completion_issues(
                 "invalid",
                 f"node {node_id!r} completion is bound to a stale review — its dag/node sha256 no "
                 f"longer match the current tree")]
-        issues = _artifact_binding_issues(events, f"dep:{node_id}", terminal, f"node {node_id!r}")
+        issues = _artifact_binding_issues(events, f"dep:{node_id}", terminal, terminal_idx,
+                                          f"node {node_id!r}")
         # The accepted review must be recorded BEFORE the node's non-forced ``done`` transition; a
         # dependency terminal appended after ``done`` marked the node complete before its review.
         done_idx = _nonforced_done_index(events, node_id)
