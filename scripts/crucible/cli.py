@@ -23,6 +23,13 @@ from crucible.lenses import read_critic_lenses
 from crucible.report import render_html, render_markdown
 from crucible.runlog import RunLog, RunLogCorruptError, init_run
 from crucible.verdict import VALID_RESOLUTIONS, Finding, Verdict, decide
+from crucible.workflow import (
+    accepted_terminal,
+    require_final_ready,
+    require_node_review_ready,
+    require_plan_ready,
+    require_plan_verdict_ready,
+)
 
 # Events that `crucible log` may append. All other events are emitted by their own
 # commands (verdict, set-status, load-dag, init-run); allowing `log` to write them would
@@ -222,6 +229,31 @@ def _expected_round(run: RunLog, gate: str) -> int:
     return prior + 1
 
 
+def _require_gate_stage_ready(run: RunLog, cfg: Config, gate: str) -> None:
+    """Enforce the configured STAGE/PHASE prerequisites for a gate's ``log``/``bindings``/``verdict``
+    (Task 3). Shared by all three so a Builder artifact, its bindings, and the Critic verdict are
+    only ever recorded/emitted once the gate is legitimately reachable:
+
+    - ``reproduce`` — none (it is Stage 0, ahead of everything else);
+    - ``plan`` — REPRODUCE consensus when ``reproduce_gate`` is configured;
+    - ``dep:<id>`` — accepted+bound PLAN, configured approval, deps done, node ``in_progress``/``in_review``;
+    - ``final`` — ``final_review`` enabled, bound PLAN/approval, every node done and backed.
+
+    Delegates to ``crucible.workflow`` so stage logic is never duplicated. Assumes ``gate`` already
+    passed ``_validate_gate`` and (for ``dep:``) ``_require_dep_node_in_dag``.
+    """
+    if gate == "reproduce":
+        return
+    if gate == "plan":
+        require_plan_verdict_ready(run, cfg)
+        return
+    dag = DAG.from_dict(run.load_dag())
+    if gate == "final":
+        require_final_ready(run, cfg, dag)
+    elif gate.startswith("dep:"):
+        require_node_review_ready(run, cfg, dag, gate[len("dep:"):])
+
+
 def cmd_init_run(args) -> int:
     cfg = load_config(args.config) if args.config else Config.from_dict({})
     base = args.base_dir or os.environ.get("CRUCIBLE_RUNS_DIR") or str(Path.home() / ".crucible" / "runs")
@@ -289,6 +321,12 @@ def cmd_next(args) -> int:
     dag = DAG.from_dict(run.load_dag())
     state, node = dag.next_state()
     if state == "ready":
+        # A ready node is about to be scheduled for implementation, so the PLAN gate (and configured
+        # approval) must be accepted and still bound to the current tree first — never begin node
+        # work before the plan the Critic reviewed is settled. Reporting states (complete/in_flight/
+        # stuck) schedule nothing, so they are not gated here.
+        cfg = load_config(run.path / "config.json")
+        require_plan_ready(run, cfg)
         print(node)
         return 0
     if state == "complete":
@@ -312,62 +350,69 @@ def cmd_next(args) -> int:
 
 def cmd_set_status(args) -> int:
     run = RunLog(args.run)
+    # set-status is a mutating command: a legacy run's provenance is unverified, so refuse to
+    # transition (or forcibly complete) its nodes — start a fresh run instead.
+    require_current_schema(run)
     dag = DAG.from_dict(run.load_dag())
     if args.node not in dag.nodes:
         raise ValueError(f"unknown node: {args.node}")
     # C2: a node cannot begin or finish work (in_progress/in_review/done) while a dependency
     # is unfinished — that would let `next` schedule its dependents and skip the dependency's
-    # work. `pending`/`blocked` are not work statuses and stay settable for recovery.
+    # work. `pending`/`blocked` are not work statuses and stay settable for recovery. Checked even
+    # under --force (a forced completion must not bypass real dependency ordering).
     if args.status in ("in_progress", "in_review", "done"):
         unmet = sorted(d for d in dag.deps[args.node] if dag.nodes[d].status != "done")
         if unmet:
             raise SystemExit(f"set-status: cannot set {args.node!r} to {args.status!r} while these "
                              f"dependencies are not done: {unmet}")
-    # H2: a node may only be marked `done` once its OWN review gate (dep:<node>) reached a terminal
-    # ADVANCE outcome — gate_consensus or gate_proceeded_with_flags. A gate_capped (halt) does NOT
-    # qualify. Use LAST-terminal-event semantics (matching report.py) so a runlog where an earlier
-    # consensus is followed by a later gate_capped is correctly treated as capped. Without this,
-    # `next` would schedule dependents of a node whose review the CLI decided must halt (or that
-    # was never reviewed), advancing past a gate without consensus. `--force` is the explicit,
-    # logged human recovery override.
-    if args.status == "done" and not args.force:
-        node_gate = f"dep:{args.node}"
-        terminal = [e for e in run.read_events()
-                    if e.get("gate") == node_gate
-                    and e.get("event") in ("gate_consensus", "gate_proceeded_with_flags", "gate_capped")]
-        accepted = bool(terminal) and terminal[-1]["event"] in ("gate_consensus", "gate_proceeded_with_flags")
-        if not accepted:
-            raise SystemExit(
-                f"set-status: refusing to mark {args.node!r} done — its review gate {node_gate!r} "
-                f"has not reached consensus (or proceeded with flags). Run the gate to a terminal "
-                f"advance first, or pass --force to override (recorded)."
-            )
-        # Task 2 binding guard: the accepted gate's recorded DAG/node bindings must still match the
-        # CURRENT tree/node. If the plan/DAG/node was substituted after the gate was accepted (e.g. a
-        # same-id node whose files/description/test-plan changed), the reviewed artifact no longer
-        # describes what would be marked done — reject the stale consensus and require a fresh review.
-        accepted_terminal = terminal[-1]
-        expected_dag = accepted_terminal.get("dag_sha256")
-        expected_node = accepted_terminal.get("node_sha256")
-        if expected_dag != dag_sha256(dag) or expected_node != node_sha256(dag, args.node):
-            raise SystemExit(
-                f"set-status: refusing to mark {args.node!r} done — the reviewed dependency binding "
-                f"no longer matches the current tree/node (dag/node sha256 changed since gate "
-                f"{node_gate!r} was accepted). The plan/DAG/node was changed after review; re-review "
-                f"the current node or start a fresh run."
-            )
-    # A --force bypasses the review gate above (an explicit human override), so it must carry a
-    # non-empty rationale — recorded in provenance and surfaced in the report — for the audit trail.
+    # A --force is an explicit human override, so it must carry a non-empty rationale — recorded in
+    # provenance and surfaced in the report. Checked AFTER the C2 dependency guard (so a forced done
+    # blocked by unfinished deps still reports the dependency problem) but BEFORE the PLAN/approval
+    # and review-gate prerequisites (so a missing rationale is reported as such).
     rationale = (args.rationale or "").strip()
     if args.force and not rationale:
         raise SystemExit(
             "set-status: --force requires --rationale explaining the override "
             "(it bypasses the node's review gate; the reason is recorded in the run log)."
         )
-    dag.set_status(args.node, args.status)
+    forced_bindings: dict[str, str] = {}
+    if args.status == "done":
+        cfg = load_config(run.path / "config.json")
+        if args.force:
+            # A forced completion is the explicit reviewed-gate bypass, but it still happens WITHIN
+            # an accepted, currently-bound plan (and configured approval) — a run cannot force node
+            # completion before its plan is settled. Record the current DAG/node hashes so the report
+            # can prove the override targeted the current tree, and flag it.
+            require_plan_ready(run, cfg)
+            forced_bindings = {"dag_sha256": dag_sha256(dag),
+                               "node_sha256": node_sha256(dag, args.node)}
+        else:
+            # Normal completion requires an accepted+bound PLAN (and configured approval), the node's
+            # OWN review gate to have advanced (gate_consensus/gate_proceeded_with_flags — a
+            # gate_capped halt does NOT qualify), and that gate's recorded DAG/node bindings to still
+            # match the current tree/node (Task 2 stale-consensus guard). The legal transition
+            # (in_progress|in_review -> done) is then enforced by DAG.set_status.
+            require_plan_ready(run, cfg)
+            node_gate = f"dep:{args.node}"
+            terminal = accepted_terminal(run.read_events(), node_gate)
+            if terminal is None:
+                raise SystemExit(
+                    f"set-status: refusing to mark {args.node!r} done — its review gate {node_gate!r} "
+                    f"has not reached consensus (or proceeded with flags). Run the gate to a terminal "
+                    f"advance first, or pass --force to override (recorded)."
+                )
+            if (terminal.get("dag_sha256") != dag_sha256(dag)
+                    or terminal.get("node_sha256") != node_sha256(dag, args.node)):
+                raise SystemExit(
+                    f"set-status: refusing to mark {args.node!r} done — the reviewed dependency "
+                    f"binding no longer matches the current tree/node (dag/node sha256 changed since "
+                    f"gate {node_gate!r} was accepted). The plan/DAG/node was changed after review; "
+                    f"re-review the current node or start a fresh run."
+                )
+    dag.set_status(args.node, args.status, force=args.force)
     run.save_dag(dag.to_dict())
     run.append("node_status_change", node=args.node, status=args.status,
-               forced=bool(args.force), rationale=rationale)
+               forced=bool(args.force), rationale=rationale, **forced_bindings)
     print(f"{args.node} -> {args.status}")
     return 0
 
@@ -382,6 +427,12 @@ def cmd_log(args) -> int:
     run = RunLog(args.run)
     require_current_schema(run)
     _require_dep_node_in_dag(run, args.gate)
+    # Stage/phase prerequisites (Task 3): a Builder artifact may only be logged when the gate is
+    # legitimately reachable — REPRODUCE consensus before PLAN when configured; an accepted+bound
+    # PLAN, configured approval, done deps and an in_progress/in_review node before a dep review; a
+    # complete, backed implementation before FINAL. Checked before the terminal-gate guard so a
+    # not-yet-reachable gate is rejected for the more fundamental reason.
+    _require_gate_stage_ready(run, load_config(run.path / "config.json"), args.gate)
     # Artifact immutability: never log Builder/Critic output for a gate that already concluded — a
     # post-terminal artifact would masquerade as reviewed content (the reported same-round bug).
     terminal = [e for e in run.read_events()
@@ -485,6 +536,13 @@ def cmd_verdict(args) -> int:
     # node — both before anything is logged or decided.
     _require_gate_not_terminal(run, args.gate)
     _require_dep_node_in_dag(run, args.gate)
+
+    # Stage/phase prerequisites (Task 3): the gate must be legitimately reachable before a verdict
+    # can settle it — REPRODUCE before PLAN when configured; accepted+bound PLAN, configured
+    # approval, done deps and an in_progress/in_review node before a dep review; a complete, backed
+    # implementation before FINAL. Enforced here (after the concluded/ghost guards, before round
+    # bookkeeping and the binding handshake) so an out-of-order gate never records a decision.
+    _require_gate_stage_ready(run, cfg, args.gate)
 
     # F1b: the round is DERIVED from run history, not trusted from the caller. It must be exactly
     # one past the number of prior review rounds for this gate — closing the bypass where a caller
@@ -602,6 +660,9 @@ def cmd_bindings(args) -> int:
     run = RunLog(args.run)
     require_current_schema(run)
     _require_dep_node_in_dag(run, args.gate)
+    # Bindings are only meaningful for a legitimately reachable gate (the same stage/phase order the
+    # `log`/`verdict` handshake enforces), so validate the stage prerequisites before emitting them.
+    _require_gate_stage_ready(run, load_config(run.path / "config.json"), args.gate)
     print(json.dumps(current_bindings(run, args.gate, args.round).to_dict()))
     return 0
 
@@ -644,6 +705,54 @@ def cmd_should_reproduce(args) -> int:
     cfg = load_config(RunLog(args.run).path / "config.json")
     print("yes" if cfg.reproduce_gate else "no")
     return 0 if cfg.reproduce_gate else 1
+
+
+def cmd_approve_plan(args) -> int:
+    """Record human approval of the accepted plan (schema-v2 ``plan_approved`` event).
+
+    A mutating command: it requires the current schema, and it is meaningful only when
+    ``human_approval`` is configured and the PLAN gate has already reached an accepted terminal whose
+    DAG binding still matches the current tree. It records the accepted plan/DAG hashes so downstream
+    prerequisites can prove the human approved *this* exact plan, and rejects a duplicate or stale
+    approval. Skills call it only after the human explicitly approves.
+    """
+    run = RunLog(args.run)
+    require_current_schema(run)
+    cfg = load_config(run.path / "config.json")
+    if not cfg.human_approval:
+        raise SystemExit(
+            "approve-plan: human_approval is disabled for this run; recording an approval would add "
+            "meaningless provenance — enable human_approval to gate on approval."
+        )
+    events = run.read_events()
+    terminal = accepted_terminal(events, "plan")
+    if terminal is None:
+        raise SystemExit(
+            "approve-plan: the PLAN gate has not reached consensus (or proceeded with flags) yet; "
+            "there is no accepted plan to approve."
+        )
+    dag = DAG.from_dict(run.load_dag())
+    approved_artifact = terminal.get("artifact_sha256")
+    approved_dag = terminal.get("dag_sha256")
+    # The accepted plan must still bind the current tree — a DAG changed after consensus (only
+    # possible by editing dag.json directly, since load-dag freezes a terminal plan) is a stale
+    # approval target.
+    if approved_dag != dag_sha256(dag):
+        raise SystemExit(
+            "approve-plan: the accepted plan's DAG binding no longer matches the current dependency "
+            "tree; the plan/DAG was changed after consensus — start a fresh run."
+        )
+    # An accepted plan is immutable within a run, so any prior approval is a duplicate — refuse
+    # rather than record redundant (or conflicting) provenance.
+    if any(e.get("event") == "plan_approved" for e in events):
+        raise SystemExit(
+            "approve-plan: the plan is already approved (duplicate approval); an accepted plan is "
+            "approved exactly once — nothing to record."
+        )
+    run.append("plan_approved", gate="plan",
+               artifact_sha256=approved_artifact, dag_sha256=approved_dag)
+    print(f"approved plan (artifact {str(approved_artifact)[:12]}…, dag {str(approved_dag)[:12]}…)")
+    return 0
 
 
 def cmd_show_plan(args) -> int:
@@ -784,6 +893,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("show-plan"); s.add_argument("--run", required=True)
     s.set_defaults(func=cmd_show_plan)
+
+    s = sub.add_parser("approve-plan"); s.add_argument("--run", required=True)
+    s.set_defaults(func=cmd_approve_plan)
 
     s = sub.add_parser("clean"); s.add_argument("--run", required=True)
     s.add_argument("--force", action="store_true", help="delete even if the run is still in progress")

@@ -105,9 +105,13 @@ def test_full_dry_run_flow(tmp_path):
     r = _run(["load-dag", "--run", run_dir, "--file", str(dag_file)])
     assert r.returncode == 0, r.stderr
 
+    # Settle the PLAN gate before scheduling any node work (next refuses to schedule otherwise).
+    _settle_plan(run_dir, tmp_path)
+
     r = _run(["next", "--run", run_dir])
     assert r.stdout.strip() == "a"
 
+    _start(run_dir, "a")
     r = _run_bound_verdict(tmp_path, run_dir, "dep:a", 1, "APPROVE", payload="impl a", max_rounds=5)
     assert "CONSENSUS" in r.stdout, r.stdout + r.stderr
 
@@ -188,13 +192,15 @@ def test_verdict_accepts_consecutive_rounds(tmp_path):
 
 
 def test_verdict_expected_round_is_scoped_per_gate(tmp_path):
-    # Round counting is keyed by EXACT gate: a CHANGES round on `plan` must not bump the expected
-    # round of a different gate — dep:a still starts at round 1 (guards per-gate independence).
+    # Round counting is keyed by EXACT gate: prior rounds on `plan` must not bump the expected round
+    # of a different gate — dep:a still starts at round 1 (guards per-gate independence).
     run_dir = _init(tmp_path)
     _load(run_dir, tmp_path, {"a": "pending"})
     blocker = [{"id": "F1", "severity": "blocker", "location": "x", "claim": "c", "suggestion": "s"}]
     assert _run_bound_verdict(tmp_path, run_dir, "plan", 1, "REQUEST_CHANGES",
                               findings=blocker).stdout.strip() == "CHANGES"
+    assert _run_bound_verdict(tmp_path, run_dir, "plan", 2, "APPROVE").stdout.strip() == "CONSENSUS"
+    _start(run_dir, "a")
     assert _run_bound_verdict(tmp_path, run_dir, "dep:a", 1, "APPROVE").stdout.strip() == "CONSENSUS"
 
 
@@ -395,25 +401,52 @@ def _init(tmp_path):
 
 
 def _load(run_dir, tmp_path, nodes, edges=None):
-    # load-dag imports a *fresh* plan: every node must be `pending` (G2). To exercise next/
-    # report against mixed statuses, load all-pending then transition via set-status — this
-    # mirrors production, where statuses only ever change through set-status, never baked
-    # into the imported plan.
+    # load-dag imports a *fresh* plan: every node must be `pending` (G2). Scheduling/report fixtures
+    # that need mixed statuses construct them DIRECTLY in dag.json afterwards — node statuses only
+    # ever change through set-status in production, but here we fabricate arbitrary states for
+    # next/status/report/clean tests WITHOUT exercising (or --force-bypassing) the Task 3 set-status
+    # stage contract, which those tests are not about.
     dag = {"nodes": [{"id": nid, "title": nid, "description": "", "files": [], "test_plan": "",
                       "status": "pending"} for nid in nodes],
            "edges": edges or []}
     f = Path(tmp_path) / "dag.json"
     f.write_text(json.dumps(dag))
     r = _run(["load-dag", "--run", run_dir, "--file", str(f)])
-    if r.returncode == 0:
-        for nid, st in nodes.items():
-            if st != "pending":
-                # Fixture scaffolding fabricates arbitrary states; --force bypasses the
-                # done-gate requirement (H2). Assert it applied so setup can't silently no-op.
-                sr = _run(["set-status", "--run", run_dir, "--node", nid, "--status", st, "--force",
-                           "--rationale", "fixture scaffolding"])
-                assert sr.returncode == 0, sr.stderr
+    if r.returncode == 0 and any(st != "pending" for st in nodes.values()):
+        saved = json.loads((Path(run_dir) / "dag.json").read_text())
+        for node in saved["nodes"]:
+            node["status"] = nodes[node["id"]]
+        (Path(run_dir) / "dag.json").write_text(json.dumps(saved))
     return r
+
+
+def _settle_plan(run_dir, tmp_path, *, approve=False):
+    """Drive the PLAN gate to consensus via the real binding handshake (a DAG must already be
+    loaded), so the Task 3 next/dependency/final/forced-done prerequisites are satisfied. dag_sha256
+    is status-free, so per-node status changes afterwards keep the accepted plan binding valid. With
+    approve=True also record the configured human approval."""
+    r = _run_bound_verdict(tmp_path, run_dir, "plan", 1, "APPROVE", payload="# plan\nreviewed")
+    assert r.stdout.strip() == "CONSENSUS", r.stdout + r.stderr
+    if approve:
+        a = _run(["approve-plan", "--run", run_dir])
+        assert a.returncode == 0, a.stderr
+
+
+def _start(run_dir, node):
+    """Move a node pending -> in_progress (the legal precondition for its dependency review)."""
+    r = _run(["set-status", "--run", run_dir, "--node", node, "--status", "in_progress"])
+    assert r.returncode == 0, r.stderr
+
+
+def _implement(run_dir, tmp_path, node, payload=None):
+    """Complete a node whose deps are done via the happy path: in_progress -> bound dep consensus ->
+    done. Assumes the PLAN gate is already settled (and approved when the run configures approval)."""
+    _start(run_dir, node)
+    r = _run_bound_verdict(tmp_path, run_dir, f"dep:{node}", 1, "APPROVE",
+                           payload=payload or f"impl {node}")
+    assert r.stdout.strip() == "CONSENSUS", r.stdout + r.stderr
+    d = _run(["set-status", "--run", run_dir, "--node", node, "--status", "done"])
+    assert d.returncode == 0, d.stderr
 
 
 def _legacy_run(tmp_path):
@@ -447,6 +480,7 @@ def test_next_all_done_exits_zero_empty(tmp_path):
 def test_next_ready_node_exits_zero(tmp_path):
     run_dir = _init(tmp_path)
     _load(run_dir, tmp_path, {"a": "pending"})
+    _settle_plan(run_dir, tmp_path)
     r = _run(["next", "--run", run_dir])
     assert r.returncode == 0
     assert r.stdout.strip() == "a"
@@ -865,6 +899,8 @@ def test_verdict_dep_gate_consensus_does_not_echo_plan(tmp_path):
     # The echo is PLAN-gate only: a dependency gate reaching consensus must not echo the plan.
     run_dir = _init(tmp_path)
     _load_two_node_dag(tmp_path, run_dir)          # node "a" exists so dep:a is a real gate
+    _settle_plan(run_dir, tmp_path)
+    _start(run_dir, "a")
     r = _run_bound_verdict(tmp_path, run_dir, "dep:a", 1, "APPROVE")
     assert r.returncode == 0, r.stderr
     assert r.stdout.strip() == "CONSENSUS"
@@ -1013,6 +1049,7 @@ def test_clean_allows_finished_run(tmp_path):
     run_dir = _init(tmp_path)
     df = Path(tmp_path) / "d.json"; df.write_text(json.dumps(_two_node_dag()))
     _run(["load-dag", "--run", run_dir, "--file", str(df)])
+    _settle_plan(run_dir, tmp_path)
     _run(["set-status", "--run", run_dir, "--node", "a", "--status", "done", "--force",
           "--rationale", "test scaffolding"])
     r = _run(["clean", "--run", run_dir])
@@ -1033,12 +1070,32 @@ def test_set_status_force_with_rationale_records_it(tmp_path):
     run_dir = _init(tmp_path)
     df = Path(tmp_path) / "d.json"; df.write_text(json.dumps(_two_node_dag()))
     _run(["load-dag", "--run", run_dir, "--file", str(df)])
+    _settle_plan(run_dir, tmp_path)
     r = _run(["set-status", "--run", run_dir, "--node", "a", "--status", "done",
               "--force", "--rationale", "manual recovery: gate flaked"])
     assert r.returncode == 0, r.stderr
     events = [json.loads(l) for l in (Path(run_dir) / "runlog.jsonl").read_text().splitlines() if l.strip()]
     nsc = [e for e in events if e["event"] == "node_status_change" and e.get("forced")][-1]
     assert nsc.get("rationale") == "manual recovery: gate flaked"
+
+
+def test_set_status_force_done_persists_current_bindings(tmp_path):
+    # A forced completion records the CURRENT dag/node hashes on its node_status_change event, so the
+    # report can prove the override targeted the current tree. Compare both to the integrity helpers.
+    from crucible.dag import DAG
+    from crucible.integrity import dag_sha256, node_sha256
+
+    run_dir = _init(tmp_path)
+    df = Path(tmp_path) / "d.json"; df.write_text(json.dumps(_two_node_dag()))
+    _run(["load-dag", "--run", run_dir, "--file", str(df)])
+    _settle_plan(run_dir, tmp_path)
+    r = _run(["set-status", "--run", run_dir, "--node", "a", "--status", "done",
+              "--force", "--rationale", "manual recovery"])
+    assert r.returncode == 0, r.stderr
+    dag = DAG.from_dict(json.loads((Path(run_dir) / "dag.json").read_text()))
+    nsc = [e for e in _events(run_dir) if e["event"] == "node_status_change" and e.get("forced")][-1]
+    assert nsc["dag_sha256"] == dag_sha256(dag)
+    assert nsc["node_sha256"] == node_sha256(dag, "a")
 
 
 def test_verdict_rejects_round_below_one(tmp_path):
@@ -1234,9 +1291,12 @@ def test_reproduce_gate_halts_even_with_proceed_with_flags(tmp_path):
 
 
 def test_verdict_accepts_final_gate(tmp_path):
-    # `final` is a valid gate (round cap = max_rounds_dep); its bindings require a loaded DAG.
+    # `final` runs only after the whole implementation is complete: settle PLAN, implement the one
+    # node to done, then FINAL reaches consensus (its bindings require a loaded DAG).
     run_dir = _init(tmp_path)
     _load(run_dir, tmp_path, {"a": "pending"})
+    _settle_plan(run_dir, tmp_path)
+    _implement(run_dir, tmp_path, "a")
     r = _run_bound_verdict(tmp_path, run_dir, "final", 1, "APPROVE", payload="whole implementation")
     assert r.returncode == 0, r.stderr
     assert r.stdout.strip() == "CONSENSUS"
@@ -1327,6 +1387,8 @@ def test_verdict_dep_gate_requires_loaded_dag(tmp_path):
 def test_verdict_valid_dep_node_still_works(tmp_path):
     run_dir = _init(tmp_path)
     _load(run_dir, tmp_path, {"a": "pending"})
+    _settle_plan(run_dir, tmp_path)
+    _start(run_dir, "a")
     r = _run_bound_verdict(tmp_path, run_dir, "dep:a", 1, "APPROVE")
     assert r.returncode == 0, r.stderr
     assert r.stdout.strip() == "CONSENSUS"
@@ -1358,6 +1420,7 @@ def test_set_status_done_allowed_when_deps_done(tmp_path):
     run_dir = _init(tmp_path)
     _load(run_dir, tmp_path, {"a": "pending", "b": "pending"},
           edges=[{"from": "b", "depends_on": "a"}])
+    _settle_plan(run_dir, tmp_path)
     assert _run(["set-status", "--run", run_dir, "--node", "a", "--status", "done", "--force",
                  "--rationale", "test setup"]).returncode == 0
     r = _run(["set-status", "--run", run_dir, "--node", "b", "--status", "done", "--force",
@@ -1377,9 +1440,11 @@ def test_set_status_blocked_not_gated_by_deps(tmp_path):
 # --- H2: set-status done requires the node's own dep gate to have been accepted ----
 
 def test_set_status_done_refused_without_accepted_gate(tmp_path):
-    # A node cannot be marked done until its OWN dep:<node> gate reached consensus/proceed.
+    # A node cannot be marked done until its OWN dep:<node> gate reached consensus/proceed. The PLAN
+    # is settled first (so its own prerequisite is met) — this test omits ONLY the dep review gate.
     run_dir = _init(tmp_path)
-    _load(run_dir, tmp_path, {"a": "pending"})           # no deps, no gate yet
+    _load(run_dir, tmp_path, {"a": "pending"})
+    _settle_plan(run_dir, tmp_path)                      # plan ready; but no dep:a gate yet
     r = _run(["set-status", "--run", run_dir, "--node", "a", "--status", "done"])
     assert r.returncode != 0
     assert "dep:a" in r.stderr and "consensus" in r.stderr.lower()
@@ -1388,6 +1453,8 @@ def test_set_status_done_refused_without_accepted_gate(tmp_path):
 def test_set_status_done_allowed_after_gate_consensus(tmp_path):
     run_dir = _init(tmp_path)
     _load(run_dir, tmp_path, {"a": "pending"})
+    _settle_plan(run_dir, tmp_path)
+    _start(run_dir, "a")
     assert _run_bound_verdict(tmp_path, run_dir, "dep:a", 1, "APPROVE").stdout.strip() == "CONSENSUS"
     assert _run(["set-status", "--run", run_dir, "--node", "a", "--status", "done"]).returncode == 0
 
@@ -1397,6 +1464,8 @@ def test_set_status_done_allowed_after_proceed_with_flags(tmp_path):
     r0 = _run(["init-run", "--goal", "g", "--base-dir", str(tmp_path), "--config", str(cfg)])
     run_dir = r0.stdout.strip()
     _load(run_dir, tmp_path, {"a": "pending"})
+    _settle_plan(run_dir, tmp_path)
+    _start(run_dir, "a")
     assert "PROCEED_WITH_FLAGS" in _run_bound_verdict(
         tmp_path, run_dir, "dep:a", 1, "REQUEST_CHANGES",
         findings=[{"id": "F1", "severity": "blocker", "location": "x", "claim": "c", "suggestion": "s"}],
@@ -1408,6 +1477,8 @@ def test_set_status_done_allowed_after_proceed_with_flags(tmp_path):
 def test_set_status_done_refused_after_gate_capped(tmp_path):
     run_dir = _init(tmp_path)
     _load(run_dir, tmp_path, {"a": "pending"})
+    _settle_plan(run_dir, tmp_path)
+    _start(run_dir, "a")
     assert "CAPPED" in _run_bound_verdict(
         tmp_path, run_dir, "dep:a", 1, "REQUEST_CHANGES",
         findings=[{"id": "F1", "severity": "blocker", "location": "x", "claim": "c", "suggestion": "s"}],
@@ -1420,6 +1491,7 @@ def test_set_status_done_refused_after_gate_capped(tmp_path):
 def test_set_status_force_overrides_and_is_recorded(tmp_path):
     run_dir = _init(tmp_path)
     _load(run_dir, tmp_path, {"a": "pending"})
+    _settle_plan(run_dir, tmp_path)
     r = _run(["set-status", "--run", run_dir, "--node", "a", "--status", "done", "--force",
               "--rationale", "manual recovery"])
     assert r.returncode == 0, r.stderr
@@ -1431,8 +1503,10 @@ def test_set_status_force_overrides_and_is_recorded(tmp_path):
 def test_set_status_done_refused_when_last_terminal_is_capped(tmp_path):
     # Last-terminal semantics: an earlier gate_consensus followed by a later gate_capped for
     # dep:a must be treated as capped, so a legacy/hand-edited runlog can't sneak a node to done.
+    # PLAN is settled first so this exercises the dep-gate rule, not the plan prerequisite.
     run_dir = _init(tmp_path)
     _load(run_dir, tmp_path, {"a": "pending"})
+    _settle_plan(run_dir, tmp_path)
     log = Path(run_dir) / "runlog.jsonl"
     with log.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps({"event": "gate_consensus", "gate": "dep:a", "round": 1}) + "\n")
@@ -1560,6 +1634,8 @@ def test_bindings_command_emits_plan_hashes(tmp_path):
 def test_bindings_dep_gate_includes_node_hash(tmp_path):
     run_dir = _init(tmp_path)
     _load(run_dir, tmp_path, {"a": "pending"})
+    _settle_plan(run_dir, tmp_path)
+    _start(run_dir, "a")
     data = _log_artifact_and_get_bindings(run_dir, tmp_path, "dep:a", 1, "impl a")
     assert set(data) == {"artifact_sha256", "dag_sha256", "node_sha256"}
 
@@ -1643,6 +1719,8 @@ def test_terminal_and_critic_verdict_events_persist_bindings(tmp_path):
     # A settled gate must persist the validated bindings on both critic_verdict and the terminal.
     run_dir = _init(tmp_path)
     _load(run_dir, tmp_path, {"a": "pending"})
+    _settle_plan(run_dir, tmp_path)
+    _start(run_dir, "a")
     bindings = _log_artifact_and_get_bindings(run_dir, tmp_path, "dep:a", 1, "impl a")
     assert _run_bound_verdict(tmp_path, run_dir, "dep:a", 1, "APPROVE",
                               payload="impl a").stdout.strip() == "CONSENSUS"
@@ -1701,5 +1779,139 @@ def test_verdict_rejects_legacy_run(tmp_path):
 def test_show_plan_rejects_legacy_run(tmp_path):
     run_dir = _legacy_run(tmp_path)
     r = _run(["show-plan", "--run", run_dir])
+    assert r.returncode != 0
+    assert "legacy" in r.stderr.lower() and "fresh run" in r.stderr.lower()
+
+
+# --- Task 3: approve-plan, stage ordering, and mutating-command legacy refusal ----
+
+def _approval_run(tmp_path):
+    """A run with human_approval enabled and a settled (but not yet approved) PLAN gate."""
+    run_dir = _init_with_config(tmp_path, {"human_approval": True})
+    _load(run_dir, tmp_path, {"a": "pending"})
+    _settle_plan(run_dir, tmp_path)
+    return run_dir
+
+
+def test_approve_plan_records_accepted_plan_and_dag_hashes(tmp_path):
+    run_dir = _approval_run(tmp_path)
+    r = _run(["approve-plan", "--run", run_dir])
+    assert r.returncode == 0, r.stderr
+    events = _events(run_dir)
+    terminal = [e for e in events if e["event"] == "gate_consensus" and e.get("gate") == "plan"][-1]
+    approved = [e for e in events if e["event"] == "plan_approved"][-1]
+    assert approved["artifact_sha256"] == terminal["artifact_sha256"]
+    assert approved["dag_sha256"] == terminal["dag_sha256"]
+
+
+def test_approve_plan_rejects_when_disabled(tmp_path):
+    # human_approval is off by default: recording an approval would be meaningless provenance.
+    run_dir = _init(tmp_path)
+    _load(run_dir, tmp_path, {"a": "pending"})
+    _settle_plan(run_dir, tmp_path)
+    r = _run(["approve-plan", "--run", run_dir])
+    assert r.returncode != 0
+    assert "human_approval" in r.stderr or "disabled" in r.stderr.lower()
+    assert "plan_approved" not in [e["event"] for e in _events(run_dir)]
+
+
+def test_approve_plan_rejects_before_plan_consensus(tmp_path):
+    run_dir = _init_with_config(tmp_path, {"human_approval": True})
+    _load(run_dir, tmp_path, {"a": "pending"})           # plan not settled
+    r = _run(["approve-plan", "--run", run_dir])
+    assert r.returncode != 0
+    assert "consensus" in r.stderr.lower()
+    assert "plan_approved" not in [e["event"] for e in _events(run_dir)]
+
+
+def test_approve_plan_rejects_duplicate(tmp_path):
+    run_dir = _approval_run(tmp_path)
+    assert _run(["approve-plan", "--run", run_dir]).returncode == 0
+    r = _run(["approve-plan", "--run", run_dir])
+    assert r.returncode != 0
+    assert "duplicate" in r.stderr.lower() or "already" in r.stderr.lower()
+    assert [e["event"] for e in _events(run_dir)].count("plan_approved") == 1
+
+
+def test_approve_plan_rejects_stale_dag(tmp_path):
+    # A DAG changed after PLAN consensus (only reachable by editing dag.json) is a stale approval
+    # target — approve-plan refuses rather than binding the human's approval to a mutated tree.
+    run_dir = _approval_run(tmp_path)
+    saved = json.loads((Path(run_dir) / "dag.json").read_text())
+    saved["nodes"][0]["files"] = ["changed.py"]
+    (Path(run_dir) / "dag.json").write_text(json.dumps(saved))
+    r = _run(["approve-plan", "--run", run_dir])
+    assert r.returncode != 0
+    assert "dependency tree" in r.stderr.lower() or "fresh run" in r.stderr.lower()
+    assert "plan_approved" not in [e["event"] for e in _events(run_dir)]
+
+
+def test_next_refuses_before_plan_approval_then_allows_after(tmp_path):
+    run_dir = _approval_run(tmp_path)
+    before = _run(["next", "--run", run_dir])
+    assert before.returncode != 0 and "approval" in before.stderr.lower()
+    assert _run(["approve-plan", "--run", run_dir]).returncode == 0
+    after = _run(["next", "--run", run_dir])
+    assert after.returncode == 0 and after.stdout.strip() == "a"
+
+
+def test_dep_log_refused_while_node_pending(tmp_path):
+    # A dependency's work cannot be logged/reviewed while the node is still pending (unstarted).
+    run_dir = _init(tmp_path)
+    _load(run_dir, tmp_path, {"a": "pending"})
+    _settle_plan(run_dir, tmp_path)
+    art = Path(tmp_path) / "impl.txt"; art.write_text("impl a")
+    r = _run(["log", "--run", run_dir, "--event", "builder_output", "--gate", "dep:a",
+              "--round", "1", "--file", str(art)])
+    assert r.returncode != 0
+    assert "in_progress" in r.stderr or "pending" in r.stderr.lower()
+    assert not any(e["event"] == "builder_output" and e.get("gate") == "dep:a"
+                   for e in _events(run_dir))
+
+
+def test_dep_verdict_refused_before_plan_settled(tmp_path):
+    # A dependency review cannot even begin before the PLAN gate is settled.
+    run_dir = _init(tmp_path)
+    _load(run_dir, tmp_path, {"a": "pending"})
+    v = Path(tmp_path) / "v.json"
+    v.write_text(json.dumps({"gate": "dep:a", "round": 1, "verdict": "APPROVE",
+                             "summary": "ok", "findings": []}))
+    r = _run(["verdict", "--run", run_dir, "--gate", "dep:a", "--round", "1", "--file", str(v)])
+    assert r.returncode != 0
+    assert "plan" in r.stderr.lower()
+    assert "critic_verdict" not in [e["event"] for e in _events(run_dir)]
+
+
+def test_final_log_refused_before_all_nodes_done(tmp_path):
+    run_dir = _init(tmp_path)
+    _load(run_dir, tmp_path, {"a": "pending"})
+    _settle_plan(run_dir, tmp_path)
+    art = Path(tmp_path) / "final.txt"; art.write_text("whole implementation")
+    r = _run(["log", "--run", run_dir, "--event", "builder_output", "--gate", "final",
+              "--round", "1", "--file", str(art)])
+    assert r.returncode != 0
+    assert "done" in r.stderr.lower() or "unfinished" in r.stderr.lower()
+
+
+def test_plan_log_refused_before_reproduce_when_configured(tmp_path):
+    run_dir = _init_with_config(tmp_path, {"reproduce_gate": True})
+    _load(run_dir, tmp_path, {"a": "pending"})
+    art = Path(tmp_path) / "plan.txt"; art.write_text("reviewed plan")
+    r = _run(["log", "--run", run_dir, "--event", "builder_output", "--gate", "plan",
+              "--round", "1", "--file", str(art)])
+    assert r.returncode != 0
+    assert "reproduce" in r.stderr.lower()
+
+
+def test_set_status_rejects_legacy_run(tmp_path):
+    run_dir = _legacy_run(tmp_path)
+    r = _run(["set-status", "--run", run_dir, "--node", "a", "--status", "in_progress"])
+    assert r.returncode != 0
+    assert "legacy" in r.stderr.lower() and "fresh run" in r.stderr.lower()
+
+
+def test_approve_plan_rejects_legacy_run(tmp_path):
+    run_dir = _legacy_run(tmp_path)
+    r = _run(["approve-plan", "--run", run_dir])
     assert r.returncode != 0
     assert "legacy" in r.stderr.lower() and "fresh run" in r.stderr.lower()

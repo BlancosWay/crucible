@@ -35,7 +35,7 @@ SEMVER = re.compile(
 )
 
 # Deterministic helper modules the skill/CLI depend on.
-PACKAGE_MODULES = ("__init__", "__main__", "config", "dag", "integrity", "verdict", "runlog", "report", "cli")
+PACKAGE_MODULES = ("__init__", "__main__", "config", "dag", "integrity", "verdict", "runlog", "workflow", "report", "cli")
 
 # Reference docs each skill's orchestrator depends on, keyed by skill directory name. Additive:
 # registering a new skill's required refs here does not touch crucible's set.

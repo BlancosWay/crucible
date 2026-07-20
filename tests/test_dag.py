@@ -26,13 +26,19 @@ def test_ready_nodes_initially_only_roots():
     assert dag.ready_nodes() == ["model"]
 
 
+def _advance_to_done(dag, node_id):
+    """Drive a node through the only legal path to ``done``: pending -> in_progress -> done."""
+    dag.set_status(node_id, "in_progress")
+    dag.set_status(node_id, "done")
+
+
 def test_ready_nodes_advance_as_deps_complete():
     dag = DAG.from_dict(SAMPLE)
-    dag.set_status("model", "done")
+    _advance_to_done(dag, "model")
     assert dag.ready_nodes() == ["routes"]
-    dag.set_status("routes", "done")
+    _advance_to_done(dag, "routes")
     assert dag.ready_nodes() == ["ui"]
-    dag.set_status("ui", "done")
+    _advance_to_done(dag, "ui")
     assert dag.ready_nodes() == []
 
 
@@ -81,15 +87,66 @@ def test_set_status_rejects_unknown_node():
         dag.set_status("nope", "done")
 
 
+@pytest.mark.parametrize(("start", "target"), [
+    ("pending", "done"),
+    ("pending", "in_review"),
+    ("blocked", "done"),
+    ("done", "pending"),
+    ("done", "in_progress"),
+])
+def test_illegal_status_transitions_raise(start, target):
+    dag = _dag({"a": start})
+    with pytest.raises(ValueError, match=rf"{start}.*{target}"):
+        dag.set_status("a", target)
+
+
+@pytest.mark.parametrize(("start", "target"), [
+    ("pending", "in_progress"),
+    ("pending", "blocked"),
+    ("in_progress", "in_review"),
+    ("in_progress", "done"),
+    ("in_progress", "blocked"),
+    ("in_progress", "pending"),
+    ("in_review", "in_progress"),
+    ("in_review", "done"),
+    ("in_review", "blocked"),
+    ("in_review", "pending"),
+    ("blocked", "pending"),
+])
+def test_legal_status_transitions_apply(start, target):
+    dag = _dag({"a": start})
+    dag.set_status("a", target)
+    assert dag.node("a").status == target
+
+
+@pytest.mark.parametrize("status", ["pending", "in_progress", "in_review", "done", "blocked"])
+def test_same_status_transition_is_idempotent(status):
+    dag = _dag({"a": status})
+    dag.set_status("a", status)  # a no-op, even from the terminal `done`
+    assert dag.node("a").status == status
+
+
+def test_force_bypasses_transition_table_for_non_done_node():
+    dag = _dag({"a": "pending"})
+    dag.set_status("a", "done", force=True)  # pending -> done is illegal without force
+    assert dag.node("a").status == "done"
+
+
+def test_force_cannot_change_a_done_node():
+    dag = _dag({"a": "done"})
+    with pytest.raises(ValueError, match="done"):
+        dag.set_status("a", "in_progress", force=True)
+
+
 def test_progress_counts():
     dag = DAG.from_dict(SAMPLE)
-    dag.set_status("model", "done")
+    _advance_to_done(dag, "model")
     assert dag.progress() == {"total": 3, "done": 1, "pending": 2, "in_progress": 0, "in_review": 0, "blocked": 0}
 
 
 def test_to_dict_round_trips_with_status():
     dag = DAG.from_dict(SAMPLE)
-    dag.set_status("model", "done")
+    _advance_to_done(dag, "model")
     again = DAG.from_dict(dag.to_dict())
     assert again.node("model").status == "done"
     assert again.topological_order() == dag.topological_order()
@@ -252,7 +309,7 @@ def test_definition_dict_sorts_dependencies():
 def test_definition_dict_is_invariant_to_status():
     dag = DAG.from_dict(DEF_SAMPLE)
     before = dag.definition_dict()
-    dag.set_status("z", "done")
+    _advance_to_done(dag, "z")
     assert dag.definition_dict() == before
 
 

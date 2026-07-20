@@ -60,6 +60,11 @@ def _log_builder(run_dir, tmp_path, gate, round_index, text):
     ])
 
 
+def _start(run_dir, node):
+    """Move a node pending -> in_progress (the legal precondition for reviewing its work)."""
+    return _run(["set-status", "--run", run_dir, "--node", node, "--status", "in_progress"])
+
+
 def _approve(run_dir, tmp_path, gate, round_index=1):
     # Schema-2 binding handshake: fetch the CLI-selected bindings for this gate/round and echo them
     # back in the verdict, exactly as a Critic must. Assumes the Builder artifact was already logged.
@@ -115,6 +120,7 @@ def test_post_consensus_dag_replacement_is_rejected(tmp_path):
 def test_stale_same_id_review_cannot_authorize_replacement_node(tmp_path):
     run_dir = _init(tmp_path)
     _settle_plan(run_dir, tmp_path)
+    assert _start(run_dir, "x").returncode == 0
     assert _log_builder(run_dir, tmp_path, "dep:x", 1, "reviewed old.py").returncode == 0
     assert _approve(run_dir, tmp_path, "dep:x").returncode == 0
 
@@ -129,9 +135,10 @@ def test_stale_same_id_review_cannot_authorize_replacement_node(tmp_path):
 def test_final_before_all_nodes_done_is_rejected(tmp_path):
     run_dir = _init(tmp_path)
     _settle_plan(run_dir, tmp_path)
-    assert _log_builder(run_dir, tmp_path, "final", 1, "whole implementation").returncode == 0
 
-    result = _approve(run_dir, tmp_path, "final")
+    # The FIRST guarded FINAL operation — logging the Builder artifact — is rejected while the single
+    # node is still pending; FINAL cannot begin before the implementation is complete.
+    result = _log_builder(run_dir, tmp_path, "final", 1, "whole implementation")
 
     assert result.returncode != 0
     assert "done" in result.stderr.lower() or "unfinished" in result.stderr.lower()
@@ -140,11 +147,13 @@ def test_final_before_all_nodes_done_is_rejected(tmp_path):
 def test_pending_node_cannot_be_reviewed(tmp_path):
     run_dir = _init(tmp_path)
     _settle_plan(run_dir, tmp_path)
-    assert _log_builder(run_dir, tmp_path, "dep:x", 1, "not implemented").returncode == 0
 
-    review = _approve(run_dir, tmp_path, "dep:x")
+    # The FIRST dependency operation — logging the Builder artifact — is rejected while node x is
+    # still pending; a dependency can only be reviewed once its work is in progress.
+    result = _log_builder(run_dir, tmp_path, "dep:x", 1, "not implemented")
 
-    assert review.returncode != 0
+    assert result.returncode != 0
+    assert "pending" in result.stderr.lower() or "in_progress" in result.stderr
 
 
 def test_dag_rejects_direct_pending_to_done_transition():
