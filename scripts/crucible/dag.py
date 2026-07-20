@@ -183,3 +183,41 @@ class DAG:
                 for dep in sorted(self.deps[nid])
             ],
         }
+
+    def definition_dict(self) -> dict[str, Any]:
+        """Canonical, status-free view of the whole tree for content binding.
+
+        Nodes appear in declared order (order is load-bearing: it breaks ties among
+        otherwise-ready nodes) with only their immutable fields; edges list each node's
+        dependencies in sorted order. Mutable ``status`` is deliberately excluded so a
+        digest over this view stays stable as work progresses.
+        """
+        return {
+            "nodes": [
+                {
+                    "id": n.id,
+                    "title": n.title,
+                    "description": n.description,
+                    "files": list(n.files),
+                    "test_plan": n.test_plan,
+                }
+                for n in (self.nodes[nid] for nid in self.order)
+            ],
+            "edges": [
+                {"from": nid, "depends_on": dep}
+                for nid in self.order
+                for dep in sorted(self.deps[nid])
+            ],
+        }
+
+    def node_definition_dict(self, node_id: str) -> dict[str, Any]:
+        """Canonical, status-free view of one node: its immutable fields plus sorted deps."""
+        n = self.node(node_id)
+        return {
+            "id": n.id,
+            "title": n.title,
+            "description": n.description,
+            "files": list(n.files),
+            "test_plan": n.test_plan,
+            "depends_on": sorted(self.deps[node_id]),
+        }

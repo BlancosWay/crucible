@@ -211,3 +211,59 @@ def test_from_dict_rejects_empty_node_id():
 def test_from_dict_rejects_non_string_edge_endpoint():
     with pytest.raises(ValueError, match="must be a non-empty string"):
         DAG.from_dict({"nodes": [{"id": "a"}], "edges": [{"from": 1, "depends_on": "a"}]})
+
+
+# --- canonical definition dictionaries (schema-v2 integrity) ------------------
+
+# Nodes are declared out of alphabetical order and `z` collects multiple deps declared in a
+# non-sorted order, so the assertions can prove both declared-order preservation and dependency
+# sorting rather than coincidental alphabetical output.
+DEF_SAMPLE = {
+    "nodes": [
+        {"id": "c", "title": "C", "description": "dc", "files": ["c.py"], "test_plan": "tc", "status": "pending"},
+        {"id": "a", "title": "A", "description": "da", "files": ["a.py"], "test_plan": "ta", "status": "done"},
+        {"id": "b", "title": "B", "description": "db", "files": ["b.py"], "test_plan": "tb", "status": "in_progress"},
+        {"id": "z", "title": "Z", "description": "dz", "files": ["z.py"], "test_plan": "tz", "status": "pending"},
+    ],
+    "edges": [
+        {"from": "z", "depends_on": "c"},
+        {"from": "z", "depends_on": "a"},
+        {"from": "z", "depends_on": "b"},
+    ],
+}
+
+
+def test_definition_dict_preserves_node_order_and_omits_status():
+    definition = DAG.from_dict(DEF_SAMPLE).definition_dict()
+    assert [n["id"] for n in definition["nodes"]] == ["c", "a", "b", "z"]
+    assert all("status" not in n for n in definition["nodes"])
+    assert set(definition["nodes"][0]) == {"id", "title", "description", "files", "test_plan"}
+
+
+def test_definition_dict_sorts_dependencies():
+    definition = DAG.from_dict(DEF_SAMPLE).definition_dict()
+    assert definition["edges"] == [
+        {"from": "z", "depends_on": "a"},
+        {"from": "z", "depends_on": "b"},
+        {"from": "z", "depends_on": "c"},
+    ]
+
+
+def test_definition_dict_is_invariant_to_status():
+    dag = DAG.from_dict(DEF_SAMPLE)
+    before = dag.definition_dict()
+    dag.set_status("z", "done")
+    assert dag.definition_dict() == before
+
+
+def test_node_definition_dict_has_immutable_fields_and_sorted_deps():
+    node_def = DAG.from_dict(DEF_SAMPLE).node_definition_dict("z")
+    assert node_def == {
+        "id": "z",
+        "title": "Z",
+        "description": "dz",
+        "files": ["z.py"],
+        "test_plan": "tz",
+        "depends_on": ["a", "b", "c"],
+    }
+    assert "status" not in node_def
