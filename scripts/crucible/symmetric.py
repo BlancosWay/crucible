@@ -34,6 +34,25 @@ VALID_WORKFLOWS = ("build", "deep-dive", "pr-review")
 SYMMETRIC_WORKFLOWS = ("deep-dive", "pr-review")
 # The two configured peer slots a symmetric decision requires.
 VALID_PEERS = ("A", "B")
+# Symmetric workflows reuse the two configured role slots as the two EQUAL peers, with no
+# config-schema change: Peer A is the ``builder`` slot, Peer B is the ``critic`` slot. This is a
+# provenance mapping only — the two peers are not a Builder/Critic asymmetry.
+PEER_SLOT_ROLES = {"A": "builder", "B": "critic"}
+
+
+def peer_slot_provenance(cfg: Config) -> dict[str, dict[str, str]]:
+    """Configured ``model``/``effort`` for each peer slot, read from the run configuration.
+
+    The CLI records this on every ``symmetric_verdict`` so the report and result projection can
+    attribute each slot's attestation to the model/effort that produced it. Per the design's trust
+    boundary this proves two configured *slots* attested — never that two distinct model processes
+    ran — so it is deliberately derived from config, not claimed cryptographically.
+    """
+    provenance: dict[str, dict[str, str]] = {}
+    for slot, role in PEER_SLOT_ROLES.items():
+        role_cfg = getattr(cfg, role)
+        provenance[slot] = {"model": role_cfg["model"], "effort": role_cfg["effort"]}
+    return provenance
 
 
 def workflow_kind(events: list[dict[str, Any]]) -> str:

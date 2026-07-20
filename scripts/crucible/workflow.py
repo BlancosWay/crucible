@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from crucible.integrity import artifact_sha256, dag_sha256, node_sha256
+from crucible.symmetric import SYMMETRIC_WORKFLOWS, workflow_kind
 
 if TYPE_CHECKING:  # annotation-only imports keep this module free of runtime import cycles
     from crucible.config import Config
@@ -345,6 +346,53 @@ def workflow_issues(events: list[dict[str, Any]], dag: DAG, cfg: Config) -> list
     if cfg.final_review:
         issues.extend(_final_issues(events, dag))
 
+    # Symmetric (deep-dive/pr-review) runs additionally persist a structured accepted finding set for
+    # every dependency/FINAL gate that advances. A terminal without it — or an accepted set recorded
+    # after the terminal — is incomplete/orphan history (see Task 2).
+    if workflow_kind(events) in SYMMETRIC_WORKFLOWS:
+        issues.extend(_symmetric_accepted_set_issues(events, dag))
+
+    return issues
+
+
+def _symmetric_accepted_set_issues(
+    events: list[dict[str, Any]], dag: DAG
+) -> list[WorkflowIssue]:
+    """Accepted-finding-set integrity for symmetric dependency/FINAL gates.
+
+    Each dependency (``dep:<id>``) and FINAL gate carries a structured accepted finding set. When such
+    a gate reaches an ADVANCING terminal (``gate_consensus``/``gate_proceeded_with_flags``), exactly
+    one ``accepted_finding_set`` for it must be recorded BEFORE that terminal (the atomic-decision
+    contract: symmetric_verdict -> accepted set -> terminal). Two integrity violations are reported as
+    ``invalid``:
+
+    - a terminal with no pre-terminal accepted set (the gate certified without persisting its result);
+    - an accepted set recorded AFTER its gate's advancing terminal, or with no advancing terminal at
+      all (orphan/post-terminal crash residue that must never count as accepted state).
+
+    Binding-shape, malformed-payload, and FINAL-inclusion validation are Task 3; PLAN gates carry a
+    text artifact and never an accepted finding set, so they are excluded.
+    """
+    issues: list[WorkflowIssue] = []
+    finding_gates = [f"dep:{nid}" for nid in dag.order] + ["final"]
+    for gate in finding_gates:
+        terminal, terminal_idx = _accepted_terminal_with_index(events, gate)
+        accepted_indices = [i for i, e in enumerate(events)
+                            if e.get("event") == "accepted_finding_set" and e.get("gate") == gate]
+        if terminal is not None:
+            pre_terminal = [i for i in accepted_indices
+                            if terminal_idx is None or i < terminal_idx]
+            if not pre_terminal:
+                issues.append(WorkflowIssue(
+                    "invalid",
+                    f"symmetric gate {gate!r} reached an accepted terminal without a persisted "
+                    f"accepted finding set recorded before it"))
+        for i in accepted_indices:
+            if terminal is None or (terminal_idx is not None and i > terminal_idx):
+                issues.append(WorkflowIssue(
+                    "invalid",
+                    f"symmetric gate {gate!r} records an accepted finding set after its terminal or "
+                    f"without an accepted terminal (orphan/post-terminal, not accepted state)"))
     return issues
 
 

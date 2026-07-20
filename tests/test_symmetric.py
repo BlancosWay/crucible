@@ -256,3 +256,19 @@ def test_symmetric_decision_changes_before_cap_with_single_peer_blocker():
     peer_b = _peer("B")
     decision = decide_symmetric(peer_a, peer_b, Config.from_dict({}), 2, 5)
     assert decision.outcome == "CHANGES"
+
+
+# --- peer slot provenance (A=builder, B=critic) ------------------------------
+
+def test_peer_slot_provenance_maps_a_to_builder_b_to_critic():
+    from crucible.symmetric import peer_slot_provenance
+
+    cfg = Config.from_dict({
+        "builder": {"model": "model-a", "effort": "high"},
+        "critic": {"model": "model-b", "effort": "low"},
+    })
+    prov = peer_slot_provenance(cfg)
+    assert prov == {
+        "A": {"model": "model-a", "effort": "high"},
+        "B": {"model": "model-b", "effort": "low"},
+    }

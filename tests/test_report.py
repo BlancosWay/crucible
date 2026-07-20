@@ -1,3 +1,5 @@
+import json
+
 from crucible.config import Config, DEFAULTS
 from crucible.dag import DAG
 from crucible.integrity import RUN_SCHEMA_VERSION, artifact_sha256, dag_sha256, node_sha256
@@ -1065,3 +1067,107 @@ def test_legacy_present_invalid_dag_is_unverified_without_traceback(tmp_path):
     block = _summary_block(render_markdown(run))
     assert "Status:** LEGACY / UNVERIFIED" in block
     assert "CLEAN" not in block
+
+
+# --- symmetric workflow: peer provenance + accepted-set integrity ------------
+
+def _sym_candidate(source_gate="dep:auth", fid="F1", severity="major"):
+    return {"summary": "auth review", "findings": [{
+        "source_gate": source_gate, "id": fid, "severity": severity,
+        "location": "src/auth.py:42", "claim": "Expired refresh tokens are accepted.",
+        "suggestion": "Reject expired refresh tokens.",
+    }]}
+
+
+def _symmetric_dep_run(tmp_path, *, accepted="pre"):
+    """A pr-review run with one done node 'auth' backed by a symmetric dependency gate.
+
+    ``accepted`` selects the accepted_finding_set placement: ``"pre"`` (valid, before the terminal),
+    ``"missing"`` (never appended), or ``"post"`` (appended after the terminal — orphan/invalid).
+    """
+    cfg = Config.from_dict({"final_review": False})
+    run = init_run("symmetric dependency", cfg, base_dir=tmp_path, workflow="pr-review")
+    dag = DAG.from_dict({
+        "nodes": [{"id": "auth", "title": "Auth", "description": "d", "files": ["auth.py"],
+                   "test_plan": "pytest", "status": "done"}],
+        "edges": [],
+    })
+    run.save_dag(dag.to_dict())
+    dsha, nsha = dag_sha256(dag), node_sha256(dag, "auth")
+
+    plan_payload = "investigation plan"
+    plan_art = artifact_sha256(plan_payload.encode("utf-8"))
+    run.append("builder_output", gate="plan", round=1, payload=plan_payload,
+               artifact_sha256=plan_art)
+    run.append("gate_consensus", gate="plan", round=1, artifact_sha256=plan_art, dag_sha256=dsha)
+
+    candidate = _sym_candidate()
+    cand_text = json.dumps(candidate)
+    cand_art = artifact_sha256(cand_text.encode("utf-8"))
+    bindings = {"artifact_sha256": cand_art, "dag_sha256": dsha, "node_sha256": nsha}
+    run.append("builder_output", gate="dep:auth", round=1, payload=cand_text,
+               artifact_sha256=cand_art)
+    run.append("symmetric_verdict", gate="dep:auth", round=1, outcome="CONSENSUS",
+               peers={
+                   "A": {"model": "ma", "effort": "ea", "raw": "{}",
+                         "attestation": {"peer": "A", "verdict": "APPROVE",
+                                         "summary": "complete", "objections": []}},
+                   "B": {"model": "mb", "effort": "eb", "raw": "{}",
+                         "attestation": {"peer": "B", "verdict": "APPROVE",
+                                         "summary": "grounded", "objections": []}},
+               },
+               objections=[], candidate=candidate, **bindings)
+    if accepted == "pre":
+        run.append("accepted_finding_set", gate="dep:auth", round=1, payload=candidate, **bindings)
+    run.append("gate_consensus", gate="dep:auth", round=1, **bindings)
+    if accepted == "post":
+        run.append("accepted_finding_set", gate="dep:auth", round=1, payload=candidate, **bindings)
+    run.append("node_status_change", node="auth", status="done")
+    return run
+
+
+def test_report_renders_symmetric_peer_attestations(tmp_path):
+    run = init_run("sym", Config.from_dict({}), base_dir=tmp_path, workflow="pr-review")
+    run.save_dag({"nodes": [{"id": "auth", "title": "Auth", "description": "", "files": [],
+                             "test_plan": "", "status": "in_review"}], "edges": []})
+    run.append("symmetric_verdict", gate="dep:auth", round=1, outcome="CHANGES",
+               peers={
+                   "A": {"model": "m", "effort": "e", "raw": "{}",
+                         "attestation": {"peer": "A", "verdict": "REQUEST_CHANGES",
+                                         "summary": "peer A dissents", "objections": [
+                                             {"id": "F1", "severity": "major",
+                                              "location": "candidate:F1", "claim": "weak",
+                                              "suggestion": "cite"}]}},
+                   "B": {"model": "m", "effort": "e", "raw": "{}",
+                         "attestation": {"peer": "B", "verdict": "APPROVE",
+                                         "summary": "peer B approves", "objections": []}},
+               },
+               objections=[{"id": "A:F1", "severity": "major", "location": "candidate:F1",
+                            "claim": "weak", "suggestion": "cite"}],
+               candidate={"summary": "", "findings": []},
+               artifact_sha256="a" * 64, dag_sha256="d" * 64, node_sha256="n" * 64)
+    md = render_markdown(run)
+    assert "Peer A" in md and "Peer B" in md
+    assert "REQUEST_CHANGES" in md
+    assert "peer A dissents" in md and "peer B approves" in md
+    assert "A:F1" in md
+
+
+def test_report_symmetric_dependency_clean_with_accepted_set(tmp_path):
+    run = _symmetric_dep_run(tmp_path, accepted="pre")
+    md = render_markdown(run)
+    assert "CLEAN" in md
+
+
+def test_report_symmetric_missing_accepted_set_is_invalid(tmp_path):
+    run = _symmetric_dep_run(tmp_path, accepted="missing")
+    md = render_markdown(run)
+    assert "INVALID" in md
+    assert "CLEAN" not in md
+
+
+def test_report_symmetric_post_terminal_accepted_set_is_invalid(tmp_path):
+    run = _symmetric_dep_run(tmp_path, accepted="post")
+    md = render_markdown(run)
+    assert "INVALID" in md
+    assert "CLEAN" not in md

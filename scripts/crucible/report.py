@@ -400,6 +400,26 @@ def render_markdown(run: RunLog) -> str:
                     lines.append("")
                     lines.extend(_fenced(_payload_text(raw)))
                     lines.append("")
+            elif ev == "symmetric_verdict":
+                # Symmetric gate provenance: both equal peers' per-round verdict + summary, then the
+                # namespaced aggregate objections (A:<id> / B:<id>). The accepted finding SET and any
+                # PR recommendation are rendered elsewhere (Task 3/4) — this shows only the peers'
+                # objections to the candidate, never the accepted results.
+                peers = e.get("peers") or {}
+                att_a = (peers.get("A") or {}).get("attestation") or {}
+                att_b = (peers.get("B") or {}).get("attestation") or {}
+                lines.append(
+                    f"- **Round {rnd} (symmetric):** "
+                    f"Peer A {_san(att_a.get('verdict', '?'))} - {_san(att_a.get('summary', ''))}; "
+                    f"Peer B {_san(att_b.get('verdict', '?'))} - {_san(att_b.get('summary', ''))}"
+                )
+                for o in e.get("objections", []):
+                    if isinstance(o, dict):
+                        lines.append(
+                            f"  - `{_san(o.get('id'))}` [{_san(o.get('severity'))}] "
+                            f"{_san(o.get('location'))}: {_san(o.get('claim'))} -> "
+                            f"{_san(o.get('suggestion'))}"
+                        )
             elif ev == "builder_resolution":
                 payload = e.get("payload") or {}
                 if isinstance(payload, dict) and payload:

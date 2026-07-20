@@ -2030,3 +2030,365 @@ def test_approve_plan_rejects_legacy_run(tmp_path):
     r = _run(["approve-plan", "--run", run_dir])
     assert r.returncode != 0
     assert "legacy" in r.stderr.lower() and "fresh run" in r.stderr.lower()
+
+
+# --- symmetric-verdict: two-peer atomic gate decisions -----------------------
+
+def _init_symmetric(tmp_path, workflow="pr-review"):
+    r = _run(["init-run", "--goal", "g", "--base-dir", str(tmp_path), "--workflow", workflow])
+    assert r.returncode == 0, r.stderr
+    return r.stdout.strip()
+
+
+def _sym_bindings(run_dir, gate, round_index):
+    r = _run(["bindings", "--run", run_dir, "--gate", gate, "--round", str(round_index)])
+    assert r.returncode == 0, r.stderr
+    return json.loads(r.stdout)
+
+
+def _peer_file(tmp_path, slot, gate, round_index, bindings, *, verdict="APPROVE",
+               objections=None, summary="the candidate set is complete and grounded", name=None):
+    """Write one peer attestation file echoing the CLI-selected bindings."""
+    path = Path(tmp_path) / (name or f"peer-{slot}-{gate.replace(':', '-')}-{round_index}.json")
+    path.write_text(json.dumps({
+        "peer": slot, "gate": gate, "round": round_index, "verdict": verdict,
+        "summary": summary, "objections": objections or [], **bindings,
+    }))
+    return str(path)
+
+
+def _objection(fid="F1", severity="major"):
+    return {"id": fid, "severity": severity, "location": "candidate:F1",
+            "claim": "Finding lacks evidence.", "suggestion": "Add a citation."}
+
+
+def _accepted_finding(source_gate="dep:auth", fid="F1", severity="major"):
+    return {"source_gate": source_gate, "id": fid, "severity": severity,
+            "location": "src/auth.py:42", "claim": "Expired refresh tokens are accepted.",
+            "suggestion": "Reject expired refresh tokens."}
+
+
+def _log_text(run_dir, tmp_path, gate, round_index, text, name):
+    f = Path(tmp_path) / name
+    f.write_text(text)
+    r = _run(["log", "--run", run_dir, "--event", "builder_output", "--gate", gate,
+              "--round", str(round_index), "--file", str(f)])
+    assert r.returncode == 0, r.stderr
+
+
+def _settle_symmetric_plan(run_dir, tmp_path):
+    """Drive the symmetric PLAN gate to consensus with two bound peer approvals (a DAG must already
+    be loaded), so dependency prerequisites are satisfied."""
+    _log_text(run_dir, tmp_path, "plan", 1, "# investigation plan\nthreads", "sym-plan.md")
+    b = _sym_bindings(run_dir, "plan", 1)
+    a = _peer_file(tmp_path, "A", "plan", 1, b)
+    bb = _peer_file(tmp_path, "B", "plan", 1, b)
+    r = _run(["symmetric-verdict", "--run", run_dir, "--gate", "plan", "--round", "1",
+              "--peer-a", a, "--peer-b", bb])
+    assert r.stdout.strip() == "CONSENSUS", r.stdout + r.stderr
+
+
+def _one_node_symmetric(tmp_path, node="auth"):
+    """A pr-review run with one loaded node, PLAN settled symmetrically, and the node in_progress."""
+    run_dir = _init_symmetric(tmp_path)
+    _load(run_dir, tmp_path, {node: "pending"})
+    _settle_symmetric_plan(run_dir, tmp_path)
+    _start(run_dir, node)
+    return run_dir
+
+
+def _symmetric_dep_verdict(run_dir, tmp_path, node, *, candidate, peer_a=None, peer_b=None,
+                           round_index=1, max_rounds=None):
+    """Log a structured candidate finding set and run symmetric-verdict for that dep gate."""
+    gate = f"dep:{node}"
+    _log_text(run_dir, tmp_path, gate, round_index, json.dumps(candidate),
+              f"cand-{node}-{round_index}.json")
+    b = _sym_bindings(run_dir, gate, round_index)
+    a = _peer_file(tmp_path, "A", gate, round_index, b, **(peer_a or {}))
+    bb = _peer_file(tmp_path, "B", gate, round_index, b, **(peer_b or {}))
+    argv = ["symmetric-verdict", "--run", run_dir, "--gate", gate, "--round", str(round_index),
+            "--peer-a", a, "--peer-b", bb]
+    if max_rounds is not None:
+        argv += ["--max-rounds", str(max_rounds)]
+    return _run(argv)
+
+
+def _sym_events(run_dir, name, gate=None):
+    return [e for e in _events(run_dir) if e.get("event") == name
+            and (gate is None or e.get("gate") == gate)]
+
+
+def test_verdict_rejects_pr_review_run(tmp_path):
+    run_dir = _init_symmetric(tmp_path, "pr-review")
+    _load(run_dir, tmp_path, {"a": "pending"})
+    _log_text(run_dir, tmp_path, "plan", 1, "# plan", "p.md")
+    b = _sym_bindings(run_dir, "plan", 1)
+    vfile = Path(tmp_path) / "v.json"
+    vfile.write_text(json.dumps({"gate": "plan", "round": 1, "verdict": "APPROVE",
+                                 "summary": "s", "findings": [], **b}))
+    r = _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1", "--file", str(vfile)])
+    assert r.returncode != 0
+    assert "symmetric-verdict" in r.stderr
+    assert not _sym_events(run_dir, "critic_verdict")
+
+
+def test_verdict_rejects_deep_dive_run(tmp_path):
+    run_dir = _init_symmetric(tmp_path, "deep-dive")
+    _load(run_dir, tmp_path, {"a": "pending"})
+    _log_text(run_dir, tmp_path, "plan", 1, "# plan", "p.md")
+    b = _sym_bindings(run_dir, "plan", 1)
+    vfile = Path(tmp_path) / "v.json"
+    vfile.write_text(json.dumps({"gate": "plan", "round": 1, "verdict": "APPROVE",
+                                 "summary": "s", "findings": [], **b}))
+    r = _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1", "--file", str(vfile)])
+    assert r.returncode != 0
+    assert "symmetric-verdict" in r.stderr
+
+
+def test_symmetric_verdict_rejects_build_run(tmp_path):
+    run_dir = _init(tmp_path)
+    _load(run_dir, tmp_path, {"a": "pending"})
+    _log_text(run_dir, tmp_path, "plan", 1, "# plan", "p.md")
+    b = _sym_bindings(run_dir, "plan", 1)
+    a = _peer_file(tmp_path, "A", "plan", 1, b)
+    bb = _peer_file(tmp_path, "B", "plan", 1, b)
+    r = _run(["symmetric-verdict", "--run", run_dir, "--gate", "plan", "--round", "1",
+              "--peer-a", a, "--peer-b", bb])
+    assert r.returncode != 0
+    assert "build" in r.stderr.lower()
+    assert not _sym_events(run_dir, "symmetric_verdict")
+
+
+def test_symmetric_verdict_requires_both_peer_files(tmp_path):
+    run_dir = _init_symmetric(tmp_path)
+    _load(run_dir, tmp_path, {"a": "pending"})
+    _log_text(run_dir, tmp_path, "plan", 1, "# plan", "p.md")
+    b = _sym_bindings(run_dir, "plan", 1)
+    a = _peer_file(tmp_path, "A", "plan", 1, b)
+    r = _run(["symmetric-verdict", "--run", run_dir, "--gate", "plan", "--round", "1",
+              "--peer-a", a])
+    assert r.returncode != 0
+    assert "peer-b" in r.stderr.lower()
+
+
+def test_symmetric_verdict_rejects_duplicate_peer_labels(tmp_path):
+    run_dir = _init_symmetric(tmp_path)
+    _load(run_dir, tmp_path, {"a": "pending"})
+    _log_text(run_dir, tmp_path, "plan", 1, "# plan", "p.md")
+    b = _sym_bindings(run_dir, "plan", 1)
+    a = _peer_file(tmp_path, "A", "plan", 1, b, name="a1.json")
+    a2 = _peer_file(tmp_path, "A", "plan", 1, b, name="a2.json")
+    r = _run(["symmetric-verdict", "--run", run_dir, "--gate", "plan", "--round", "1",
+              "--peer-a", a, "--peer-b", a2])
+    assert r.returncode != 0
+    assert "peer" in r.stderr.lower()
+    assert not _sym_events(run_dir, "symmetric_verdict")
+
+
+def test_symmetric_verdict_rejects_swapped_peer_labels(tmp_path):
+    run_dir = _init_symmetric(tmp_path)
+    _load(run_dir, tmp_path, {"a": "pending"})
+    _log_text(run_dir, tmp_path, "plan", 1, "# plan", "p.md")
+    b = _sym_bindings(run_dir, "plan", 1)
+    # peer-a slot carries a "B" file and vice versa.
+    swapped_b = _peer_file(tmp_path, "B", "plan", 1, b, name="b.json")
+    swapped_a = _peer_file(tmp_path, "A", "plan", 1, b, name="a.json")
+    r = _run(["symmetric-verdict", "--run", run_dir, "--gate", "plan", "--round", "1",
+              "--peer-a", swapped_b, "--peer-b", swapped_a])
+    assert r.returncode != 0
+    assert "peer" in r.stderr.lower()
+    assert not _sym_events(run_dir, "symmetric_verdict")
+
+
+def test_symmetric_verdict_rejects_double_b_labels(tmp_path):
+    run_dir = _init_symmetric(tmp_path)
+    _load(run_dir, tmp_path, {"a": "pending"})
+    _log_text(run_dir, tmp_path, "plan", 1, "# plan", "p.md")
+    b = _sym_bindings(run_dir, "plan", 1)
+    b1 = _peer_file(tmp_path, "B", "plan", 1, b, name="b1.json")
+    b2 = _peer_file(tmp_path, "B", "plan", 1, b, name="b2.json")
+    r = _run(["symmetric-verdict", "--run", run_dir, "--gate", "plan", "--round", "1",
+              "--peer-a", b1, "--peer-b", b2])
+    assert r.returncode != 0
+    assert not _sym_events(run_dir, "symmetric_verdict")
+
+
+def test_symmetric_verdict_rejects_binding_mismatch(tmp_path):
+    run_dir = _init_symmetric(tmp_path)
+    _load(run_dir, tmp_path, {"a": "pending"})
+    _log_text(run_dir, tmp_path, "plan", 1, "# plan", "p.md")
+    b = _sym_bindings(run_dir, "plan", 1)
+    a = _peer_file(tmp_path, "A", "plan", 1, b)
+    tampered = {**b, "artifact_sha256": "0" * 64}
+    bb = _peer_file(tmp_path, "B", "plan", 1, tampered)
+    r = _run(["symmetric-verdict", "--run", run_dir, "--gate", "plan", "--round", "1",
+              "--peer-a", a, "--peer-b", bb])
+    assert r.returncode != 0
+    assert "binding" in r.stderr.lower()
+    assert not _sym_events(run_dir, "symmetric_verdict")
+
+
+def test_symmetric_verdict_rejects_inconsistent_peer(tmp_path):
+    run_dir = _init_symmetric(tmp_path)
+    _load(run_dir, tmp_path, {"a": "pending"})
+    _log_text(run_dir, tmp_path, "plan", 1, "# plan", "p.md")
+    b = _sym_bindings(run_dir, "plan", 1)
+    # APPROVE but carries a blocking objection -> inconsistent.
+    a = _peer_file(tmp_path, "A", "plan", 1, b, verdict="APPROVE",
+                   objections=[_objection(severity="major")])
+    bb = _peer_file(tmp_path, "B", "plan", 1, b)
+    r = _run(["symmetric-verdict", "--run", run_dir, "--gate", "plan", "--round", "1",
+              "--peer-a", a, "--peer-b", bb])
+    assert r.returncode != 0
+    assert "inconsistent" in r.stderr.lower()
+    assert not _sym_events(run_dir, "symmetric_verdict")
+
+
+def test_symmetric_verdict_two_approvals_records_both_slots(tmp_path):
+    run_dir = _init_symmetric(tmp_path)
+    _load(run_dir, tmp_path, {"a": "pending"})
+    _log_text(run_dir, tmp_path, "plan", 1, "# plan\nreviewed", "p.md")
+    b = _sym_bindings(run_dir, "plan", 1)
+    a = _peer_file(tmp_path, "A", "plan", 1, b, summary="peer A says complete")
+    bb = _peer_file(tmp_path, "B", "plan", 1, b, summary="peer B agrees")
+    r = _run(["symmetric-verdict", "--run", run_dir, "--gate", "plan", "--round", "1",
+              "--peer-a", a, "--peer-b", bb])
+    assert r.stdout.strip() == "CONSENSUS", r.stdout + r.stderr
+    events = _sym_events(run_dir, "symmetric_verdict")
+    assert len(events) == 1
+    ev = events[0]
+    cfg = json.loads((Path(run_dir) / "config.json").read_text())
+    assert ev["peers"]["A"]["model"] == cfg["builder"]["model"]
+    assert ev["peers"]["A"]["effort"] == cfg["builder"]["effort"]
+    assert ev["peers"]["B"]["model"] == cfg["critic"]["model"]
+    assert ev["peers"]["B"]["effort"] == cfg["critic"]["effort"]
+    assert ev["peers"]["A"]["attestation"]["verdict"] == "APPROVE"
+    assert ev["peers"]["A"]["attestation"]["summary"] == "peer A says complete"
+    assert "peer B agrees" in ev["peers"]["B"]["raw"]
+    assert ev["outcome"] == "CONSENSUS"
+
+
+def test_symmetric_verdict_dependency_consensus_persists_accepted_findings(tmp_path):
+    run_dir = _one_node_symmetric(tmp_path, "auth")
+    candidate = {"summary": "auth review",
+                 "findings": [_accepted_finding("dep:auth", "F1", "major")]}
+    r = _symmetric_dep_verdict(run_dir, tmp_path, "auth", candidate=candidate)
+    assert r.stdout.strip() == "CONSENSUS", r.stdout + r.stderr
+    accepted = _sym_events(run_dir, "accepted_finding_set")
+    assert len(accepted) == 1
+    assert accepted[0]["payload"]["findings"][0]["id"] == "F1"
+    assert accepted[0]["gate"] == "dep:auth"
+    # Event order: symmetric_verdict -> accepted_finding_set -> gate_consensus (terminal last).
+    evs = [e["event"] for e in _events(run_dir)
+           if e.get("gate") == "dep:auth"
+           and e["event"] in ("symmetric_verdict", "accepted_finding_set", "gate_consensus")]
+    assert evs == ["symmetric_verdict", "accepted_finding_set", "gate_consensus"]
+
+
+def test_symmetric_verdict_blocker_candidate_still_reaches_consensus(tmp_path):
+    # An ACCEPTED blocker in the candidate set does not block the gate — only peer OBJECTIONS do.
+    run_dir = _one_node_symmetric(tmp_path, "auth")
+    candidate = {"summary": "auth review",
+                 "findings": [_accepted_finding("dep:auth", "F1", "blocker")]}
+    r = _symmetric_dep_verdict(run_dir, tmp_path, "auth", candidate=candidate)
+    assert r.stdout.strip() == "CONSENSUS", r.stdout + r.stderr
+    assert _sym_events(run_dir, "accepted_finding_set")[0]["payload"]["findings"][0]["severity"] == "blocker"
+
+
+def test_symmetric_verdict_request_changes_records_no_accepted_set(tmp_path):
+    run_dir = _one_node_symmetric(tmp_path, "auth")
+    candidate = {"summary": "auth review",
+                 "findings": [_accepted_finding("dep:auth", "F1", "major")]}
+    # Peer B requests changes with a blocking objection on the candidate's completeness.
+    r = _symmetric_dep_verdict(
+        run_dir, tmp_path, "auth", candidate=candidate,
+        peer_b={"verdict": "REQUEST_CHANGES", "objections": [_objection("O1", "blocker")]})
+    assert r.stdout.strip() == "CHANGES", r.stdout + r.stderr
+    assert not _sym_events(run_dir, "accepted_finding_set")
+    assert not [e for e in _events(run_dir)
+                if e.get("gate") == "dep:auth" and e["event"] == "gate_consensus"]
+
+
+def test_symmetric_verdict_namespaces_peer_objections(tmp_path):
+    run_dir = _one_node_symmetric(tmp_path, "auth")
+    candidate = {"summary": "auth review", "findings": []}
+    r = _symmetric_dep_verdict(
+        run_dir, tmp_path, "auth", candidate=candidate,
+        peer_a={"verdict": "REQUEST_CHANGES", "objections": [_objection("F1", "major")]},
+        peer_b={"verdict": "REQUEST_CHANGES", "objections": [_objection("F1", "blocker")]})
+    assert r.stdout.strip() == "CHANGES", r.stdout + r.stderr
+    ev = _sym_events(run_dir, "symmetric_verdict", "dep:auth")[0]
+    ids = [o["id"] for o in ev["objections"]]
+    assert ids == ["A:F1", "B:F1"]
+
+
+def test_symmetric_verdict_caps_when_halt_configured(tmp_path):
+    cfg = Path(tmp_path) / "cfg.json"
+    cfg.write_text(json.dumps({"on_cap": "halt", "max_rounds_dep": 1}))
+    r = _run(["init-run", "--goal", "g", "--base-dir", str(tmp_path),
+              "--workflow", "pr-review", "--config", str(cfg)])
+    assert r.returncode == 0, r.stderr
+    run_dir = r.stdout.strip()
+    _load(run_dir, tmp_path, {"auth": "pending"})
+    _settle_symmetric_plan(run_dir, tmp_path)
+    _start(run_dir, "auth")
+    candidate = {"summary": "auth review", "findings": []}
+    r = _symmetric_dep_verdict(
+        run_dir, tmp_path, "auth", candidate=candidate,
+        peer_a={"verdict": "REQUEST_CHANGES", "objections": [_objection("O1", "blocker")]})
+    assert r.stdout.strip() == "CAPPED", r.stdout + r.stderr
+    assert not _sym_events(run_dir, "accepted_finding_set")
+    assert [e for e in _events(run_dir)
+            if e.get("gate") == "dep:auth" and e["event"] == "gate_capped"]
+
+
+def test_symmetric_verdict_proceeds_with_flags_persists_accepted_with_flags(tmp_path):
+    cfg = Path(tmp_path) / "cfg.json"
+    cfg.write_text(json.dumps({"on_cap": "proceed_with_flags", "max_rounds_dep": 1}))
+    r = _run(["init-run", "--goal", "g", "--base-dir", str(tmp_path),
+              "--workflow", "pr-review", "--config", str(cfg)])
+    assert r.returncode == 0, r.stderr
+    run_dir = r.stdout.strip()
+    _load(run_dir, tmp_path, {"auth": "pending"})
+    _settle_symmetric_plan(run_dir, tmp_path)
+    _start(run_dir, "auth")
+    candidate = {"summary": "auth review",
+                 "findings": [_accepted_finding("dep:auth", "F1", "major")]}
+    r = _symmetric_dep_verdict(
+        run_dir, tmp_path, "auth", candidate=candidate,
+        peer_a={"verdict": "REQUEST_CHANGES", "objections": [_objection("O1", "blocker")]})
+    assert r.stdout.strip() == "PROCEED_WITH_FLAGS", r.stdout + r.stderr
+    accepted = _sym_events(run_dir, "accepted_finding_set")
+    assert len(accepted) == 1
+    assert accepted[0]["accepted_with_flags"] is True
+    assert "A:O1" in accepted[0]["open_objections"]
+    # Order: symmetric_verdict -> accepted_finding_set -> gate_proceeded_with_flags.
+    evs = [e["event"] for e in _events(run_dir)
+           if e.get("gate") == "dep:auth"
+           and e["event"] in ("symmetric_verdict", "accepted_finding_set",
+                               "gate_proceeded_with_flags")]
+    assert evs == ["symmetric_verdict", "accepted_finding_set", "gate_proceeded_with_flags"]
+
+
+def test_symmetric_verdict_rejects_dependency_candidate_wrong_source_gate(tmp_path):
+    run_dir = _one_node_symmetric(tmp_path, "auth")
+    candidate = {"summary": "auth review",
+                 "findings": [_accepted_finding("dep:other", "F1", "major")]}
+    r = _symmetric_dep_verdict(run_dir, tmp_path, "auth", candidate=candidate)
+    assert r.returncode != 0
+    assert "source_gate" in r.stderr
+    assert not _sym_events(run_dir, "symmetric_verdict", "dep:auth")
+
+
+def test_symmetric_verdict_rejects_wrong_round(tmp_path):
+    run_dir = _init_symmetric(tmp_path)
+    _load(run_dir, tmp_path, {"a": "pending"})
+    _log_text(run_dir, tmp_path, "plan", 1, "# plan", "p.md")
+    b = _sym_bindings(run_dir, "plan", 1)
+    a = _peer_file(tmp_path, "A", "plan", 2, b)
+    bb = _peer_file(tmp_path, "B", "plan", 2, b)
+    r = _run(["symmetric-verdict", "--run", run_dir, "--gate", "plan", "--round", "2",
+              "--peer-a", a, "--peer-b", bb])
+    assert r.returncode != 0
+    assert "round" in r.stderr.lower()
+    assert not _sym_events(run_dir, "symmetric_verdict")
