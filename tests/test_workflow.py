@@ -20,6 +20,7 @@ from crucible.workflow import (
     require_node_review_ready,
     require_plan_ready,
     require_plan_verdict_ready,
+    require_reproduce_ready,
     workflow_issues,
     WorkflowIssue,
 )
@@ -331,4 +332,108 @@ def test_workflow_issues_ignores_post_terminal_builder_output(tmp_path):
     _bind_dep_a(run, dag)
     run.append("builder_output", gate="plan", round=1, payload="tampered later plan",
                artifact_sha256=artifact_sha256(b"tampered later plan"))
+    assert workflow_issues(run.read_events(), dag, cfg) == []
+
+
+# --- F1: the REPRODUCE gate is accepted only when reproduce_gate is enabled ---
+
+def test_require_reproduce_ready_rejects_when_disabled(tmp_path):
+    # Design: "reproduce is accepted only when reproduce_gate: true." With it disabled the REPRODUCE
+    # gate is not part of the configured workflow, so the shared readiness guard rejects it (the CLI
+    # log/bindings/verdict handshake delegates here, so a forbidden gate never records or certifies).
+    cfg = Config.from_dict({"reproduce_gate": False})
+    with pytest.raises(SystemExit) as exc:
+        require_reproduce_ready(cfg)
+    assert "reproduce_gate" in str(exc.value)
+
+
+def test_require_reproduce_ready_allows_when_enabled(tmp_path):
+    cfg = Config.from_dict({"reproduce_gate": True})
+    require_reproduce_ready(cfg)  # does not raise — REPRODUCE is Stage 0 of the configured workflow
+
+
+def test_workflow_issues_flags_disabled_reproduce_terminal(tmp_path):
+    # F1: reproduce_gate is disabled, yet a REPRODUCE gate reached a terminal in the log. That is a
+    # configured-forbidden phase (an extra gate the workflow does not include) -> "invalid", so the
+    # report can never certify such a run CLEAN even though every other phase is validly bound.
+    cfg = Config.from_dict({"reproduce_gate": False, "final_review": False})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    dag = _dag(status="done")
+    _bind_plan(run, dag)
+    ra = artifact_sha256(b"repro")
+    run.append("builder_output", gate="reproduce", round=1, payload="repro", artifact_sha256=ra)
+    run.append("gate_consensus", gate="reproduce", round=1, artifact_sha256=ra)
+    _bind_dep_a(run, dag)  # the node is validly completed, so ONLY the forbidden REPRODUCE is at issue
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "invalid" and "reproduce" in i.message.lower() for i in issues)
+
+
+def test_workflow_issues_flags_disabled_reproduce_even_when_capped(tmp_path):
+    # F1: a disabled REPRODUCE gate that CAPPED (a terminal, not an advance) is still a forbidden
+    # phase in the log -> "invalid" (the phase must not appear at all when reproduce_gate is off).
+    cfg = Config.from_dict({"reproduce_gate": False, "final_review": False})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    dag = _dag(status="done")
+    _bind_plan(run, dag)
+    run.append("gate_capped", gate="reproduce", round=1, open_findings=["F1"])
+    _bind_dep_a(run, dag)
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "invalid" and "reproduce" in i.message.lower() for i in issues)
+
+
+def test_workflow_issues_allows_reproduce_terminal_when_enabled(tmp_path):
+    # Enabled behavior remains: a bound, accepted REPRODUCE terminal under reproduce_gate: true is not
+    # flagged (it is the configured Stage 0), so a fully bound run stays clean.
+    cfg = Config.from_dict({"reproduce_gate": True, "final_review": False})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    dag = _dag(status="done")
+    ra = artifact_sha256(b"repro")
+    run.append("builder_output", gate="reproduce", round=1, payload="repro", artifact_sha256=ra)
+    run.append("gate_consensus", gate="reproduce", round=1, artifact_sha256=ra)
+    _bind_plan(run, dag)
+    _bind_dep_a(run, dag)
+    assert workflow_issues(run.read_events(), dag, cfg) == []
+
+
+# --- F2: configured human approval must precede all dependency / FINAL work ---
+
+def test_workflow_issues_flags_late_approval_after_dependency_work(tmp_path):
+    # F2: human_approval is configured; the plan is approved and binds correctly, but the approval is
+    # recorded AFTER the dependency was reviewed and the node marked done. Approval must gate
+    # dependency work (design phase order: approval before dependency work), so an approval recorded
+    # after that work is out of order -> "invalid", never CLEAN.
+    cfg = Config.from_dict({"human_approval": True, "final_review": False})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    dag = _dag(status="done")
+    artifact, dag_hash = _bind_plan(run, dag)
+    _bind_dep_a(run, dag)
+    run.append("node_status_change", node="a", status="done",
+               dag_sha256=dag_sha256(dag), node_sha256=node_sha256(dag, "a"))
+    run.append("plan_approved", gate="plan", artifact_sha256=artifact, dag_sha256=dag_hash)
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "invalid" and "approval" in i.message.lower() for i in issues)
+
+
+def test_workflow_issues_flags_approval_after_node_start(tmp_path):
+    # F2: even a node_status_change to in_progress (status work) recorded before approval is out of
+    # order — approval must precede ANY dependency/status work, not just a completed dependency.
+    cfg = Config.from_dict({"human_approval": True, "final_review": False})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    dag = _dag(status="in_progress")
+    artifact, dag_hash = _bind_plan(run, dag)
+    run.append("node_status_change", node="a", status="in_progress")
+    run.append("plan_approved", gate="plan", artifact_sha256=artifact, dag_sha256=dag_hash)
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "invalid" and "approval" in i.message.lower() for i in issues)
+
+
+def test_workflow_issues_allows_approval_before_dependency_work(tmp_path):
+    # Valid-order guard: approval recorded BEFORE any dependency work keeps a fully bound, approved
+    # run clean (no approval-ordering issue) — the F2 fix must not flag the legitimate order.
+    cfg = Config.from_dict({"human_approval": True, "final_review": False})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    dag = _dag(status="done")
+    artifact, dag_hash = _bind_plan(run, dag)
+    run.append("plan_approved", gate="plan", artifact_sha256=artifact, dag_sha256=dag_hash)
+    _bind_dep_a(run, dag)
     assert workflow_issues(run.read_events(), dag, cfg) == []

@@ -29,6 +29,7 @@ from crucible.workflow import (
     require_node_review_ready,
     require_plan_ready,
     require_plan_verdict_ready,
+    require_reproduce_ready,
 )
 
 # Events that `crucible log` may append. All other events are emitted by their own
@@ -234,7 +235,8 @@ def _require_gate_stage_ready(run: RunLog, cfg: Config, gate: str) -> None:
     (Task 3). Shared by all three so a Builder artifact, its bindings, and the Critic verdict are
     only ever recorded/emitted once the gate is legitimately reachable:
 
-    - ``reproduce`` — none (it is Stage 0, ahead of everything else);
+    - ``reproduce`` — Stage 0, but part of the configured workflow ONLY when ``reproduce_gate`` is
+      enabled (rejected otherwise, so a disabled REPRODUCE gate never records or certifies);
     - ``plan`` — REPRODUCE consensus when ``reproduce_gate`` is configured;
     - ``dep:<id>`` — accepted+bound PLAN, configured approval, deps done, node ``in_progress``/``in_review``;
     - ``final`` — ``final_review`` enabled, bound PLAN/approval, every node done and backed.
@@ -243,6 +245,7 @@ def _require_gate_stage_ready(run: RunLog, cfg: Config, gate: str) -> None:
     passed ``_validate_gate`` and (for ``dep:``) ``_require_dep_node_in_dag``.
     """
     if gate == "reproduce":
+        require_reproduce_ready(cfg)
         return
     if gate == "plan":
         require_plan_verdict_ready(run, cfg)

@@ -2,6 +2,10 @@ import json
 import re
 from pathlib import Path
 
+import pytest
+
+from crucible.cli import _load_resolutions
+
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULTS = json.loads((ROOT / "config.defaults.json").read_text())
 SOURCE_REFERENCE_DOCS = [
@@ -231,3 +235,75 @@ def test_command_docs_mention_artifact_binding():
         assert "schema v2" in low, f"commands/{name}.md omits the schema-2 claim"
         assert "bindings" in low and "verdict must echo" in low, f"commands/{name}.md omits the echo requirement"
         assert "legacy / unverified" in low, f"commands/{name}.md omits the legacy behavior"
+
+
+# --- --resolutions grammar guards: the skill/rubric examples must match the CLI parser --------------
+# `_load_resolutions` rejects a bare `wontfix`/`deferred` (a resolution that clears a finding without a
+# fix must carry the object form with a non-empty `rationale`). A user copy/pasting a documented
+# example must not hit a runtime rejection, so every executable `--resolutions` example in the skill
+# and rubric docs is parsed through the real CLI loader here.
+
+RESOLUTION_EXAMPLE_DOCS = [
+    ROOT / "skills" / "crucible" / "SKILL.md",
+    ROOT / "skills" / "crucible" / "references" / "consensus-rubric.md",
+]
+
+
+def _resolution_map_examples(text: str) -> list[dict]:
+    """Every inline-code JSON object in `text` that is a top-level `--resolutions` map
+    (`{finding_id: resolution}`) — i.e. a non-empty dict whose EVERY value is a bare resolution
+    keyword (`fixed`/`deferred`/`wontfix`) or an object carrying a `"resolution"` key. The inner
+    object form `{"resolution": …, "rationale": …}` is deliberately excluded (its `rationale` value
+    is not a resolution), so only genuine top-level resolution maps are validated."""
+    examples: list[dict] = []
+    for span in re.findall(r"`([^`]*)`", text):
+        span = span.strip()
+        if not (span.startswith("{") and span.endswith("}")):
+            continue
+        try:
+            obj = json.loads(span)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(obj, dict) or not obj:
+            continue
+        def _is_resolution(v):
+            return v in ("fixed", "deferred", "wontfix") or (isinstance(v, dict) and "resolution" in v)
+        if all(_is_resolution(v) for v in obj.values()):
+            examples.append(obj)
+    return examples
+
+
+def test_resolution_examples_in_docs_match_cli_grammar(tmp_path):
+    # Every documented `--resolutions` example must be EXECUTABLE: the real `_load_resolutions` accepts
+    # it, and every non-fixed resolution uses the object+rationale form the CLI requires (a bare
+    # `wontfix`/`deferred` would be rejected at runtime, breaking the documented workflow).
+    total = 0
+    for doc in RESOLUTION_EXAMPLE_DOCS:
+        examples = _resolution_map_examples(doc.read_text())
+        assert examples, f"{doc} has no --resolutions example to validate"
+        for obj in examples:
+            total += 1
+            path = tmp_path / "res.json"
+            path.write_text(json.dumps(obj))
+            _load_resolutions(str(path))  # must not raise: a rejected example is a broken doc
+            for fid, val in obj.items():
+                res = val if isinstance(val, str) else val.get("resolution")
+                if res in ("wontfix", "deferred"):
+                    assert isinstance(val, dict) and isinstance(val.get("rationale"), str) \
+                        and val["rationale"].strip(), \
+                        f"{doc}: {fid} is a bare {res!r}; use the object+rationale form"
+    assert total >= 2, "expected at least the SKILL.md and consensus-rubric.md resolution examples"
+
+
+def test_load_resolutions_rejects_bare_nonfixed_resolution(tmp_path):
+    # The grammar the docs must match: a bare `wontfix`/`deferred` (clearing a finding with no recorded
+    # reason) is rejected; the object+rationale form is accepted. This is the guard the docs would trip
+    # if an example regressed to the bare form.
+    for res in ("wontfix", "deferred"):
+        bare = tmp_path / "bare.json"
+        bare.write_text(json.dumps({"F1": res}))
+        with pytest.raises(ValueError, match="rationale"):
+            _load_resolutions(str(bare))
+        ok = tmp_path / "ok.json"
+        ok.write_text(json.dumps({"F1": {"resolution": res, "rationale": "recorded reason"}}))
+        _load_resolutions(str(ok))  # object form with a rationale is accepted

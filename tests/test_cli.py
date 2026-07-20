@@ -1270,7 +1270,7 @@ def test_verdict_rejects_invalid_gate_name(tmp_path):
 
 
 def test_verdict_accepts_reproduce_gate(tmp_path):
-    run_dir = _init(tmp_path)
+    run_dir = _init_with_config(tmp_path, {"reproduce_gate": True})
     r = _run_bound_verdict(tmp_path, run_dir, "reproduce", 1, "APPROVE", payload="bug reproduced")
     assert r.returncode == 0, r.stderr
     assert r.stdout.strip() == "CONSENSUS"
@@ -1279,7 +1279,7 @@ def test_verdict_accepts_reproduce_gate(tmp_path):
 def test_reproduce_gate_halts_even_with_proceed_with_flags(tmp_path):
     # An unconfirmed reproduction must HALT (CAPPED), never PROCEED_WITH_FLAGS, regardless of on_cap.
     cfg = Path(tmp_path) / "c.json"
-    cfg.write_text(json.dumps({"on_cap": "proceed_with_flags", "max_rounds_plan": 1}))
+    cfg.write_text(json.dumps({"reproduce_gate": True, "on_cap": "proceed_with_flags", "max_rounds_plan": 1}))
     run_dir = _run(["init-run", "--goal", "g", "--base-dir", str(tmp_path), "--config", str(cfg)]).stdout.strip()
     r = _run_bound_verdict(
         tmp_path, run_dir, "reproduce", 1, "REQUEST_CHANGES", payload="no repro",
@@ -1688,9 +1688,46 @@ def test_bindings_dep_gate_includes_node_hash(tmp_path):
 
 
 def test_bindings_reproduce_gate_is_artifact_only(tmp_path):
-    run_dir = _init(tmp_path)
+    run_dir = _init_with_config(tmp_path, {"reproduce_gate": True})
     data = _log_artifact_and_get_bindings(run_dir, tmp_path, "reproduce", 1, "bug repro")
     assert set(data) == {"artifact_sha256"}
+
+
+def test_reproduce_log_refused_when_disabled(tmp_path):
+    # F1: reproduce_gate is off by default, so the REPRODUCE gate is not part of this run's configured
+    # workflow. Logging a Builder artifact for it is refused, and nothing is appended to the run — a
+    # disabled gate can never even begin, let alone certify.
+    run_dir = _init(tmp_path)
+    art = Path(tmp_path) / "repro.txt"; art.write_text("bug repro")
+    r = _run(["log", "--run", run_dir, "--event", "builder_output", "--gate", "reproduce",
+              "--round", "1", "--file", str(art)])
+    assert r.returncode != 0
+    assert "reproduce_gate" in r.stderr
+    assert not any(e.get("gate") == "reproduce" for e in _events(run_dir))
+
+
+def test_reproduce_bindings_refused_when_disabled(tmp_path):
+    # F1: bindings are only meaningful for a legitimately reachable gate; a disabled REPRODUCE gate is
+    # refused (the stage guard rejects before emitting any binding).
+    run_dir = _init(tmp_path)
+    r = _run(["bindings", "--run", run_dir, "--gate", "reproduce", "--round", "1"])
+    assert r.returncode != 0
+    assert "reproduce_gate" in r.stderr
+
+
+def test_reproduce_verdict_refused_when_disabled(tmp_path):
+    # F1: a verdict for a disabled REPRODUCE gate is refused before any verdict/decision is recorded,
+    # so a default run can never log a REPRODUCE terminal or certify one.
+    run_dir = _init(tmp_path)
+    v = Path(tmp_path) / "v.json"
+    v.write_text(json.dumps({"gate": "reproduce", "round": 1, "verdict": "APPROVE",
+                             "summary": "ok", "findings": []}))
+    r = _run(["verdict", "--run", run_dir, "--gate", "reproduce", "--round", "1", "--file", str(v)])
+    assert r.returncode != 0
+    assert "reproduce_gate" in r.stderr
+    events = [e["event"] for e in _events(run_dir)]
+    assert "critic_verdict" not in events
+    assert not any(ev.startswith("gate_") for ev in events)
 
 
 def test_bindings_require_a_logged_builder_output(tmp_path):

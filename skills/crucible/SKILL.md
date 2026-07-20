@@ -49,7 +49,9 @@ tree** — scratch files live outside it.
 **Round caps & rebuttals.** `crucible verdict` reads the round cap from the run config by gate
 (`max_rounds_plan` for `plan`, `max_rounds_dep` for `dep:*`/`final`); pass `--max-rounds` only to
 override. When the Builder responds to findings, record per-finding resolutions in a JSON file
-(`{"F1": "fixed", "F2": "wontfix"}`, values `fixed|deferred|wontfix`) and pass
+(`{"F1": "fixed", "F2": {"resolution": "wontfix", "rationale": "…"}}`, values `fixed|deferred|wontfix`;
+`wontfix`/`deferred` clear a finding without a fix, so each must use the object form with a non-empty
+`rationale` — a bare `"wontfix"`/`"deferred"` is rejected) and pass
 `--resolutions "$RUN"/res.json`; the decision honors `defer_severities` and `strict_rebuttal`, and the
 resolutions are logged to the run for provenance.
 

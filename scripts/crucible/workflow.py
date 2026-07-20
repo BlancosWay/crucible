@@ -84,6 +84,41 @@ def _latest(events: list[dict[str, Any]], event_name: str) -> dict[str, Any] | N
     return _latest_with_index(events, event_name)[0]
 
 
+def _first_dependency_or_final_work_index(events: list[dict[str, Any]]) -> int | None:
+    """Index of the EARLIEST event that constitutes dependency or FINAL work, or ``None`` if none.
+
+    "Work" is any ``dep:<id>`` gate event (Builder output, Critic verdict, or a terminal), any
+    ``node_status_change`` (starting, advancing, or completing a node), or any ``final`` gate event.
+    Configured human approval must precede all of it, so the report compares the approval index
+    against this. ``events`` is append-only and in log order, so the first match is the earliest.
+    """
+    for i, e in enumerate(events):
+        gate = e.get("gate")
+        if ((isinstance(gate, str) and gate.startswith("dep:"))
+                or e.get("event") == "node_status_change"
+                or gate == "final"):
+            return i
+    return None
+
+
+def require_reproduce_ready(cfg: Config) -> None:
+    """Guard REPRODUCE logging/bindings/verdict — the reproduce counterpart to the other gate
+    readiness helpers, and the single owner of "may the REPRODUCE gate run at all".
+
+    The REPRODUCE gate is Stage 0, but it is part of the configured workflow ONLY when
+    ``reproduce_gate`` is enabled (design: "``reproduce`` is accepted only when ``reproduce_gate:
+    true``"). When it is disabled the gate is a configured-forbidden phase, so this rejects it —
+    the CLI's ``log``/``bindings``/``verdict`` handshake all delegate here before any log append, so
+    a disabled REPRODUCE gate can never record an artifact/binding/verdict, let alone certify one.
+    Takes only ``cfg`` because the decision is purely configuration; no run history is consulted.
+    """
+    if not cfg.reproduce_gate:
+        raise SystemExit(
+            "crucible: reproduce_gate is disabled; the REPRODUCE gate is not part of this run's "
+            "configured workflow — enable reproduce_gate to run it, or start at the PLAN gate."
+        )
+
+
 def require_plan_verdict_ready(run: RunLog, cfg: Config) -> None:
     """Guard PLAN logging/bindings/verdict: when ``reproduce_gate`` is configured, the REPRODUCE
     gate must have reached an accepted terminal first. A no-op when ``reproduce_gate`` is off."""
@@ -224,18 +259,19 @@ def workflow_issues(events: list[dict[str, Any]], dag: DAG, cfg: Config) -> list
     - ``"missing"`` — a configured REPRODUCE/approval/FINAL phase (or PLAN) that never happened, or
       a FINAL not yet reached though the tree is done; the run is merely *in progress*.
     - ``"invalid"`` — a binding that no longer matches the current artifact/tree, an unbound or
-      tampered artifact, a stale approval, or a phase recorded out of log order: an integrity
-      violation recorded in the log.
+      tampered artifact, a stale approval, a phase recorded out of log order, or a
+      configured-forbidden phase (a REPRODUCE terminal when ``reproduce_gate`` is disabled): an
+      integrity violation recorded in the log.
     - ``"flagged"`` — a done node completed outside an accepted review gate (a forced override, or
       no gate at all): an audited/unaudited bypass, not a hard violation.
 
     Every accepted terminal (REPRODUCE / PLAN / ``dep:*`` / FINAL) is validated two ways: its
     ``artifact_sha256`` must bind a same-gate/same-round Builder output recorded BEFORE the terminal
     (:func:`_artifact_binding_issues`), and the configured phases must appear in log order (REPRODUCE
-    before PLAN, approval after PLAN, each dependency review before its non-forced ``done``, FINAL
-    after every node's backing and ``done`` events). PLAN and FINAL terminals must additionally bind
-    the CURRENT dependency tree (``dag_sha256``). An empty list means every configured phase is
-    present, ordered, accepted, and currently bound.
+    before PLAN; approval after PLAN consensus but BEFORE any dependency/FINAL work; each dependency
+    review before its non-forced ``done``; FINAL after every node's backing and ``done`` events).
+    PLAN and FINAL terminals must additionally bind the CURRENT dependency tree (``dag_sha256``). An
+    empty list means every configured phase is present, ordered, accepted, and currently bound.
     """
     issues: list[WorkflowIssue] = []
 
@@ -247,6 +283,15 @@ def workflow_issues(events: list[dict[str, Any]], dag: DAG, cfg: Config) -> list
         else:
             issues.extend(_artifact_binding_issues(events, "reproduce", reproduce_terminal,
                                                    reproduce_idx, "REPRODUCE"))
+    elif any(e.get("gate") == "reproduce" and e.get("event") in _TERMINAL_EVENTS for e in events):
+        # reproduce_gate is OFF, yet a REPRODUCE gate reached a terminal in the log. The REPRODUCE
+        # phase is not part of this run's configured workflow (design: "reproduce is accepted only
+        # when reproduce_gate: true"), so a recorded terminal — accepted OR capped — is a
+        # configured-forbidden phase: an integrity violation, never CLEAN.
+        issues.append(WorkflowIssue(
+            "invalid",
+            "REPRODUCE gate terminal is recorded though reproduce_gate is disabled "
+            "(configured-forbidden phase)"))
 
     plan_terminal, plan_idx = _accepted_terminal_with_index(events, "plan")
     if plan_terminal is None:
@@ -281,6 +326,17 @@ def workflow_issues(events: list[dict[str, Any]], dag: DAG, cfg: Config) -> list
                     "invalid",
                     "plan approval is recorded before the PLAN gate reached consensus "
                     "(out of order)"))
+            # Configured approval must GATE dependency work: it comes after PLAN consensus but before
+            # any dependency or FINAL work begins (design phase order 3 before 4/5). Compare the
+            # approval index against the earliest recorded dependency/FINAL work event; approval
+            # recorded after that work means dependencies advanced without the required human OK — an
+            # out-of-order integrity violation, never CLEAN.
+            work_idx = _first_dependency_or_final_work_index(events)
+            if approval_idx is not None and work_idx is not None and work_idx < approval_idx:
+                issues.append(WorkflowIssue(
+                    "invalid",
+                    "plan approval is recorded after dependency or FINAL work began — configured "
+                    "approval must gate dependency work (out of order)"))
 
     for nid in dag.order:
         if dag.nodes[nid].status == "done":

@@ -799,6 +799,41 @@ def test_complete_bound_configured_workflow_is_clean(tmp_path):
     assert "Status:** CLEAN" in block
 
 
+def test_disabled_reproduce_terminal_is_invalid(tmp_path):
+    # F1: reproduce_gate is disabled, yet the run log records a REPRODUCE gate terminal. That gate is
+    # not part of the configured workflow (a configured-forbidden phase), so the run must render
+    # INVALID and never CLEAN even though the PLAN + dependency are validly bound.
+    cfg = Config.from_dict({"reproduce_gate": False, "final_review": False})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    dag = _bound_dag(("a", "done"))
+    _bind_plan(run, dag)
+    _bind_gate(run, dag, "reproduce")  # a bound, accepted REPRODUCE terminal though it is disabled
+    _bind_dep(run, dag, "a")
+    block = _summary_block(render_markdown(run))
+    assert "Status:** INVALID" in block
+    assert "reproduce" in block.lower()
+    assert "CLEAN" not in block
+
+
+def test_late_approval_after_dependency_is_invalid(tmp_path):
+    # F2: human_approval is configured; PLAN reaches consensus, the dependency is reviewed and the
+    # node marked done, and only THEN is plan_approved appended. Configured approval must gate
+    # dependency work, so an approval recorded after that work is out of order -> INVALID, never CLEAN
+    # (mirrors the finding's report probe that wrongly rendered CLEAN).
+    cfg = Config.from_dict({"human_approval": True, "final_review": False})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    dag = _bound_dag(("a", "done"))
+    artifact, dag_hash = _bind_plan(run, dag)
+    _bind_dep(run, dag, "a")
+    run.append("node_status_change", node="a", status="done",
+               dag_sha256=dag_sha256(dag), node_sha256=node_sha256(dag, "a"))
+    run.append("plan_approved", gate="plan", artifact_sha256=artifact, dag_sha256=dag_hash)
+    block = _summary_block(render_markdown(run))
+    assert "Status:** INVALID" in block
+    assert "approval" in block.lower()
+    assert "CLEAN" not in block
+
+
 def test_final_missing_dag_binding_is_invalid(tmp_path):
     # F3: an otherwise-complete, otherwise-valid run whose FINAL terminal carries a valid artifact
     # but NO dag_sha256 binding must not certify — FINAL's DAG binding is required, so a missing one
