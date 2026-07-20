@@ -914,3 +914,119 @@ def test_forced_current_node_remains_flagged(tmp_path):
     block = _summary_block(render_markdown(run))
     assert "Status:** FLAGGED" in block
     assert "manual recovery: CI outage" in block
+
+
+# F6: the resolved run_start config must be certified against its COMPLETE recorded shape (exactly
+# the Config.to_dict keys and nested builder/critic role keys), never re-derived from defaults via
+# Config.from_dict override semantics. A schema-v2 run whose run_start omits the config, records only
+# a partial override, or drops a nested role key cannot know which phases were configured, so it must
+# fail closed to INVALID and can never certify CLEAN.
+
+def test_missing_run_start_config_is_invalid_never_clean(tmp_path):
+    # A schema-v2 run_start with NO `config` at all: even with a fully bound PLAN + dependency +
+    # FINAL over a done tree (which would otherwise be CLEAN under the shipped defaults), the absent
+    # resolved config cannot be certified -> INVALID, never CLEAN, naming the run configuration.
+    run_dir = tmp_path / "no-config-run"
+    run_dir.mkdir()
+    run = RunLog(run_dir)
+    run.append("run_start", schema_version=RUN_SCHEMA_VERSION, goal="g")  # NO config recorded
+    dag = _bound_dag(("a", "done"))
+    _bind_plan(run, dag)
+    _bind_dep(run, dag, "a")
+    _bind_gate(run, dag, "final")  # shipped defaults enable final_review
+    block = _summary_block(render_markdown(run))
+    assert "Status:** INVALID" in block
+    assert "CLEAN" not in block
+    assert "run configuration" in block.lower()
+
+
+def test_partial_run_start_config_is_invalid_never_clean(tmp_path):
+    # A schema-v2 run_start whose config is a from_dict OVERRIDE (only `final_review`), not a full
+    # resolved config. Under override semantics it would parse (filling every other key from
+    # defaults) and certify CLEAN over a bound PLAN + dependency; the resolved-shape check rejects it
+    # -> INVALID, never CLEAN.
+    run_dir = tmp_path / "partial-config-run"
+    run_dir.mkdir()
+    run = RunLog(run_dir)
+    run.append("run_start", schema_version=RUN_SCHEMA_VERSION, goal="g",
+               config={"final_review": False})  # a partial override, not a resolved config
+    dag = _bound_dag(("a", "done"))
+    _bind_plan(run, dag)
+    _bind_dep(run, dag, "a")
+    block = _summary_block(render_markdown(run))
+    assert "Status:** INVALID" in block
+    assert "CLEAN" not in block
+    assert "run configuration" in block.lower()
+
+
+def test_incomplete_role_run_start_config_is_invalid_never_clean(tmp_path):
+    # A schema-v2 run_start config with every top-level key but a builder role missing `effort`.
+    # Config.from_dict would fill the missing role key from defaults (override semantics) and certify
+    # CLEAN; the resolved-shape check requires exactly the nested role keys -> INVALID, never CLEAN.
+    run_dir = tmp_path / "partial-role-run"
+    run_dir.mkdir()
+    run = RunLog(run_dir)
+    resolved = Config.from_dict({"final_review": False}).to_dict()
+    resolved["builder"] = {"model": resolved["builder"]["model"]}  # drop nested `effort`
+    run.append("run_start", schema_version=RUN_SCHEMA_VERSION, goal="g", config=resolved)
+    dag = _bound_dag(("a", "done"))
+    _bind_plan(run, dag)
+    _bind_dep(run, dag, "a")
+    block = _summary_block(render_markdown(run))
+    assert "Status:** INVALID" in block
+    assert "CLEAN" not in block
+    assert "run configuration" in block.lower()
+
+
+def test_resolved_run_start_config_still_certifies_clean(tmp_path):
+    # Regression for F6: a run_start carrying the EXACT resolved config shape (Config.to_dict, as
+    # init_run records) is unchanged — it still certifies CLEAN when every configured phase is bound.
+    cfg = Config.from_dict({"final_review": False})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    dag = _bound_dag(("a", "done"))
+    _bind_plan(run, dag)
+    _bind_dep(run, dag, "a")
+    block = _summary_block(render_markdown(run))
+    assert "Status:** CLEAN" in block
+
+
+# F7: a PRESENT but unparseable dag.json (syntactically invalid JSON, or valid JSON that is not an
+# object) must fail closed to INVALID with no traceback; an ABSENT dag.json stays IN PROGRESS; a
+# legacy run stays LEGACY / UNVERIFIED regardless of a malformed present tree.
+
+def test_syntactically_invalid_present_dag_is_invalid_without_traceback(tmp_path):
+    cfg = Config.from_dict({"final_review": False})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    run.append("gate_consensus", gate="plan", round=1)
+    run.append("gate_consensus", gate="dep:a", round=1)
+    (run.path / "dag.json").write_text("{not-json")  # present, but not valid JSON
+    block = _summary_block(render_markdown(run))  # must not raise a JSONDecodeError traceback
+    assert "Status:** INVALID" in block
+    assert "dependency tree" in block
+    assert "CLEAN" not in block
+
+
+def test_present_non_object_dag_is_invalid_without_traceback(tmp_path):
+    # A present dag.json that is valid JSON but not an object (a list) is still an uncertifiable tree
+    # -> INVALID, no `.get`/parse traceback.
+    cfg = Config.from_dict({"final_review": False})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    run.append("gate_consensus", gate="plan", round=1)
+    (run.path / "dag.json").write_text("[]")
+    block = _summary_block(render_markdown(run))
+    assert "Status:** INVALID" in block
+    assert "CLEAN" not in block
+
+
+def test_legacy_present_invalid_dag_is_unverified_without_traceback(tmp_path):
+    # Precedence: a legacy run (no schema_version) with a present but non-JSON dag.json stays
+    # LEGACY / UNVERIFIED, never INVALID or a traceback.
+    run_dir = tmp_path / "legacy-bad-dag"
+    run_dir.mkdir()
+    run = RunLog(run_dir)
+    run.append("run_start", goal="legacy", config=Config.from_dict({}).to_dict())  # NO schema_version
+    run.append("gate_consensus", gate="plan", round=1)
+    (run.path / "dag.json").write_text("{not-json")
+    block = _summary_block(render_markdown(run))
+    assert "Status:** LEGACY / UNVERIFIED" in block
+    assert "CLEAN" not in block

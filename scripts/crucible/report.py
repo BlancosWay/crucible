@@ -6,7 +6,7 @@ import json
 import re
 from typing import Any
 
-from crucible.config import Config
+from crucible.config import Config, resolved_config_shape_error
 from crucible.dag import DAG
 from crucible.integrity import RUN_SCHEMA_VERSION, run_schema_version
 from crucible.runlog import RunLog
@@ -88,15 +88,20 @@ def _config_aware_issues(
     """Parse the current DAG + resolved run config and delegate to the shared workflow validator
     (``crucible.workflow.workflow_issues``), the single owner of the stage/phase contract.
 
-    A schema-v2 run is only certifiable against a well-formed current dependency tree and a
-    parseable resolved config. If either artifact is PRESENT but cannot be parsed, this fails
-    *closed*: it returns an ``invalid`` :class:`WorkflowIssue` naming the malformed artifact rather
-    than silently returning ``[]``. That is deliberate — a malformed current tree still carries raw
-    ``status: "done"`` nodes, so returning ``[]`` would let the event-based ``dag_done`` check
-    certify the run ``CLEAN`` even though nothing about it can be recomputed or bound. The caller
-    only invokes this for a *present* schema-v2 DAG (an ABSENT tree stays ``IN PROGRESS`` and never
-    reaches here), so a parse failure here means "present but malformed", never "absent". The
-    validator itself is pure and total over well-formed inputs, and this never raises.
+    A schema-v2 run is only certifiable against a well-formed current dependency tree and a COMPLETE
+    resolved config. If either artifact is PRESENT but cannot be used, this fails *closed*: it returns
+    an ``invalid`` :class:`WorkflowIssue` naming the malformed artifact rather than silently returning
+    ``[]``. That is deliberate — a malformed current tree still carries raw ``status: "done"`` nodes,
+    so returning ``[]`` would let the event-based ``dag_done`` check certify the run ``CLEAN`` even
+    though nothing about it can be recomputed or bound. The caller only invokes this for a *present*
+    schema-v2 DAG (an ABSENT tree stays ``IN PROGRESS`` and never reaches here), so a parse failure
+    here means "present but malformed", never "absent".
+
+    The recorded ``config`` is validated against its COMPLETE resolved shape (exactly the
+    ``Config.to_dict`` keys and nested role keys) BEFORE it is parsed — never with ``Config.from_dict``
+    override semantics, which would silently fill an absent/partial config from defaults and certify a
+    run whose configured phases are unknown. The validator itself is pure and total over well-formed
+    inputs, and this never raises.
     """
     try:
         dag_obj = DAG.from_dict(dag)
@@ -105,6 +110,11 @@ def _config_aware_issues(
             "invalid",
             "the current dependency tree (dag.json) is malformed and cannot be parsed, bound, or "
             "certified")]
+    shape_error = resolved_config_shape_error(config)
+    if shape_error is not None:
+        return [WorkflowIssue(
+            "invalid",
+            f"the recorded run configuration {shape_error} and cannot be validated or certified")]
     try:
         cfg_obj = Config.from_dict(config)
     except (ValueError, KeyError, TypeError):
@@ -121,6 +131,7 @@ def _run_summary_lines(
     config: dict[str, Any] | None = None,
     schema_version: int | None = None,
     dag_present: bool = True,
+    dag_load_error: bool = False,
 ) -> list[str]:
     """A deterministic run-level ``## Summary`` banner.
 
@@ -169,16 +180,23 @@ def _run_summary_lines(
     nodes = dag.get("nodes", [])
     dag_done = bool(nodes) and all(n.get("status") == "done" for n in nodes)
 
-    # Schema/config-aware validation (schema-v2 only, and only when a current DAG is PRESENT and a
-    # resolved config is available to validate against). Legacy runs skip this entirely and are
-    # never CLEAN. A `done` node with no current-bound review, and every out-of-order/stale binding,
-    # surfaces here. A present-but-malformed current tree/config fails closed to an `invalid` issue
-    # (see `_config_aware_issues`), so the raw `dag_done` CLEAN check below can never certify an
-    # unparseable tree. An ABSENT tree is not routed here at all and stays IN PROGRESS below.
+    # Schema/config-aware validation (schema-v2 only). Legacy runs skip this entirely and are never
+    # CLEAN. For a schema-v2 run a `done` node with no current-bound review, and every
+    # out-of-order/stale binding, surfaces here. A PRESENT current tree that cannot even be loaded as
+    # a JSON object (`dag_load_error`) fails closed to an `invalid` issue directly; a present tree
+    # that loads but is structurally malformed (or a partial/absent resolved config) fails closed
+    # inside `_config_aware_issues`. Either way the raw `dag_done` CLEAN check below can never certify
+    # an uncertifiable run. An ABSENT tree is not routed here at all and stays IN PROGRESS below.
     schema_current = schema_version is not None and schema_version >= RUN_SCHEMA_VERSION
     issues: list[WorkflowIssue] = []
-    if schema_current and dag_present and config is not None:
-        issues = _config_aware_issues(events, dag, config)
+    if schema_current:
+        if dag_load_error:
+            issues = [WorkflowIssue(
+                "invalid",
+                "the current dependency tree (dag.json) is present but is not a well-formed JSON "
+                "object and cannot be parsed, bound, or certified")]
+        elif dag_present:
+            issues = _config_aware_issues(events, dag, config)
     invalid = [i for i in issues if i.kind == "invalid"]
     missing = [i for i in issues if i.kind == "missing"]
     flagged_issues = [i for i in issues if i.kind == "flagged"]
@@ -301,7 +319,12 @@ def render_markdown(run: RunLog) -> str:
     events = run.read_events()
     start = next((e for e in events if e["event"] == "run_start"), {})
     goal = start.get("goal", "(unknown goal)")
-    config = start.get("config", {})
+    # The recorded resolved config. Coerce a missing/null/non-object value to `{}` so the header can
+    # render (it degrades to `?`); the schema-aware Summary separately fails such a run closed
+    # because `{}` is not a complete resolved config shape (see `_config_aware_issues`).
+    config = start.get("config")
+    if not isinstance(config, dict):
+        config = {}
 
     lines: list[str] = []
     lines.append("# Crucible Run Report")
@@ -315,16 +338,30 @@ def render_markdown(run: RunLog) -> str:
     )
     lines.append("")
 
+    # Load the current dependency tree, fail-closed. Three outcomes drive the Summary:
+    #   - ABSENT (FileNotFoundError) -> IN PROGRESS (no tree to certify yet);
+    #   - PRESENT but not a well-formed JSON object (a JSON syntax/decoding error, or valid JSON that
+    #     is not an object) -> INVALID, with an empty tree table and NO traceback;
+    #   - PRESENT and loadable -> validated by the schema-aware Summary (a structurally malformed but
+    #     loadable tree still fails closed inside `_run_summary_lines`).
     dag_present = True
+    dag_load_error = False
     try:
         dag = run.load_dag()
     except FileNotFoundError:
         dag = {"nodes": []}
         dag_present = False
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        dag = {"nodes": []}
+        dag_load_error = True
+    else:
+        if not isinstance(dag, dict):
+            dag = {"nodes": []}
+            dag_load_error = True
 
     lines.extend(_run_summary_lines(
         events, dag, config=config, schema_version=run_schema_version(events),
-        dag_present=dag_present,
+        dag_present=dag_present, dag_load_error=dag_load_error,
     ))
 
     lines.append("## Dependency tree")

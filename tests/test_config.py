@@ -2,7 +2,14 @@ import json
 
 import pytest
 
-from crucible.config import Config, DEFAULTS, DEFAULTS_PATH, load_config, load_defaults
+from crucible.config import (
+    Config,
+    DEFAULTS,
+    DEFAULTS_PATH,
+    load_config,
+    load_defaults,
+    resolved_config_shape_error,
+)
 
 
 def test_defaults_match_shipped_file():
@@ -267,3 +274,38 @@ def test_critic_checklists_rejects_empty_or_whitespace_entries():
     for bad in ([""], ["   "], ["/abs/ok.md", ""]):
         with pytest.raises(ValueError, match="critic_checklists must be a list"):
             Config.from_dict({"critic_checklists": bad})
+
+
+def test_resolved_config_shape_accepts_exact_to_dict_output():
+    # The exact shape init_run records (Config.to_dict) is a well-formed resolved config.
+    assert resolved_config_shape_error(Config.from_dict({}).to_dict()) is None
+    assert resolved_config_shape_error(
+        Config.from_dict({"final_review": False, "reproduce_gate": True}).to_dict()) is None
+
+
+def test_resolved_config_shape_rejects_absent_or_non_object():
+    for bad in (None, [], "x", 5):
+        assert resolved_config_shape_error(bad) == "is absent or not a JSON object"
+
+
+def test_resolved_config_shape_rejects_partial_or_extra_top_level_keys():
+    # from_dict OVERRIDE semantics accept these (filling defaults); the resolved shape must not.
+    assert Config.from_dict({"final_review": False})  # parses fine as an override
+    assert (resolved_config_shape_error({"final_review": False})
+            == "does not carry exactly the resolved configuration keys")
+    extra = Config.from_dict({}).to_dict()
+    extra["unexpected"] = 1
+    assert (resolved_config_shape_error(extra)
+            == "does not carry exactly the resolved configuration keys")
+
+
+def test_resolved_config_shape_rejects_incomplete_nested_role_keys():
+    # A role missing `effort` is accepted by from_dict (deep-merge) but is not a resolved shape.
+    for role in ("builder", "critic"):
+        data = Config.from_dict({}).to_dict()
+        data[role] = {"model": data[role]["model"]}  # drop nested `effort`
+        assert (resolved_config_shape_error(data)
+                == f"does not carry exactly the resolved {role} role keys")
+        data[role] = "not-an-object"
+        assert (resolved_config_shape_error(data)
+                == f"does not carry exactly the resolved {role} role keys")
