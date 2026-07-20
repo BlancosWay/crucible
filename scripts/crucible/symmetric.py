@@ -326,28 +326,105 @@ def decide_symmetric(
 
 _ADVANCE_TERMINALS = ("gate_consensus", "gate_proceeded_with_flags")
 _TERMINAL_EVENTS = ("gate_consensus", "gate_proceeded_with_flags", "gate_capped")
+# The three event kinds of a symmetric gate's atomic decision. Adjacency is defined over THIS
+# subsequence for a gate: unrelated same-gate events (e.g. an interleaved ``builder_output``) and
+# every other gate's events are ignored, but no OTHER protocol event of the same gate may intervene.
+_PROTOCOL_EVENTS = ("symmetric_verdict", "accepted_finding_set", *_TERMINAL_EVENTS)
+
+# Resolver issue reasons (stable, human-readable fragments the workflow layer prefixes with the gate).
+_ORPHAN_WITHOUT_TERMINAL = ("records an accepted finding set with no advancing terminal "
+                            "(orphan/pre-terminal, not accepted state)")
+_TERMINAL_WITHOUT_SET = ("reached an advancing terminal without an accepted finding set recorded "
+                         "immediately before it (missing set or an intervening protocol event)")
+_SET_BINDING_MISMATCH = ("accepted finding set does not bind the same artifact/DAG/node as its "
+                         "advancing terminal")
+_NO_MATCHING_DECISION = ("accepted finding set is not immediately preceded by a matching peer "
+                         "decision (no symmetric_verdict for this gate/round echoing the same "
+                         "artifact/DAG/node directly precedes it — the two peers reviewed a "
+                         "different candidate, or a second accepted set intervened)")
+_POST_TERMINAL_RESIDUE = ("records an accepted finding set after its advancing terminal "
+                          "(post-terminal crash residue, not accepted state)")
 
 
-def peer_decision_binds(
-    events: list[dict[str, Any]], before_idx: int, gate: str, round_index: Any,
-    bindings: dict[str, Any],
-) -> bool:
-    """Whether a ``symmetric_verdict`` for ``gate``/``round_index`` echoing exactly ``bindings`` is
-    recorded before ``before_idx``.
+@dataclass(frozen=True)
+class GateAcceptance:
+    """The single resolved acceptance state of one symmetric gate, decided in exactly one place.
 
-    The two peers' recorded decision must bind the SAME artifact/DAG/node as the accepted finding set
-    (and terminal) it brackets — otherwise the accepted result is not the candidate the peers
-    reviewed (a corrupt log attesting to artifact A but accepting/certifying artifact B). Shared by
-    the projection here and ``workflow._accepted_set_content_issues`` (which imports it) so the
-    peer-decision binding rule lives in exactly one place.
+    ``accepted_index`` is the index of the gate's ONE effective ``accepted_finding_set`` event (the
+    middle of a valid ``symmetric_verdict -> accepted_finding_set -> advancing terminal`` trio), or
+    ``None`` when the gate has no accepted state. ``terminal_index`` is the authoritative advancing
+    terminal's index (or ``None``). ``orphan_indices`` are every OTHER ``accepted_finding_set`` event
+    for the gate (never accepted state). ``issues`` are stable reason fragments for each integrity
+    violation, for the workflow layer to prefix with the gate — the projection uses ``accepted_index``
+    and ``orphan_indices`` and ignores ``issues``. Payload validity is deferred to the caller.
     """
-    return any(
-        e.get("event") == "symmetric_verdict"
-        and e.get("gate") == gate
-        and e.get("round") == round_index
-        and event_bindings(e) == bindings
-        for e in events[:before_idx]
-    )
+
+    gate: str
+    accepted_index: int | None
+    terminal_index: int | None
+    orphan_indices: tuple[int, ...]
+    issues: tuple[str, ...]
+
+
+def resolve_gate_acceptance(events: list[dict[str, Any]], gate: str) -> GateAcceptance:
+    """Resolve the ONE effective accepted finding set for ``gate`` (the shared tri-event resolver).
+
+    A gate's accepted state is the middle event of a single atomic trio: a ``symmetric_verdict`` whose
+    bindings the ``accepted_finding_set`` echoes, IMMEDIATELY followed (in the gate's protocol
+    subsequence) by that accepted set, IMMEDIATELY followed by the gate's authoritative ADVANCING
+    terminal binding the same artifact/DAG/node and round. Exactly one accepted set may bracket the
+    terminal; a second pre-terminal set, a non-immediate/mismatched peer decision, an intervening
+    same-gate protocol event, a binding mismatch, or an accepted set with no advancing terminal all
+    mean the gate has NO accepted state. Pure; never raises (payload validity is the caller's job).
+
+    Both the projection (:func:`accepted_findings` and friends) and workflow validation consume this,
+    so the atomic-decision contract lives in exactly one place.
+    """
+    protocol = [i for i, e in enumerate(events)
+                if e.get("gate") == gate and e.get("event") in _PROTOCOL_EVENTS]
+    accepted_all = tuple(i for i in protocol
+                         if events[i].get("event") == "accepted_finding_set")
+    terminals = [i for i in protocol if events[i].get("event") in _TERMINAL_EVENTS]
+
+    def _result(accepted_index, terminal_index, *issues):
+        orphans = tuple(i for i in accepted_all if i != accepted_index)
+        return GateAcceptance(gate, accepted_index, terminal_index, orphans, tuple(issues))
+
+    # No authoritative advancing terminal: any accepted set is orphan/pre-terminal, never state.
+    if not terminals or events[terminals[-1]].get("event") not in _ADVANCE_TERMINALS:
+        issues = (_ORPHAN_WITHOUT_TERMINAL,) if accepted_all else ()
+        return _result(None, None, *issues)
+
+    terminal_idx = terminals[-1]
+    tpos = protocol.index(terminal_idx)
+    want_round = events[terminal_idx].get("round")
+    want_bind = event_bindings(events[terminal_idx])
+
+    # (1) The accepted set must be the protocol event IMMEDIATELY before the terminal. A missing set
+    #     or any intervening same-gate protocol event breaks the adjacency.
+    if tpos < 1 or events[protocol[tpos - 1]].get("event") != "accepted_finding_set":
+        return _result(None, terminal_idx, _TERMINAL_WITHOUT_SET)
+    accepted_idx = protocol[tpos - 1]
+
+    # (2) That accepted set must bind the same artifact/DAG/node (and round) as its terminal.
+    if (events[accepted_idx].get("round") != want_round
+            or event_bindings(events[accepted_idx]) != want_bind):
+        return _result(None, terminal_idx, _SET_BINDING_MISMATCH)
+
+    # (3) A matching peer decision must be the protocol event IMMEDIATELY before the accepted set.
+    #     This rejects a second pre-terminal accepted set (its predecessor is another accepted set)
+    #     and a non-immediate/mismatched peer decision alike.
+    if tpos < 2 or events[protocol[tpos - 2]].get("event") != "symmetric_verdict":
+        return _result(None, terminal_idx, _NO_MATCHING_DECISION)
+    decision_idx = protocol[tpos - 2]
+    if (events[decision_idx].get("round") != want_round
+            or event_bindings(events[decision_idx]) != want_bind):
+        return _result(None, terminal_idx, _NO_MATCHING_DECISION)
+
+    # Valid trio. Any OTHER accepted set for the gate is post-terminal residue, never accepted state.
+    orphans = tuple(i for i in accepted_all if i != accepted_idx)
+    issues = (_POST_TERMINAL_RESIDUE,) if orphans else ()
+    return GateAcceptance(gate, accepted_idx, terminal_idx, orphans, issues)
 
 
 def _last_terminal(
@@ -362,63 +439,42 @@ def _last_terminal(
     return last, last_idx
 
 
-def _authoritative_accepted_terminal(
-    events: list[dict[str, Any]], gate: str
-) -> tuple[dict[str, Any] | None, int | None]:
-    """The gate's authoritative accepted terminal (LAST terminal iff it ADVANCES) and its index.
-
-    Mirrors ``workflow._accepted_terminal_with_index`` (re-implemented here to avoid an import
-    cycle): an earlier consensus overturned by a later ``gate_capped`` is not accepted.
-    """
-    last, last_idx = _last_terminal(events, gate)
-    if last is None or last.get("event") not in _ADVANCE_TERMINALS:
-        return None, None
-    return last, last_idx
-
-
-def _is_effective_accepted(events: list[dict[str, Any]], idx: int) -> bool:
-    """Whether the ``accepted_finding_set`` at ``events[idx]`` is complete, accepted state.
-
-    It counts only when it is bracketed by its gate's atomic decision: a matching
-    ``symmetric_verdict`` (same gate/round AND same artifact/DAG/node bindings) is recorded BEFORE
-    it, and the gate's authoritative ADVANCING terminal (same gate/round/bindings) is recorded AFTER
-    it. An orphan (no advancing terminal), a pre-terminal event with no later terminal, a
-    post-terminal event, one whose bindings differ from the terminal, or one whose preceding peer
-    decision bound a DIFFERENT candidate (so the accepted result was never the reviewed one) is
-    incomplete/corrupt history, never accepted state.
-    """
-    event = events[idx]
-    gate = event.get("gate")
-    round_index = event.get("round")
-    binding = event_bindings(event)
-    if not peer_decision_binds(events, idx, gate, round_index, binding):
-        return False
-    terminal, terminal_idx = _authoritative_accepted_terminal(events, gate)
-    if terminal is None or terminal_idx is None or terminal_idx <= idx:
-        return False
-    if terminal.get("round") != round_index:
-        return False
-    return event_bindings(terminal) == binding
+def _gates_with_accepted_sets(events: list[dict[str, Any]]) -> list[str]:
+    """Every distinct gate carrying an ``accepted_finding_set`` event, in first-appearance order."""
+    gates: list[str] = []
+    for e in events:
+        if e.get("event") == "accepted_finding_set":
+            gate = e.get("gate")
+            if isinstance(gate, str) and gate not in gates:
+                gates.append(gate)
+    return gates
 
 
 def _effective_accepted_events(
     events: list[dict[str, Any]]
 ) -> list[tuple[int, str, FindingSet]]:
     """``(index, gate, FindingSet)`` for every EFFECTIVE ``accepted_finding_set`` event, in log
-    order. Raises ``ValueError`` when an effective event's payload is not a valid finding set."""
+    order. Each gate contributes at most one (the middle of its atomic trio, per
+    :func:`resolve_gate_acceptance`). Raises ``ValueError`` when an effective payload is not a valid
+    finding set."""
     out: list[tuple[int, str, FindingSet]] = []
-    for i, e in enumerate(events):
-        if e.get("event") == "accepted_finding_set" and _is_effective_accepted(events, i):
-            out.append((i, e.get("gate"), FindingSet.from_dict(e.get("payload"))))
+    for gate in _gates_with_accepted_sets(events):
+        resolution = resolve_gate_acceptance(events, gate)
+        if resolution.accepted_index is not None:
+            out.append((resolution.accepted_index, gate,
+                        FindingSet.from_dict(events[resolution.accepted_index].get("payload"))))
+    out.sort(key=lambda item: item[0])
     return out
 
 
 def _orphan_accepted_indices(events: list[dict[str, Any]]) -> list[int]:
-    """Indices of ``accepted_finding_set`` events that are NOT effective accepted state — orphan,
-    pre-terminal-without-terminal, post-terminal, or binding-mismatched crash residue."""
-    effective = {i for i, _, _ in _effective_accepted_events(events)}
-    return [i for i, e in enumerate(events)
-            if e.get("event") == "accepted_finding_set" and i not in effective]
+    """Indices of ``accepted_finding_set`` events that are NOT the effective accepted state of their
+    gate — orphan, pre-terminal-without-terminal, post-terminal, binding-mismatched, or a duplicate
+    pre-terminal set that broke the atomic trio."""
+    orphans: list[int] = []
+    for gate in _gates_with_accepted_sets(events):
+        orphans.extend(resolve_gate_acceptance(events, gate).orphan_indices)
+    return sorted(orphans)
 
 
 def accepted_finding_set_for_gate(
@@ -426,12 +482,12 @@ def accepted_finding_set_for_gate(
 ) -> FindingSet | None:
     """The effective accepted finding set for ``gate`` (``dep:<id>`` or ``final``), or ``None``.
 
-    Raises ``ValueError`` if an effective accepted payload is malformed.
+    Raises ``ValueError`` if the effective accepted payload is malformed.
     """
-    for _, gate_of, finding_set in _effective_accepted_events(events):
-        if gate_of == gate:
-            return finding_set
-    return None
+    resolution = resolve_gate_acceptance(events, gate)
+    if resolution.accepted_index is None:
+        return None
+    return FindingSet.from_dict(events[resolution.accepted_index].get("payload"))
 
 
 def accepted_findings(

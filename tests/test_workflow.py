@@ -527,3 +527,58 @@ def test_workflow_issues_flags_symmetric_final_inclusion_violation(tmp_path):
     run, dag, cfg = _symmetric_run(tmp_path, accepted="valid", final="drops")
     issues = workflow_issues(run.read_events(), dag, cfg)
     assert any(i.kind == "invalid" and "final" in i.message.lower() for i in issues)
+
+
+def _corrupt_dep_trio(events, corruption):
+    """Return a copy of a valid symmetric run's events with the ``dep:a`` atomic trio corrupted.
+
+    ``duplicate`` inserts a SECOND pre-terminal accepted set (distinct id); ``nonimmediate`` inserts
+    a mismatched ``symmetric_verdict`` immediately before the accepted set (a matching decision then a
+    later mismatched one); ``intervening`` inserts an extra ``symmetric_verdict`` between the accepted
+    set and its terminal. Each breaks the exact ``symmetric_verdict -> accepted_finding_set ->
+    terminal`` adjacency for the same gate/round.
+    """
+    events = [dict(e) for e in events]
+    acc_idx = next(i for i, e in enumerate(events)
+                   if e.get("event") == "accepted_finding_set" and e.get("gate") == "dep:a")
+    term_idx = next(i for i, e in enumerate(events)
+                    if e.get("event") == "gate_consensus" and e.get("gate") == "dep:a")
+    sv = next(e for e in events
+              if e.get("event") == "symmetric_verdict" and e.get("gate") == "dep:a")
+    if corruption == "duplicate":
+        dup = dict(events[acc_idx])
+        dup["payload"] = {"summary": "", "findings": [_af("dep:a", "F2")]}
+        events.insert(term_idx, dup)  # two accepted sets before the terminal (distinct ids)
+    elif corruption == "nonimmediate":
+        mismatched = dict(sv)
+        mismatched["artifact_sha256"] = "9" * 64
+        events.insert(acc_idx, mismatched)  # matching sv, then mismatched sv, then accepted set
+    elif corruption == "intervening":
+        events.insert(term_idx, dict(sv))  # an extra verdict between the accepted set and terminal
+    return events
+
+
+def test_workflow_issues_clean_for_valid_symmetric_dependency_only(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    assert workflow_issues(run.read_events(), dag, cfg) == []
+
+
+def test_workflow_issues_flags_two_pre_terminal_accepted_sets(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    events = _corrupt_dep_trio(run.read_events(), "duplicate")
+    issues = workflow_issues(events, dag, cfg)
+    assert any(i.kind == "invalid" and "dep:a" in i.message for i in issues)
+
+
+def test_workflow_issues_flags_non_immediate_peer_decision(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    events = _corrupt_dep_trio(run.read_events(), "nonimmediate")
+    issues = workflow_issues(events, dag, cfg)
+    assert any(i.kind == "invalid" and "dep:a" in i.message for i in issues)
+
+
+def test_workflow_issues_flags_intervening_protocol_event(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    events = _corrupt_dep_trio(run.read_events(), "intervening")
+    issues = workflow_issues(events, dag, cfg)
+    assert any(i.kind == "invalid" and "dep:a" in i.message for i in issues)

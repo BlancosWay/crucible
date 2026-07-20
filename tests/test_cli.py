@@ -2541,6 +2541,68 @@ def test_result_commands_reject_stale_node_definition(tmp_path):
         assert "invalid" in r.stderr.lower()
 
 
+def test_result_commands_reject_two_pre_terminal_accepted_sets(tmp_path):
+    # Round-2 F1: two pre-terminal accepted sets for the same gate/round/bindings (distinct ids, so
+    # no key collision) violate the atomic tri-event contract, leaving the node unbacked. Both
+    # Finish-time result commands must reject rather than publish either forged set.
+    run_dir = _complete_one_node_symmetric(tmp_path, "auth",
+                                           findings=[_accepted_finding("dep:auth", "F1", "major")])
+
+    def _mutate(records):
+        acc_idx = next(i for i, r in enumerate(records)
+                       if r.get("event") == "accepted_finding_set" and r.get("gate") == "dep:auth")
+        dup = json.loads(json.dumps(records[acc_idx]))
+        dup["payload"] = {"summary": "", "findings": [_accepted_finding("dep:auth", "F2", "major")]}
+        records.insert(acc_idx + 1, dup)  # still before the terminal
+    _rewrite_events(run_dir, _mutate)
+    for command in ("accepted-findings", "review-result"):
+        r = _run([command, "--run", run_dir])
+        assert r.returncode != 0, command
+        assert "incomplete" in r.stderr.lower()
+
+
+def test_result_commands_reject_non_immediate_peer_decision(tmp_path):
+    # Round-2 F1: a matching symmetric_verdict followed by a LATER mismatched one before the accepted
+    # set means the immediate peer decision bound a different candidate — the accepted result is not
+    # the one the two peers reviewed, so both result commands fail closed.
+    run_dir = _complete_one_node_symmetric(tmp_path, "auth",
+                                           findings=[_accepted_finding("dep:auth", "F1", "major")])
+
+    def _mutate(records):
+        acc_idx = next(i for i, r in enumerate(records)
+                       if r.get("event") == "accepted_finding_set" and r.get("gate") == "dep:auth")
+        sv = next(r for r in records
+                  if r.get("event") == "symmetric_verdict" and r.get("gate") == "dep:auth")
+        mismatched = json.loads(json.dumps(sv))
+        mismatched["artifact_sha256"] = "9" * 64
+        records.insert(acc_idx, mismatched)  # matching sv, then mismatched sv, then accepted set
+    _rewrite_events(run_dir, _mutate)
+    for command in ("accepted-findings", "review-result"):
+        r = _run([command, "--run", run_dir])
+        assert r.returncode != 0, command
+        assert "incomplete" in r.stderr.lower()
+
+
+def test_result_commands_reject_intervening_protocol_event(tmp_path):
+    # Round-2 F1: an extra symmetric_verdict recorded between the accepted set and its terminal breaks
+    # the exact accepted_finding_set -> terminal adjacency, so the set is not effective and both
+    # result commands reject.
+    run_dir = _complete_one_node_symmetric(tmp_path, "auth",
+                                           findings=[_accepted_finding("dep:auth", "F1", "major")])
+
+    def _mutate(records):
+        term_idx = next(i for i, r in enumerate(records)
+                        if r.get("event") == "gate_consensus" and r.get("gate") == "dep:auth")
+        sv = next(r for r in records
+                  if r.get("event") == "symmetric_verdict" and r.get("gate") == "dep:auth")
+        records.insert(term_idx, json.loads(json.dumps(sv)))  # between accepted set and terminal
+    _rewrite_events(run_dir, _mutate)
+    for command in ("accepted-findings", "review-result"):
+        r = _run([command, "--run", run_dir])
+        assert r.returncode != 0, command
+        assert "incomplete" in r.stderr.lower()
+
+
 def test_review_result_rejects_stale_final_dag_binding(tmp_path):
     # F2 (FINAL dimension): a complete run WITH FINAL whose tree is mutated after FINAL consensus.
     # The accepted FINAL terminal now binds a stale dag_sha256, so review-result fails closed.

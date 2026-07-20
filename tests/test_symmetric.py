@@ -405,14 +405,58 @@ def test_accepted_finding_set_for_gate_excludes_peer_decision_binding_mismatch()
     assert accepted_finding_set_for_gate(events, "dep:auth") is None
 
 
-def test_accepted_findings_rejects_duplicate_composite_keys_across_events():
+def test_accepted_findings_excludes_two_pre_terminal_accepted_sets_distinct_ids():
+    # Exactly one accepted set may bracket a gate's advancing terminal. Two pre-terminal accepted
+    # sets for the same gate/round/bindings — even with DISTINCT finding IDs, so no key collision —
+    # violate the atomic symmetric_verdict -> accepted_finding_set -> terminal contract, so NEITHER
+    # is effective and the gate has no accepted state.
+    from crucible.symmetric import accepted_finding_set_for_gate
+
     b = _bindings()
     events = _dep_events("auth", findings=[_finding("dep:auth", "F1")], bindings=b)
-    # a second pre-terminal accepted set for the same gate repeats (dep:auth, F1).
-    events.insert(1, {"event": "accepted_finding_set", "gate": "dep:auth", "round": 1,
-                      "payload": {"summary": "", "findings": [_finding("dep:auth", "F1")]}, **b})
+    # events == [symmetric_verdict, accepted_finding_set, gate_consensus]; insert a SECOND accepted
+    # set (distinct id F2) still before the terminal.
+    events.insert(2, {"event": "accepted_finding_set", "gate": "dep:auth", "round": 1,
+                      "payload": {"summary": "", "findings": [_finding("dep:auth", "F2")]}, **b})
+    assert accepted_findings(events).findings == []
+    assert accepted_finding_set_for_gate(events, "dep:auth") is None
+
+
+def test_accepted_findings_excludes_non_immediate_peer_decision():
+    # The matching peer decision must be the protocol event IMMEDIATELY preceding the accepted set.
+    # A matching symmetric_verdict followed by a LATER mismatched one before the accepted set breaks
+    # the atomic trio (the immediate predecessor bound a different candidate), so it is not effective.
+    b = _bindings()
+    events = _dep_events("auth", findings=[_finding("dep:auth", "F1")], bindings=b)
+    mismatched = {"event": "symmetric_verdict", "gate": "dep:auth", "round": 1,
+                  "outcome": "CONSENSUS", "objections": [],
+                  **{**b, "artifact_sha256": "9" * 64}}
+    events.insert(1, mismatched)  # [sv(match), sv(mismatch), accepted_finding_set, terminal]
+    assert accepted_findings(events).findings == []
+
+
+def test_accepted_findings_excludes_intervening_protocol_event_before_terminal():
+    # No same-gate/round protocol event may intervene between the accepted set and its terminal: the
+    # accepted set must be the protocol event immediately before the advancing terminal.
+    b = _bindings()
+    events = _dep_events("auth", findings=[_finding("dep:auth", "F1")], bindings=b)
+    intervening = {"event": "symmetric_verdict", "gate": "dep:auth", "round": 1,
+                   "outcome": "CONSENSUS", "objections": [], **b}
+    events.insert(2, intervening)  # [sv, accepted_finding_set, sv(intervening), terminal]
+    assert accepted_findings(events).findings == []
+
+
+def test_accepted_findings_rejects_duplicate_composite_keys_across_gates():
+    # Two DIFFERENT dependency gates whose (individually valid) accepted trios both carry the same
+    # (source_gate, id) — only reachable via forged history, since write-time validate_for_gate
+    # rejects it — union to a duplicate composite key and are rejected.
+    dag = _two_done_dag()
+    events = (
+        _dep_events("a", findings=[_finding("dep:a", "F1")], bindings=_bindings("a", "d", "na"))
+        + _dep_events("b", findings=[_finding("dep:a", "F1")], bindings=_bindings("b", "d", "nb"))
+    )
     with pytest.raises(ValueError, match="duplicate"):
-        accepted_findings(events)
+        accepted_findings(events, dag)
 
 
 def test_accepted_findings_rejects_malformed_effective_payload():
