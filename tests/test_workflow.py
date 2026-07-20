@@ -708,3 +708,62 @@ def test_workflow_issues_flags_reproduce_symmetric_protocol_event(tmp_path):
                            "node_sha256": "f" * 64})
     issues = workflow_issues(run.read_events(), dag, cfg)
     assert any(i.kind == "invalid" and "reproduce" in i.message.lower() for i in issues)
+
+
+# --- round-7 F1: an accepted DEPENDENCY set whose finding is attributed to another gate is invalid ---
+
+def test_workflow_issues_flags_mis_scoped_dependency_finding(tmp_path):
+    # A valid dep:a trio, but its accepted set attributes its finding to source_gate "final" — a
+    # forged dep:auth set injecting a FINAL/ghost finding. workflow_issues must surface it as invalid
+    # (reusing FindingSet.validate_for_gate), never leave the run CLEAN.
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    events = run.read_events()
+    for e in events:
+        if e.get("event") == "accepted_finding_set" and e.get("gate") == "dep:a":
+            e["payload"]["findings"][0]["source_gate"] = "final"
+    issues = workflow_issues(events, dag, cfg)
+    assert any(i.kind == "invalid" and "dep:a" in i.message for i in issues)
+
+
+def test_workflow_issues_flags_mis_scoped_dependency_finding_ghost(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    events = run.read_events()
+    for e in events:
+        if e.get("event") == "accepted_finding_set" and e.get("gate") == "dep:a":
+            e["payload"]["findings"][0]["source_gate"] = "dep:ghost"
+    issues = workflow_issues(events, dag, cfg)
+    assert any(i.kind == "invalid" and "dep:a" in i.message for i in issues)
+
+
+# --- round-7 F2: a FINAL symmetric protocol event while final_review is disabled is invalid --------
+#
+# The earlier terminal-only check only sees a FINAL *terminal*. A FINAL symmetric_verdict or
+# accepted_finding_set WITHOUT a terminal (verdict-only / accepted-set-only residue) evaded it while
+# _symmetric_accepted_set_issues unconditionally skipped out-of-scope `final`, leaving the run CLEAN.
+
+def test_workflow_issues_flags_disabled_final_verdict_only_residue(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")  # final_review off, no FINAL
+    assert cfg.final_review is False
+    run.append("symmetric_verdict", gate="final", round=1, outcome="CONSENSUS", objections=[],
+               candidate={"summary": "", "findings": []},
+               artifact_sha256="e" * 64, dag_sha256=dag_sha256(dag))
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "invalid" and "final" in i.message.lower() for i in issues)
+
+
+def test_workflow_issues_flags_disabled_final_accepted_set_only_residue(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")  # final_review off, no FINAL
+    assert cfg.final_review is False
+    run.append("accepted_finding_set", gate="final", round=1,
+               payload={"summary": "", "findings": []},
+               artifact_sha256="e" * 64, dag_sha256=dag_sha256(dag))
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "invalid" and "final" in i.message.lower() for i in issues)
+
+
+def test_workflow_issues_clean_when_final_review_disabled_and_no_final_events(tmp_path):
+    # Guard against over-flagging: a valid final_review=off run with NO final protocol events stays
+    # CLEAN (the disabled-FINAL rule only fires on an actual FINAL protocol event).
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    assert cfg.final_review is False
+    assert workflow_issues(run.read_events(), dag, cfg) == []

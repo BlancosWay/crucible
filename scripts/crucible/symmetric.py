@@ -616,7 +616,9 @@ def accepted_findings(
 
     Raises ``ValueError`` if any effective payload is malformed, if two accepted findings share a
     ``(source_gate, id)`` key (duplicate/forged history), or (DAG-aware only) if an accepted
-    dependency gate is outside the current tree.
+    dependency gate is outside the current tree OR one of its findings is attributed to a
+    ``source_gate`` other than that dependency gate (a forged ``dep:<id>`` set smuggling a
+    ``final``/ghost finding).
     """
     effective = [(i, gate, fs) for i, gate, fs in _effective_accepted_events(events)
                  if isinstance(gate, str) and gate.startswith("dep:")]
@@ -629,6 +631,11 @@ def accepted_findings(
                 f"absent from the current dependency tree; refusing to publish out-of-scope accepted "
                 f"findings (the DAG changed after acceptance, or the history is forged)"
             )
+        # Every finding in a dependency accepted set must be attributed to that dependency gate; a
+        # forged dep:<id> set injecting a `source_gate: final` or `dep:ghost` finding is mis-scoped
+        # history the DAG-aware Finish-time path must fail closed on (reusing the write-time rule).
+        for _, gate, fs in effective:
+            fs.validate_for_gate(gate)
         effective.sort(key=lambda item: (position[item[1]], item[0]))
     else:
         effective.sort(key=lambda item: item[0])
@@ -791,17 +798,19 @@ def require_complete_symmetric_run(
     """Finish-time completeness guard for the result commands (never for reports).
 
     Rejects (``ValueError`` prefixed ``incomplete symmetric workflow``) unless every DAG node is
-    ``done`` and backed by an effective accepted dependency finding set, no orphan/pre-terminal/
-    post-terminal accepted set exists, no in-scope gate records a same-gate symmetric protocol event
-    AFTER its authoritative terminal (post-terminal residue), no gate carrying ANY review protocol
-    event is OUT OF SCOPE (an arbitrary name, a ``dep:<id>`` absent from the current tree, or the
-    ``final`` gate when ``final_enabled`` is false), and — when ``require_final`` — the FINAL gate has
-    an effective accepted set. The scope check spans every ``symmetric_verdict``/``accepted_finding_set``/
-    terminal so a forged out-of-scope gate that only CAPS or proceeds-with-flags (persisting objections
-    but no accepted set) is caught too. ``final_enabled`` mirrors ``cfg.final_review`` (FINAL is part of
-    the configured workflow); it is distinct from ``require_final`` because ``accepted-findings``
-    legitimately precedes FINAL yet must still reject a forged FINAL gate in a run where FINAL is
-    disabled. A malformed effective accepted payload surfaces its own ``ValueError``.
+    ``done`` and backed by an effective accepted dependency finding set whose findings are all
+    attributed to that dependency gate (a mis-scoped ``source_gate: final``/ghost finding fails
+    closed), no orphan/pre-terminal/post-terminal accepted set exists, no in-scope gate records a
+    same-gate symmetric protocol event AFTER its authoritative terminal (post-terminal residue), no
+    gate carrying ANY review protocol event is OUT OF SCOPE (an arbitrary name, a ``dep:<id>`` absent
+    from the current tree, or the ``final`` gate when ``final_enabled`` is false), and — when
+    ``require_final`` — the FINAL gate has an effective accepted set. The scope check spans every
+    ``symmetric_verdict``/``accepted_finding_set``/terminal so a forged out-of-scope gate that only
+    CAPS or proceeds-with-flags (persisting objections but no accepted set) is caught too.
+    ``final_enabled`` mirrors ``cfg.final_review`` (FINAL is part of the configured workflow); it is
+    distinct from ``require_final`` because ``accepted-findings`` legitimately precedes FINAL yet must
+    still reject a forged FINAL gate in a run where FINAL is disabled. A malformed effective accepted
+    payload surfaces its own ``ValueError``.
     """
     if not dag.nodes:
         raise ValueError("incomplete symmetric workflow: no dependency tree is loaded")
@@ -817,6 +826,24 @@ def require_complete_symmetric_run(
         raise ValueError(
             f"incomplete symmetric workflow: node(s) {unbacked} have no valid accepted dependency "
             f"finding set"
+        )
+    # Each backed dependency's accepted set must attribute every finding to its own gate; a forged
+    # dep:<id> set injecting a `source_gate: final`/ghost finding is mis-scoped history that must fail
+    # closed at Finish time (reusing FindingSet.validate_for_gate, the write-time rule).
+    mis_scoped: list[str] = []
+    for nid in dag.order:
+        gate = f"dep:{nid}"
+        finding_set = accepted_finding_set_for_gate(events, gate)
+        if finding_set is None:
+            continue
+        try:
+            finding_set.validate_for_gate(gate)
+        except ValueError as exc:
+            mis_scoped.append(str(exc))
+    if mis_scoped:
+        raise ValueError(
+            f"incomplete symmetric workflow: an accepted dependency finding set attributes a finding "
+            f"to the wrong source_gate ({'; '.join(mis_scoped)})"
         )
     orphans = _orphan_accepted_indices(events)
     if orphans:

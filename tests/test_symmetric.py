@@ -448,15 +448,16 @@ def test_accepted_findings_excludes_intervening_protocol_event_before_terminal()
 
 def test_accepted_findings_rejects_duplicate_composite_keys_across_gates():
     # Two DIFFERENT dependency gates whose (individually valid) accepted trios both carry the same
-    # (source_gate, id) — only reachable via forged history, since write-time validate_for_gate
-    # rejects it — union to a duplicate composite key and are rejected.
-    dag = _two_done_dag()
+    # (source_gate, id) union to a duplicate composite key and are rejected. A cross-gate duplicate is
+    # only reachable via forged history — write-time AND the DAG-aware Finish path both reject a
+    # mis-scoped source_gate (round-7 F1) — so the duplicate-key rule is exercised through the no-DAG
+    # partial helper, whose deterministic union still fails closed on a duplicate key.
     events = (
         _dep_events("a", findings=[_finding("dep:a", "F1")], bindings=_bindings("a", "d", "na"))
         + _dep_events("b", findings=[_finding("dep:a", "F1")], bindings=_bindings("b", "d", "nb"))
     )
     with pytest.raises(ValueError, match="duplicate"):
-        accepted_findings(events, dag)
+        accepted_findings(events)
 
 
 def test_accepted_findings_rejects_malformed_effective_payload():
@@ -942,4 +943,44 @@ def test_require_complete_symmetric_run_rejects_post_terminal_verdict():
     events = _dep_events("a", findings=[_finding("dep:a", "F1")], bindings=b)
     events.append(_post_terminal_verdict("dep:a", [], b))
     with pytest.raises(ValueError, match="post-terminal residue"):
+        require_complete_symmetric_run(events, dag, require_final=False, final_enabled=False)
+
+
+# --- round-7 F1: accepted DEPENDENCY sets must attribute every finding to their own gate ----------
+#
+# A dependency accepted set for ``dep:<id>`` may only carry findings whose ``source_gate`` is that
+# gate. A forged ``dep:auth`` accepted set injecting a ``source_gate: final`` (or ``dep:ghost``)
+# finding must never be published by the DAG-aware Finish-time path, and the completeness guard and
+# workflow validation must surface it as invalid history (reusing FindingSet.validate_for_gate).
+
+def test_accepted_findings_with_dag_rejects_mis_scoped_final_source_gate():
+    dag = _one_done_dag("a")
+    events = _dep_events("a", findings=[_finding("final", "X1")], bindings=_bindings("a", "d", "na"))
+    with pytest.raises(ValueError, match="source_gate"):
+        accepted_findings(events, dag)
+
+
+def test_accepted_findings_with_dag_rejects_mis_scoped_ghost_source_gate():
+    dag = _one_done_dag("a")
+    events = _dep_events("a", findings=[_finding("dep:ghost", "G1")],
+                         bindings=_bindings("a", "d", "na"))
+    with pytest.raises(ValueError, match="source_gate"):
+        accepted_findings(events, dag)
+
+
+def test_accepted_findings_without_dag_stays_best_effort_on_mis_scoped():
+    # The no-DAG partial helper is best-effort by design (mirrors its DAG-scope contract): it cannot
+    # know the tree, so it does not fail closed on a mis-scoped finding — Finish-time scope
+    # enforcement is exclusively the DAG-aware path's job (and workflow_issues flags it INVALID).
+    events = _dep_events("a", findings=[_finding("final", "X1")], bindings=_bindings("a", "d", "na"))
+    fs = accepted_findings(events)  # no dag => partial helper, no source_gate validation
+    assert [f.source_gate for f in fs.findings] == ["final"]
+
+
+def test_require_complete_symmetric_run_rejects_mis_scoped_dependency_finding():
+    from crucible.symmetric import require_complete_symmetric_run
+
+    dag = _one_done_dag("a")
+    events = _dep_events("a", findings=[_finding("final", "X1")], bindings=_bindings("a", "d", "na"))
+    with pytest.raises(ValueError, match="incomplete symmetric workflow"):
         require_complete_symmetric_run(events, dag, require_final=False, final_enabled=False)

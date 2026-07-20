@@ -2771,6 +2771,23 @@ def test_review_result_rejects_arbitrary_gate_objection(tmp_path):
     assert r.returncode != 0, r.stdout
 
 
+def test_result_commands_reject_mis_scoped_dependency_finding(tmp_path):
+    # Round-7 F1: a complete valid run, then the dep:auth accepted set is forged to attribute its
+    # finding to source_gate "final" (a FINAL/ghost finding smuggled through a dependency gate). Both
+    # Finish-time result commands must fail closed rather than publish the mis-scoped finding.
+    run_dir = _complete_one_node_symmetric(tmp_path, "auth",
+                                           findings=[_accepted_finding("dep:auth", "F1", "major")])
+
+    def _mis_scope(records):
+        for r in records:
+            if r.get("event") == "accepted_finding_set" and r.get("gate") == "dep:auth":
+                r["payload"]["findings"][0]["source_gate"] = "final"
+    _rewrite_events(run_dir, _mis_scope)
+    for command in ("accepted-findings", "review-result"):
+        r = _run([command, "--run", run_dir])
+        assert r.returncode != 0, command
+
+
 def test_symmetric_verdict_final_rejects_dropped_dependency_finding(tmp_path):
     run_dir = _complete_one_node_symmetric(tmp_path, "auth", final_review=True,
                                            findings=[_accepted_finding("dep:auth", "F1", "major")])

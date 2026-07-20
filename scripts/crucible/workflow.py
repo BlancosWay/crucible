@@ -417,12 +417,24 @@ def _symmetric_accepted_set_issues(
             issues.append(WorkflowIssue("invalid", f"symmetric gate {gate!r} {reason}"))
         if resolution.accepted_index is not None:
             try:
-                FindingSet.from_dict(events[resolution.accepted_index].get("payload"))
+                accepted_set = FindingSet.from_dict(events[resolution.accepted_index].get("payload"))
             except (ValueError, TypeError):
                 issues.append(WorkflowIssue(
                     "invalid",
                     f"symmetric gate {gate!r} accepted finding set payload is not a valid finding "
                     f"set (malformed)"))
+            else:
+                # A DEPENDENCY accepted set must attribute every finding to its own gate; a forged
+                # dep:<id> set injecting a `source_gate: final`/ghost finding is mis-scoped history
+                # (round-7 F1). FINAL legitimately carries dependency findings, so its inclusion is
+                # validated separately by _final_inclusion_issues, never validate_for_gate.
+                if gate.startswith("dep:"):
+                    try:
+                        accepted_set.validate_for_gate(gate)
+                    except ValueError as exc:
+                        issues.append(WorkflowIssue(
+                            "invalid",
+                            f"symmetric gate {gate!r} accepted finding set is mis-scoped ({exc})"))
     # Post-terminal protocol residue: a same-gate symmetric protocol event (a verdict that could
     # rewrite the gate's unresolved objections, an accepted set, or a second terminal) recorded AFTER
     # the authoritative terminal is forged/crash residue, never part of the concluded decision
@@ -440,11 +452,23 @@ def _symmetric_accepted_set_issues(
     # round-4 capped ghost, round-5 arbitrary/off-convention name such as ``sidequest`` or a
     # ``reproduce`` gate symmetric protocols never use). The protocol-wide scope guard spans every
     # symmetric_verdict/accepted/terminal, so a gate that only CAPS/proceeds with objections (no
-    # accepted set) is caught too. A forged FINAL gate while final_review is off is reported as a
-    # configured-forbidden phase by the FINAL terminal check in workflow_issues, so it is skipped here
-    # to avoid a duplicate.
+    # accepted set) is caught too.
+    #
+    # The ``final`` gate is special when ``final_review`` is off (round-7 F2): a FINAL *terminal* is
+    # already reported as a configured-forbidden phase by the FINAL terminal check in workflow_issues,
+    # so that case is skipped here to avoid a duplicate. But a FINAL symmetric_verdict or
+    # accepted_finding_set WITHOUT a terminal evades that terminal-only check, so it must be flagged
+    # here — any FINAL symmetric protocol event while FINAL is disabled is invalid history.
+    final_terminal_present = any(
+        e.get("gate") == "final" and e.get("event") in _TERMINAL_EVENTS for e in events)
     for gate in out_of_scope_protocol_gates(events, dag, final_enabled=cfg.final_review):
         if gate == "final":
+            if final_terminal_present:
+                continue
+            issues.append(WorkflowIssue(
+                "invalid",
+                "symmetric FINAL gate records a symmetric protocol event (verdict/accepted set) "
+                "though final_review is disabled (configured-forbidden phase)"))
             continue
         issues.append(WorkflowIssue(
             "invalid",
