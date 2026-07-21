@@ -10,21 +10,23 @@ or a diff against the actual code.
 Usage: `/pr-review <pr-or-diff>` — e.g. `/pr-review #123`, `/pr-review https://github.com/org/repo/pull/123`,
 or `/pr-review main..my-branch`.
 
-Follow `skills/pr-review/SKILL.md` exactly: normalize the input (a GitHub PR via `gh`, or a local
-`base..head` range / diff file) into a diff + changed-files + intent triple -> PLAN gate (review plan
-+ review graph, both peers review to consensus) -> one THREAD gate per review concern (both peers
-review that slice of the change independently against the real code, both review the merged set, loop
-to consensus or cap) -> optional FINAL gate -> run report + assembled findings + a derived
-recommendation. Two **equal peers** (no Builder/Critic asymmetry); the recorded verdict each round is
-the union of both peers' findings, and consensus is grounded in re-verifiable citations — never a vote
-or an average. Resolve models, effort, caps, and policies from the `RUN/config.json` written by
-`init-run`; shipped values live in `config.defaults.json`. Every gate decision is **bound** to the
-exact merged artifact both peers reviewed (schema v2): the CLI hashes it into SHA-256 bindings the
-union verdict must echo, and the accepted review plan/graph is frozen (a legacy pre-schema-2 run is
-read-only, `LEGACY / UNVERIFIED`).
+Follow `skills/pr-review/SKILL.md` exactly: init the run with `--workflow pr-review` and normalize the
+input (a GitHub PR via `gh`, or a local `base..head` range / diff file) into a diff + changed-files +
+intent triple -> PLAN gate (review plan + review graph, both peers attest to consensus) -> one THREAD
+gate per review concern (both peers review that slice independently against the real code, both attest
+to the candidate finding set, loop to consensus or cap) -> optional FINAL gate (assembled from
+`crucible accepted-findings`) -> `crucible review-result` (findings + derived recommendation) + run
+report. Two **equal peers** (no Builder/Critic asymmetry); each round **both peers independently
+attest** in their own `peer-a.json` / `peer-b.json` and `crucible symmetric-verdict --peer-a --peer-b`
+decides — never the build-only `verdict` — and consensus is grounded in re-verifiable citations, never
+a vote or an average. Resolve models, effort, caps, and policies from the `RUN/config.json` written by
+`init-run`; shipped values live in `config.defaults.json`. Every **gate decision is bound to the
+exact** candidate both peers reviewed (**schema v2**): the CLI hashes it into SHA-256 **bindings** that
+**each peer attestation must echo**, and the accepted review plan/graph is frozen (a legacy
+pre-schema-2 run is read-only, `LEGACY / UNVERIFIED`).
 
 **Engineering tool — never advance a gate without consensus unless `on_cap: proceed_with_flags`, and
-never clear a blocking peer dispute with a rebuttal; resolve it against the cited source or flag both
+never clear a blocking peer objection with a rebuttal; resolve it against the cited source or flag both
 positions.** The deliverable is the findings; the review is **read-only** over the target by default —
 posting to the PR happens only for a GitHub PR, only after consensus, and only with your explicit OK.
 

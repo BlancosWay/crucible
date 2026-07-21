@@ -20,11 +20,13 @@ is the path `init-run` printed.
   `~/.crucible/runs`, so nothing is written into the target repo.
 - **Gates** — a gate is `plan`, `final`, or a dependency **node id** (one IMPLEMENT gate per node).
   The companion `deep-dive` skill reuses this same CLI, where a node id is an **investigation thread**
-  (`dep:<thread>`) and each round's verdict is the union of both peers' findings. The companion
-  `pr-review` skill likewise reuses it, where a node id is a **review thread** (`dep:<thread>`); that
-  review is **static/CI-only** for a PR-URL or diff-file target and executes a reviewed change only
-  for a **trusted local checkout** after exact-command **consent** (a skill-level Execution Safety
-  Gate, not a CLI feature).
+  (`dep:<thread>`) and each round is settled by `symmetric-verdict` from two separate peer
+  attestations, not a single union verdict (see
+  [Symmetric workflows](#symmetric-workflows-deep-dive--pr-review)). The companion `pr-review` skill
+  likewise reuses it, where a node id is a **review thread** (`dep:<thread>`); that review is
+  **static/CI-only** for a PR-URL or diff-file target and executes a reviewed change only for a
+  **trusted local checkout** after exact-command **consent** (a skill-level Execution Safety Gate,
+  not a CLI feature).
 - **Node statuses** — `pending`, `in_progress`, `in_review`, `done`, `blocked`. Transitions are
   enforced: `pending -> in_progress | blocked`, `in_progress -> in_review | done | blocked | pending`,
   `in_review -> in_progress | done | blocked | pending`, `blocked -> pending`, and `done` is terminal.
@@ -45,7 +47,7 @@ is the path `init-run` printed.
 
 | Command | Arguments | Behavior |
 |---------|-----------|----------|
-| `init-run` | `--goal GOAL` (required), `--config FILE`, `--base-dir DIR` | Create a run directory (seeding its `config.json` from `--config`, or defaults) and print its path to stdout. |
+| `init-run` | `--goal GOAL` (required), `--config FILE`, `--base-dir DIR`, `--workflow build\|deep-dive\|pr-review` | Create a run directory (seeding its `config.json` from `--config`, or defaults) and print its path to stdout. `--workflow` records the immutable workflow kind on `run_start` (default `build`, the asymmetric Builder/Critic flow); `deep-dive`/`pr-review` select the symmetric two-peer flow and are documented under [Symmetric workflows](#symmetric-workflows-deep-dive--pr-review). |
 | `load-dag` | `--run RUN` (required), `--file FILE` (required); `--force` (optional) | Import the plan's dependency tree from a JSON file. Rejects an empty tree and any node not `pending` (fresh plans start all-`pending`; statuses change only via `set-status`). Also refuses to overwrite a run whose existing DAG already has progress (non-`pending` nodes), which would reset it — pass `--force` to replace it (discards current node statuses). Prints the node count and the tree. |
 
 ## Schedule & track progress
@@ -61,7 +63,7 @@ is the path `init-run` printed.
 | Command | Arguments | Behavior |
 |---------|-----------|----------|
 | `log` | `--run RUN`, `--event EVENT`, `--gate GATE`, `--round ROUND` (required), `--file FILE` | Append a Builder or Critic transcript to the run log. `--event` is `builder_output` or `critic_output` (other events are written by their own commands). A schema-2 `builder_output` **requires `--file`** with a non-empty payload, must be logged for the CLI-derived current round, is rejected after that gate has a terminal event, and records the artifact's `artifact_sha256` (the exact bytes are hashed, CRLF-preserving). `critic_output` payload is optional (omit `--file` for empty). |
-| `verdict` | `--run RUN`, `--gate GATE`, `--round ROUND` (required), `--max-rounds M`, `--resolutions FILE`, `--file FILE` (required) | Adjudicate the Critic's verdict deterministically into `CONSENSUS`, `CHANGES`, `PROCEED_WITH_FLAGS`, or `CAPPED`, honoring `blocking_severities`, `defer_severities`, and `strict_rebuttal`. The verdict JSON must **echo** the gate's content bindings (`artifact_sha256` + gate-specific `dag_sha256`/`node_sha256` from `bindings`); a missing or mismatched binding is rejected **before** any decision is logged. `--round` must equal the CLI-derived next round for the gate (one past the number of prior `critic_verdict` events, i.e. consecutive starting at 1); a mismatch is rejected, so the round cap cannot be bypassed by skipping to the cap or repeating a round. `--resolutions` is the Builder's per-finding map (`id` → `fixed` / `deferred` / `wontfix`; a `wontfix` or `deferred` entry must use the object form `{"resolution": "wontfix", "rationale": "…"}` with a non-empty `rationale`, since it clears a finding without a fix — a bare `"wontfix"`/`"deferred"` is rejected); `--max-rounds` overrides the cap (defaults to `max_rounds_plan`/`max_rounds_dep` by gate). Prints the outcome, the findings the Builder will fix, and any unresolved blocking findings; when the PLAN gate settles it also echoes the approved plan + DAG. The validated bindings are persisted on `critic_verdict` and every terminal event for provenance. |
+| `verdict` | `--run RUN`, `--gate GATE`, `--round ROUND` (required), `--max-rounds M`, `--resolutions FILE`, `--file FILE` (required) | Adjudicate the Critic's verdict deterministically into `CONSENSUS`, `CHANGES`, `PROCEED_WITH_FLAGS`, or `CAPPED`, honoring `blocking_severities`, `defer_severities`, and `strict_rebuttal`. The verdict JSON must **echo** the gate's content bindings (`artifact_sha256` + gate-specific `dag_sha256`/`node_sha256` from `bindings`); a missing or mismatched binding is rejected **before** any decision is logged. `--round` must equal the CLI-derived next round for the gate (one past the number of prior `critic_verdict` events, i.e. consecutive starting at 1); a mismatch is rejected, so the round cap cannot be bypassed by skipping to the cap or repeating a round. `--resolutions` is the Builder's per-finding map (`id` → `fixed` / `deferred` / `wontfix`; a `wontfix` or `deferred` entry must use the object form `{"resolution": "wontfix", "rationale": "…"}` with a non-empty `rationale`, since it clears a finding without a fix — a bare `"wontfix"`/`"deferred"` is rejected); `--max-rounds` overrides the cap (defaults to `max_rounds_plan`/`max_rounds_dep` by gate). Prints the outcome, the findings the Builder will fix, and any unresolved blocking findings; when the PLAN gate settles it also echoes the approved plan + DAG. The validated bindings are persisted on `critic_verdict` and every terminal event for provenance. **Build workflow only** — a symmetric (`deep-dive`/`pr-review`) run is rejected with a message directing the orchestrator to `symmetric-verdict`. |
 
 ## Content bindings & human approval
 
@@ -92,6 +94,30 @@ eyeballing it. All take `--run RUN` (required).
 | `report` | `--run RUN` (required), `--html`, `--open` | Render the run report from the log (Markdown, or HTML with `--html`), print it, and write it into the run dir. `--open` also opens it in a browser (best-effort). |
 | `clean` | `--run RUN` (required), `--force` | Delete a finished run's directory. Refuses any path that isn't a run dir (must contain `runlog.jsonl`) and any run still in progress unless `--force` is given. |
 | `critic-lenses` | `--run RUN` (required) | Print the operator's configured Critic lenses (`critic_checklists`) as one fenced block — each lens file's contents, labelled with size + a short sha256 — for the orchestrator to append to the Critic seed as additive DATA (subordinate to `critic-prompt.md` and the verdict schema). Fail-closed: a missing / relative / symlink / oversized lens prints to stderr and exits non-zero. Prints nothing when `critic_checklists` is unset. |
+
+## Symmetric workflows (deep-dive / pr-review)
+
+The `deep-dive` and `pr-review` companion skills run a **symmetric two-peer** flow instead of the
+asymmetric Builder/Critic loop. `init-run --workflow deep-dive|pr-review` records the immutable
+workflow kind, and every gate is settled by **two separately produced peer attestation files** rather
+than a single `verdict`. The build workflow behavior and `verdict` semantics are unchanged.
+
+| Command | Arguments | Behavior |
+|---------|-----------|----------|
+| `symmetric-verdict` | `--run RUN`, `--gate GATE`, `--round ROUND` (required), `--peer-a FILE`, `--peer-b FILE` (required), `--max-rounds M` | Atomically decide a symmetric gate from a **Peer A** and a **Peer B** attestation file. Each attestation is `{"peer": "A"\|"B", "gate", "round", "verdict": "APPROVE"\|"REQUEST_CHANGES", "summary", "objections": [Finding…], + echoed bindings}`; both files must **echo** the exact `crucible bindings` (a mismatch in either is rejected before any append). The decision is computed from the **union of the two peers' objections** — `CONSENSUS` iff neither peer has a blocking objection, else `CHANGES` / `CAPPED` / `PROCEED_WITH_FLAGS` — never from an accepted finding's severity. For a `dep:`/`final` gate the bound Builder artifact is a structured **finding set** (`{"summary", "findings": [{"source_gate", "id", "severity", "location", "claim", "suggestion"}]}`) that is validated and persisted as the accepted set on an advancing outcome. Takes **no** `--resolutions`. Rejects a `build` run (which uses `verdict`). |
+| `accepted-findings` | `--run RUN` (required) | Print the deterministic union of accepted **dependency** finding sets (DAG topological order, keyed by `(source_gate, id)`) as canonical JSON. The FINAL candidate is assembled from this output plus cross-cutting `source_gate: final` findings; the CLI rejects a FINAL set that drops or alters an accepted dependency finding. Fails closed on an incomplete or out-of-scope run. |
+| `review-result` | `--run RUN` (required) | The Finish-time deliverable: `{"workflow", "findings": [...], "unresolved_objections": [...]}`, plus — for `pr-review` only — a derived `recommendation`: any accepted finding in `blocking_severities` or any unresolved blocking objection → `REQUEST_CHANGES`; any other accepted finding → `COMMENT`; none → `APPROVE`. `deep-dive` omits `recommendation` (an investigation returns a finding set). Rejects a `build` run or an incomplete symmetric run. |
+
+The report renders **Peer A** / **Peer B** headers (from the two configured slots) and, for
+`pr-review`, a `**Review recommendation:**` line. That review recommendation is **separate** from the
+workflow status (`CLEAN` / `FLAGGED` / …): a `CLEAN` run is never treated as synonymous with an
+`APPROVE`.
+
+**Trust boundary — slot proof, not process identity.** A symmetric decision proves that **two
+configured slots** (`A` and `B`) each supplied a valid attestation bound to the same candidate, and
+records each slot's configured model/effort. It **does not cryptographically prove** that two distinct
+model *processes* produced the files — runtime peer independence is a platform/orchestrator property,
+not a CLI guarantee.
 
 ## Report statuses
 

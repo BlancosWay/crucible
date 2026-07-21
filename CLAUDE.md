@@ -38,10 +38,15 @@ on `main`/`master` without consent (use a worktree). See `SECURITY.md`.
 An independent second skill, **`deep-dive`** (`skills/deep-dive/`, slash command `deep-dive:deep-dive`
 or "use deep-dive to …"), runs a two-model **symmetric** adversarial *investigation* against the
 actual code or data: two **equal peers** (no Builder/Critic asymmetry) investigate independently,
-cross-examine, and converge on an **evidence-grounded consensus finding set** — reusing the same
-deterministic `crucible` CLI with no config-schema change (each round both peers review the merged
-set; the recorded verdict is the union of their findings; consensus is grounded in re-verifiable
-citations, never a vote or an average). Follow `skills/deep-dive/SKILL.md`.
+cross-examine, and converge on an **evidence-grounded consensus finding set** (grounded in
+re-verifiable citations, never a vote or an average). It runs on the same deterministic `crucible`
+CLI with no config-schema change: `init-run --workflow deep-dive` selects the symmetric flow, and
+every gate is settled by `crucible symmetric-verdict --peer-a … --peer-b …` from **separate Peer A /
+Peer B attestation files** (never the build-only `verdict`) — the union of the two peers' *objections*
+decides gate progress; there is **no single serialized union verdict**. `accepted-findings` assembles
+the accepted dependency findings before FINAL and `review-result` is the Finish-time deliverable. A
+symmetric decision proves **two configured slots** each attested to the same bound candidate — not a
+cryptographic proof that two distinct model *processes* ran. Follow `skills/deep-dive/SKILL.md`.
 
 ## Companion skill: pr-review
 
@@ -49,11 +54,14 @@ An independent third skill, **`pr-review`** (`skills/pr-review/`, slash command 
 or "use pr-review to …"), runs a two-model **symmetric** adversarial *review* of a pull request: two
 **equal peers** (no Builder/Critic asymmetry) review a GitHub PR (via `gh`) or a local diff
 independently against the real code, cross-examine, and converge on an **evidence-grounded consensus
-finding set** plus a **derived** Approve/Comment/Request-changes recommendation — reusing the same
-deterministic `crucible` CLI with no config-schema change (consensus is grounded in re-verifiable
-citations, never a vote or an average). Read-only over the target by default; posting to the PR is a
-consented, per-run side effect. **Execution safety:** a PR-URL and a diff-file review are
-**static/CI-only** and never execute locally; running tests or builds is available only for a
-**trusted local checkout**, after explicit execution **consent** to the exact commands and an
-arbitrary-code warning — consent does not imply sandboxing, and is separate from posting consent.
-Follow `skills/pr-review/SKILL.md`.
+finding set** plus a **derived** Approve/Comment/Request-changes recommendation (grounded in
+re-verifiable citations, never a vote or an average). It runs on the same deterministic `crucible`
+CLI with no config-schema change: `init-run --workflow pr-review` selects the same symmetric two-peer
+flow (gates settled by `crucible symmetric-verdict` from separate **Peer A / Peer B** attestations,
+never a single union verdict), and the Approve/Comment/Request-changes call is a **deterministic**
+projection of the accepted finding set from `crucible review-result` (not a separate vote).
+Read-only over the target by default; posting to the PR is a consented, per-run side effect.
+**Execution safety:** a PR-URL and a diff-file review are **static/CI-only** and never execute
+locally; running tests or builds is available only for a **trusted local checkout**, after explicit
+execution **consent** to the exact commands and an arbitrary-code warning — consent does not imply
+sandboxing, and is separate from posting consent. Follow `skills/pr-review/SKILL.md`.

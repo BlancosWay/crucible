@@ -22,6 +22,20 @@ from crucible.integrity import (
 from crucible.lenses import read_critic_lenses
 from crucible.report import render_html, render_markdown
 from crucible.runlog import RunLog, RunLogCorruptError, init_run
+from crucible.symmetric import (
+    SYMMETRIC_WORKFLOWS,
+    VALID_WORKFLOWS,
+    CorruptWorkflowError,
+    FindingSet,
+    PeerAttestation,
+    accepted_findings,
+    decide_symmetric,
+    peer_slot_provenance,
+    require_complete_symmetric_run,
+    review_result,
+    validate_final_finding_set,
+    workflow_kind,
+)
 from crucible.verdict import VALID_RESOLUTIONS, Finding, Verdict, decide
 from crucible.workflow import (
     accepted_terminal,
@@ -30,6 +44,7 @@ from crucible.workflow import (
     require_plan_ready,
     require_plan_verdict_ready,
     require_reproduce_ready,
+    workflow_issues,
 )
 
 # Events that `crucible log` may append. All other events are emitted by their own
@@ -44,6 +59,30 @@ def _read_payload(path):
     if not path:
         return None
     return Path(path).read_text(encoding="utf-8")
+
+
+def _require_run_integrity(run: RunLog) -> None:
+    """Shared run-integrity guard for every schema-v2 mutation/certification command.
+
+    Called before any read/mutation/append at the start of a current-schema command, it fails the run
+    closed (``SystemExit`` — a clean message, no traceback) on either integrity fault:
+
+    - a LEGACY run whose ``run_start`` predates the current schema, so its provenance is unverified
+      (:func:`crucible.integrity.require_current_schema`); or
+    - a run whose recorded ``workflow`` metadata is CORRUPT — a present null/non-string/unrecognized
+      value. Reading it through the single :func:`workflow_kind` path raises
+      :class:`CorruptWorkflowError`, which this converts to ``SystemExit`` so a tampered run can never
+      be routed as ``build`` (the asymmetric path) or appended to.
+
+    An ABSENT workflow key stays ``build`` (legacy readability is preserved). Intentional readable /
+    cleanup commands (``report``, ``status``, ``next``, ``clean``, ``critic-lenses``) deliberately do
+    NOT call this, so they keep rendering or removing even a corrupt run.
+    """
+    require_current_schema(run)
+    try:
+        workflow_kind(run.read_events())
+    except CorruptWorkflowError as exc:
+        raise SystemExit(f"crucible: {exc}")
 
 
 def _print_dependency_tree(dag, stream=None) -> None:
@@ -222,11 +261,20 @@ def _max_rounds_for_gate(cfg: Config, gate: str) -> int:
 
 
 def _expected_round(run: RunLog, gate: str) -> int:
-    """The next review round for a gate, DERIVED from run history: one past the number of
-    ``critic_verdict`` events already logged for that gate. This makes round counting CLI-owned
-    (F1b) so a caller cannot skip to the cap or repeat a round to dodge it."""
-    prior = sum(1 for e in run.read_events()
-                if e.get("gate") == gate and e.get("event") == "critic_verdict")
+    """The next review round for a gate, DERIVED from run history: one past the number of prior
+    per-round verdict events already logged for that gate. This makes round counting CLI-owned (F1b)
+    so a caller cannot skip to the cap or repeat a round to dodge it.
+
+    The verdict event is workflow-specific: the asymmetric Builder/Critic flow logs one
+    ``critic_verdict`` per round, while a symmetric ``deep-dive``/``pr-review`` run logs one
+    ``symmetric_verdict`` (two peer attestations) per round. Counting the mode's own marker keeps the
+    shared ``log``/``bindings`` handshake and the per-mode decision command in lock-step.
+    """
+    events = run.read_events()
+    marker = ("symmetric_verdict" if workflow_kind(events) in SYMMETRIC_WORKFLOWS
+              else "critic_verdict")
+    prior = sum(1 for e in events
+                if e.get("gate") == gate and e.get("event") == marker)
     return prior + 1
 
 
@@ -260,14 +308,14 @@ def _require_gate_stage_ready(run: RunLog, cfg: Config, gate: str) -> None:
 def cmd_init_run(args) -> int:
     cfg = load_config(args.config) if args.config else Config.from_dict({})
     base = args.base_dir or os.environ.get("CRUCIBLE_RUNS_DIR") or str(Path.home() / ".crucible" / "runs")
-    run = init_run(args.goal, cfg, base_dir=base)
+    run = init_run(args.goal, cfg, base_dir=base, workflow=args.workflow)
     print(run.path)
     return 0
 
 
 def cmd_load_dag(args) -> int:
     run = RunLog(args.run)
-    require_current_schema(run)
+    _require_run_integrity(run)
     # Artifact immutability: once the PLAN gate concludes (any terminal outcome), the accepted
     # dependency tree is frozen. Refuse to replace it — even with --force — because a Critic already
     # reviewed and the run bound its decision to this exact tree. A changed plan/DAG needs a fresh
@@ -355,7 +403,7 @@ def cmd_set_status(args) -> int:
     run = RunLog(args.run)
     # set-status is a mutating command: a legacy run's provenance is unverified, so refuse to
     # transition (or forcibly complete) its nodes — start a fresh run instead.
-    require_current_schema(run)
+    _require_run_integrity(run)
     dag = DAG.from_dict(run.load_dag())
     if args.node not in dag.nodes:
         raise ValueError(f"unknown node: {args.node}")
@@ -450,7 +498,7 @@ def cmd_log(args) -> int:
     if args.round < 1:
         raise SystemExit("log --round must be >= 1 (rounds are 1-based)")
     run = RunLog(args.run)
-    require_current_schema(run)
+    _require_run_integrity(run)
     _require_dep_node_in_dag(run, args.gate)
     # Stage/phase prerequisites (Task 3): a Builder artifact may only be logged when the gate is
     # legitimately reachable — REPRODUCE consensus before PLAN when configured; an accepted+bound
@@ -545,8 +593,17 @@ def cmd_verdict(args) -> int:
     run = RunLog(args.run)
     # Schema guard: a legacy run's provenance is unverified, so a verdict must never append to it —
     # checked before any read/mutation so `verdict` can never certify unbindable history.
-    require_current_schema(run)
+    _require_run_integrity(run)
     cfg = load_config(run.path / "config.json")
+    # Routing guard: `verdict` records ONE asymmetric Builder/Critic sign-off. A symmetric
+    # (deep-dive/pr-review) run requires two separately produced peer attestations, so it must never
+    # be certified by a single `verdict` — reject before reading/parsing the verdict file and direct
+    # the orchestrator to `symmetric-verdict`.
+    if workflow_kind(run.read_events()) in SYMMETRIC_WORKFLOWS:
+        raise SystemExit(
+            "crucible: verdict is the asymmetric Builder/Critic command, but this is a symmetric "
+            "run — use `symmetric-verdict` with separate --peer-a/--peer-b attestation files."
+        )
     raw_text = Path(args.file).read_text(encoding="utf-8")
     data = json.loads(raw_text)
     verdict = Verdict.from_dict(data)
@@ -672,6 +729,303 @@ def cmd_verdict(args) -> int:
     return 0
 
 
+def _require_matching_peer_bindings(peer: PeerAttestation, expected: dict[str, str], slot: str,
+                                    gate: str, round_index: int) -> None:
+    """Reject a peer attestation whose echoed bindings do not exactly match ``expected`` (the
+    CLI-selected ``crucible bindings`` output for this gate/round) — the symmetric counterpart of
+    ``_require_matching_bindings``.
+
+    An exact match is required: every expected field present and equal, and no extra binding field
+    the gate never carries. Raises ``SystemExit`` (with "binding" in the message) so the caller
+    rejects before any append — a peer that reviewed a different artifact/DAG/node can never attest.
+    """
+    provided = {key: getattr(peer, key)
+                for key in ("artifact_sha256", "dag_sha256", "node_sha256")}
+    problems = [f"{key}: expected {want}, got {provided.get(key)!r}"
+                for key, want in expected.items() if provided.get(key) != want]
+    problems += [f"unexpected {key} for this gate" for key in provided
+                 if provided[key] is not None and key not in expected]
+    if problems:
+        raise SystemExit(
+            f"symmetric-verdict: peer {slot} bindings do not match the CLI-selected artifact/DAG/node "
+            f"for gate {gate!r} round {round_index} ({'; '.join(problems)}); each peer attestation "
+            f"must echo the exact `crucible bindings` output — refusing to record a decision bound to "
+            f"a different artifact."
+        )
+
+
+def _bound_candidate_finding_set(run: RunLog, gate: str, round_index: int) -> FindingSet:
+    """Parse the current bound Builder artifact for a dependency/FINAL gate as a ``FindingSet``.
+
+    For symmetric dependency/FINAL gates the logged Builder artifact IS the candidate finding set
+    (structured JSON), so the same latest non-empty ``builder_output`` payload that ``current_bindings``
+    binds by hash is parsed here. PLAN artifacts are plain text and are never parsed this way, so this
+    is only called for ``dep:``/``final`` gates. Assumes ``current_bindings`` already validated the
+    artifact exists and its recorded hash matches the payload bytes.
+    """
+    outputs = [e for e in run.read_events()
+               if e.get("event") == "builder_output" and e.get("gate") == gate
+               and e.get("round") == round_index
+               and isinstance(e.get("payload"), str) and e.get("payload")]
+    if not outputs:  # pragma: no cover - current_bindings already required a bound artifact
+        raise SystemExit(
+            f"symmetric-verdict: no candidate finding set logged for gate {gate!r} round "
+            f"{round_index}; log the Builder finding set before deciding."
+        )
+    return FindingSet.from_dict(json.loads(outputs[-1]["payload"]))
+
+
+def cmd_symmetric_verdict(args) -> int:
+    """Atomically decide a symmetric (deep-dive/pr-review) gate from TWO separately produced peer
+    attestation files. Validates the complete candidate/peers/decision before any append, then logs
+    one ``symmetric_verdict`` event (both raw+parsed slots, configured model/effort, namespaced
+    aggregate objections, candidate + bindings), an ``accepted_finding_set`` for an advancing
+    dependency/FINAL gate, and the standard terminal event LAST. No partial event is written if any
+    file is invalid (design: atomic symmetric decision).
+    """
+    if args.round < 1:
+        raise SystemExit("--round must be >= 1 (rounds are 1-based)")
+    if args.max_rounds is not None and args.max_rounds < 1:
+        raise SystemExit("--max-rounds must be >= 1")
+    _validate_gate(args.gate)
+    run = RunLog(args.run)
+    # Schema guard first: a legacy run's provenance is unverified, so never certify it.
+    _require_run_integrity(run)
+    cfg = load_config(run.path / "config.json")
+    # Routing guard: symmetric-verdict is only for the two-peer workflows. A build run uses the
+    # asymmetric `verdict` command — reject before any read/append.
+    workflow = workflow_kind(run.read_events())
+    if workflow not in SYMMETRIC_WORKFLOWS:
+        raise SystemExit(
+            f"crucible: symmetric-verdict is for deep-dive/pr-review runs, but this is a {workflow!r} "
+            f"run — use `verdict` for the asymmetric Builder/Critic workflow."
+        )
+
+    # C3/C1: refuse to re-decide a concluded gate, and require a dep:<id> gate to name a real node.
+    _require_gate_not_terminal(run, args.gate)
+    _require_dep_node_in_dag(run, args.gate)
+    # Stage/phase prerequisites: the gate must be legitimately reachable before a decision settles it
+    # (accepted+bound PLAN, done deps, an in_progress/in_review node before a dep review, etc.).
+    _require_gate_stage_ready(run, cfg, args.gate)
+
+    # F1b: the round is DERIVED from prior symmetric_verdict events for this gate, not trusted from
+    # the caller — it must be exactly one past the number logged, so a caller cannot skip to the cap
+    # or repeat a round.
+    expected = _expected_round(run, args.gate)
+    if args.round != expected:
+        raise SystemExit(
+            f"symmetric-verdict --round {args.round} does not match the expected round {expected} "
+            f"for gate {args.gate!r} ({expected - 1} prior symmetric round(s) logged); rounds are "
+            f"derived from run history and must be consecutive starting at 1."
+        )
+
+    max_rounds = (args.max_rounds if args.max_rounds is not None
+                  else _max_rounds_for_gate(cfg, args.gate))
+
+    # The exact bindings BOTH peers must echo (recomputed from run history + the current tree).
+    bindings = current_bindings(run, args.gate, args.round).to_dict()
+
+    # Read and parse BOTH peer files completely before any validation append. Raw text is kept for
+    # full-fidelity provenance; the parsed attestation is validated against the CLI-selected bindings.
+    raw_a = Path(args.peer_a).read_text(encoding="utf-8")
+    raw_b = Path(args.peer_b).read_text(encoding="utf-8")
+    peer_a = PeerAttestation.from_dict(json.loads(raw_a))
+    peer_b = PeerAttestation.from_dict(json.loads(raw_b))
+
+    # Exactly one peer 'A' file via --peer-a and one peer 'B' file via --peer-b — no duplicates or
+    # swapped labels. PeerAttestation.from_dict already restricts each `peer` to A/B, so this only has
+    # to pin the slots to their flags.
+    if peer_a.peer != "A" or peer_b.peer != "B":
+        raise SystemExit(
+            f"symmetric-verdict: expected one peer 'A' file via --peer-a and one peer 'B' file via "
+            f"--peer-b; got --peer-a peer={peer_a.peer!r}, --peer-b peer={peer_b.peer!r}. Two equal "
+            f"peers must supply exactly one A and one B attestation — no duplicate or swapped labels."
+        )
+
+    # Per-peer: exact gate/round, exact bindings, and internal APPROVE/REQUEST_CHANGES consistency.
+    for slot, peer in (("A", peer_a), ("B", peer_b)):
+        if peer.gate != args.gate:
+            raise SystemExit(
+                f"symmetric-verdict: peer {slot} gate {peer.gate!r} does not match --gate "
+                f"{args.gate!r}")
+        if peer.round != args.round:
+            raise SystemExit(
+                f"symmetric-verdict: peer {slot} round {peer.round} does not match --round "
+                f"{args.round}")
+        _require_matching_peer_bindings(peer, bindings, slot, args.gate, args.round)
+        inconsistency = peer.consistency_error(cfg)
+        if inconsistency:
+            raise SystemExit(inconsistency)
+
+    # Structured candidate finding set for dependency/FINAL gates (PLAN stays plain text). A
+    # dependency candidate must attribute every finding to this exact gate; a FINAL candidate must
+    # CONTAIN every accepted dependency finding unchanged and add only source_gate: final extras
+    # (validated against the accepted dependency union before any append).
+    candidate: FindingSet | None = None
+    if args.gate.startswith("dep:") or args.gate == "final":
+        candidate = _bound_candidate_finding_set(run, args.gate, args.round)
+        if args.gate.startswith("dep:"):
+            candidate.validate_for_gate(args.gate)
+        else:
+            prior = accepted_findings(run.read_events(), DAG.from_dict(run.load_dag()))
+            validate_final_finding_set(candidate, prior)
+
+    # Gate progress is decided ONLY from the union of peer objections, never from accepted-finding
+    # severity — so a candidate that accepts a blocker still reaches consensus when both peers attest.
+    decision = decide_symmetric(peer_a, peer_b, cfg, round_index=args.round, max_rounds=max_rounds)
+
+    # ---- every file/candidate/decision is valid; append atomically ----
+    provenance = peer_slot_provenance(cfg)
+    objections = [
+        {"id": o.id, "severity": o.severity, "location": o.location,
+         "claim": o.claim, "suggestion": o.suggestion}
+        for o in decision.open_objections
+    ]
+    sym_fields: dict = {
+        "gate": args.gate, "round": args.round, "outcome": decision.outcome,
+        "peers": {
+            "A": {**provenance["A"], "raw": raw_a, "attestation": peer_a.to_dict()},
+            "B": {**provenance["B"], "raw": raw_b, "attestation": peer_b.to_dict()},
+        },
+        "objections": objections,
+        **bindings,
+    }
+    if candidate is not None:
+        sym_fields["candidate"] = candidate.to_dict()
+    run.append("symmetric_verdict", **sym_fields)
+
+    # For an ADVANCING dependency/FINAL outcome, persist the accepted finding set AFTER the
+    # symmetric_verdict and BEFORE the terminal, so a crash between them leaves incomplete history
+    # (never a terminal without its accepted set). CHANGES/CAPPED never accept a set.
+    advancing = decision.outcome in ("CONSENSUS", "PROCEED_WITH_FLAGS")
+    if candidate is not None and advancing:
+        accepted_fields: dict = {"gate": args.gate, "round": args.round,
+                                 "payload": candidate.to_dict(), **bindings}
+        if decision.outcome == "PROCEED_WITH_FLAGS":
+            accepted_fields["accepted_with_flags"] = True
+            accepted_fields["open_objections"] = [o.id for o in decision.open_objections]
+        run.append("accepted_finding_set", **accepted_fields)
+
+    # The standard terminal event is appended LAST with bindings (CHANGES logs none, staying in loop).
+    if decision.outcome == "CONSENSUS":
+        run.append("gate_consensus", gate=args.gate, round=args.round, **bindings)
+    elif decision.outcome == "PROCEED_WITH_FLAGS":
+        run.append("gate_proceeded_with_flags", gate=args.gate, round=args.round,
+                   open_findings=[o.id for o in decision.open_objections], **bindings)
+    elif decision.outcome == "CAPPED":
+        run.append("gate_capped", gate=args.gate, round=args.round,
+                   open_findings=[o.id for o in decision.open_objections], **bindings)
+    elif decision.outcome != "CHANGES":  # CHANGES intentionally logs no terminal event
+        raise SystemExit(f"unexpected decision outcome: {decision.outcome!r}")
+
+    print(decision.outcome)
+    return 0
+
+
+def _require_symmetric_result_workflow(events: list[dict], command: str) -> str:
+    """Route a result command to the two-peer workflows only. The asymmetric build workflow records
+    no accepted finding sets or review result, so reject it before any read/projection."""
+    workflow = workflow_kind(events)
+    if workflow not in SYMMETRIC_WORKFLOWS:
+        raise SystemExit(
+            f"crucible: {command} is for deep-dive/pr-review runs, but this is a {workflow!r} run — "
+            f"the asymmetric build workflow has no accepted finding sets or review result."
+        )
+    return workflow
+
+
+def _load_result_dag(run: RunLog) -> DAG:
+    """Load the current dependency tree for a result command, mapping an absent tree to the same
+    'incomplete symmetric workflow' rejection the completeness guard raises for an unfinished run."""
+    try:
+        return DAG.from_dict(run.load_dag())
+    except FileNotFoundError:
+        raise ValueError("incomplete symmetric workflow: no dependency tree is loaded")
+
+
+def _reject_incomplete_result_history(events: list[dict], dag: DAG, cfg: Config, command: str,
+                                      *, tolerate_missing_final: bool) -> None:
+    """Fail a Finish-time result command closed when the recorded workflow history is INVALID against
+    the CURRENT tree OR is MISSING a configured prerequisite phase.
+
+    ``workflow_issues`` is the single owner of the schema-v2 stage/phase contract: it flags an
+    ``invalid`` binding (a plan/DAG/node/approval substituted after acceptance, a symmetric peer
+    decision bound to a different candidate, post-terminal protocol residue, or an out-of-scope gate)
+    AND a ``missing`` configured prerequisite that never happened (PLAN, configured REPRODUCE,
+    configured human approval, or FINAL). A result is a certified Finish-time output, so it must not
+    be published from history the report would render ``INVALID`` (a recorded violation) or ``IN
+    PROGRESS`` (a missing prerequisite). Reusing that owner (rather than re-deriving the current-binding
+    checks here) keeps the rule in one place and avoids a ``symmetric`` -> ``workflow`` import cycle.
+
+    Every ``invalid`` issue fails closed. Every ``missing`` issue fails closed too, with ONE narrow
+    exception: ``accepted-findings`` (``tolerate_missing_final=True``) legitimately PRECEDES FINAL —
+    it is the union FINAL is assembled from — so it tolerates only the missing configured FINAL
+    prerequisite, and no other missing phase. ``review-result`` tolerates nothing (it requires FINAL
+    when ``final_review`` is enabled). ``flagged`` audited bypasses are handled by the completeness
+    guard, which requires every node backed by an accepted dependency set.
+    """
+    blocking: list[str] = []
+    for issue in workflow_issues(events, dag, cfg):
+        if issue.kind == "invalid":
+            blocking.append(issue.message)
+        elif issue.kind == "missing":
+            if tolerate_missing_final and issue.phase == "final":
+                continue
+            blocking.append(issue.message)
+    if blocking:
+        raise SystemExit(
+            f"crucible: {command} refuses to publish a result from incomplete or invalid workflow "
+            f"history — the recorded decisions are missing a configured prerequisite or no longer "
+            f"bind the current plan/tree: {'; '.join(blocking)}"
+        )
+
+
+def cmd_accepted_findings(args) -> int:
+    """Emit the deterministic union of accepted DEPENDENCY finding sets as canonical JSON.
+
+    A Finish-time output (design): it requires the current schema, a symmetric workflow, and a
+    complete run (every node done and backed by a valid accepted dependency set, no orphan accepted
+    events) whose recorded decisions still bind the current plan/tree before emitting the
+    topologically-ordered union the FINAL artifact is assembled from. It does NOT require FINAL (it
+    precedes it).
+    """
+    run = RunLog(args.run)
+    _require_run_integrity(run)
+    events = run.read_events()
+    _require_symmetric_result_workflow(events, "accepted-findings")
+    dag = _load_result_dag(run)
+    cfg = load_config(run.path / "config.json")
+    require_complete_symmetric_run(events, dag, require_final=False,
+                                   final_enabled=cfg.final_review)
+    _reject_incomplete_result_history(events, dag, cfg, "accepted-findings",
+                                      tolerate_missing_final=True)
+    print(json.dumps(accepted_findings(events, dag).to_dict()))
+    return 0
+
+
+def cmd_review_result(args) -> int:
+    """Emit the deterministic review deliverable (effective findings, unresolved objections, and —
+    for pr-review — the derived recommendation) as canonical JSON.
+
+    A Finish-time output (design): it requires the current schema, a symmetric workflow, and a
+    complete run — additionally requiring an accepted FINAL gate when ``final_review`` is configured —
+    whose recorded decisions still bind the current plan/tree before deriving the recommendation from
+    the accepted finding set (never from workflow status).
+    """
+    run = RunLog(args.run)
+    _require_run_integrity(run)
+    events = run.read_events()
+    cfg = load_config(run.path / "config.json")
+    workflow = _require_symmetric_result_workflow(events, "review-result")
+    dag = _load_result_dag(run)
+    require_complete_symmetric_run(events, dag, require_final=cfg.final_review,
+                                   final_enabled=cfg.final_review)
+    _reject_incomplete_result_history(events, dag, cfg, "review-result",
+                                      tolerate_missing_final=False)
+    print(json.dumps(review_result(events, cfg, workflow, dag)))
+    return 0
+
+
 def cmd_bindings(args) -> int:
     """Emit the deterministic content bindings for a gate/round as machine-readable JSON.
 
@@ -683,7 +1037,7 @@ def cmd_bindings(args) -> int:
         raise SystemExit("--round must be >= 1 (rounds are 1-based)")
     _validate_gate(args.gate)
     run = RunLog(args.run)
-    require_current_schema(run)
+    _require_run_integrity(run)
     _require_dep_node_in_dag(run, args.gate)
     # Bindings are only meaningful for a legitimately reachable gate (the same stage/phase order the
     # `log`/`verdict` handshake enforces), so validate the stage prerequisites before emitting them.
@@ -742,7 +1096,7 @@ def cmd_approve_plan(args) -> int:
     approval. Skills call it only after the human explicitly approves.
     """
     run = RunLog(args.run)
-    require_current_schema(run)
+    _require_run_integrity(run)
     cfg = load_config(run.path / "config.json")
     if not cfg.human_approval:
         raise SystemExit(
@@ -790,7 +1144,7 @@ def cmd_show_plan(args) -> int:
     refused, so the operator can only ever see exactly what was reviewed.
     """
     run = RunLog(args.run)
-    require_current_schema(run)
+    _require_run_integrity(run)
     events = run.read_events()
     terminal = _plan_advance_terminal(events)
     if terminal is None:
@@ -870,6 +1224,9 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("init-run"); s.add_argument("--goal", required=True)
     s.add_argument("--config"); s.add_argument("--base-dir", default=None,
                    help="run base dir; default $CRUCIBLE_RUNS_DIR or ~/.crucible/runs (keeps runs out of the target repo)")
+    s.add_argument("--workflow", choices=VALID_WORKFLOWS, default="build",
+                   help="immutable workflow kind recorded on run_start; default build (asymmetric "
+                        "Builder/Critic). deep-dive/pr-review select the symmetric two-peer flow.")
     s.set_defaults(func=cmd_init_run)
 
     s = sub.add_parser("load-dag"); s.add_argument("--run", required=True); s.add_argument("--file", required=True)
@@ -899,6 +1256,23 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--resolutions", help="JSON file of Builder per-finding resolutions (id -> fixed|deferred|wontfix)")
     s.add_argument("--file", required=True)
     s.set_defaults(func=cmd_verdict)
+
+    s = sub.add_parser("symmetric-verdict")
+    s.add_argument("--run", required=True); s.add_argument("--gate", required=True)
+    s.add_argument("--round", type=int, required=True)
+    s.add_argument("--peer-a", required=True,
+                   help="Peer A attestation JSON (echoes the current bindings; verdict/objections)")
+    s.add_argument("--peer-b", required=True,
+                   help="Peer B attestation JSON (echoes the current bindings; verdict/objections)")
+    s.add_argument("--max-rounds", type=int, default=None,
+                   help="override the round cap; defaults to config max_rounds_plan/max_rounds_dep by gate")
+    s.set_defaults(func=cmd_symmetric_verdict)
+
+    s = sub.add_parser("accepted-findings"); s.add_argument("--run", required=True)
+    s.set_defaults(func=cmd_accepted_findings)
+
+    s = sub.add_parser("review-result"); s.add_argument("--run", required=True)
+    s.set_defaults(func=cmd_review_result)
 
     s = sub.add_parser("bindings"); s.add_argument("--run", required=True); s.add_argument("--gate", required=True)
     s.add_argument("--round", type=int, required=True)

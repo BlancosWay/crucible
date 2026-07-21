@@ -7,6 +7,14 @@
 code may run — PR-URL and diff-file reviews are static/CI-only, and a trusted local checkout executes
 tests/builds only after exact-command consent. See "Execution trust boundary (amendment)" below.
 
+> **Amendment (2026-07-20) — superseded consensus mechanism.** The single serialized **union verdict**
+> and the "reuses the *unmodified* CLI" claim in this document are **historical**. Symmetric gates are
+> now settled by **two separately produced peer attestation files** (`peer-a.json` / `peer-b.json`) via
+> `crucible symmetric-verdict --peer-a --peer-b`; the Approve/Comment/Request-changes recommendation is
+> derived by `crucible review-result`, and FINAL is assembled from `accepted-findings`. The CLI
+> **gained** those symmetric commands (still **no config-schema change**). See the implemented design:
+> [`2026-07-20-symmetric-consensus-design.md`](2026-07-20-symmetric-consensus-design.md).
+
 ## Problem
 
 Crucible ships two skills: `crucible` (asymmetric **Builder → Critic** *construction*) and `deep-dive`
@@ -26,17 +34,20 @@ single-model panel with no consensus, no determinism, and no cross-examination. 
 ## Goal
 
 A new, **independent** skill `skills/pr-review/` that runs a two-model **symmetric** adversarial PR
-review, **without any change** to the existing `crucible`/`deep-dive` skills, the `scripts/crucible/`
-CLI, its config schema, or its tests. It reuses the *unmodified* deterministic CLI for all bookkeeping
-(run init, DAG walk, round counting, consensus, provenance, report), exactly as `deep-dive` does.
+review, **without any change** to the existing `crucible`/`deep-dive` skills or the config schema. It
+reuses the deterministic CLI for all bookkeeping (run init, DAG walk, round counting, consensus,
+provenance, report), exactly as `deep-dive` does. (Amendment 2026-07-20: the two-peer migration later
+added the symmetric `symmetric-verdict` / `accepted-findings` / `review-result` commands — still no
+config-schema change; see the banner above.)
 
 ## Symmetric model (inherited from `deep-dive`)
 
 Two **equal peers**, not Builder/Critic. Peer A = the main session (config `builder` slot / model 1);
 Peer B = a dispatched subagent (config `critic` slot / model 2) — slot names are labels only. Both
-peers review the merged candidate finding set **every round**; one peer serializes the deduped
-**union** of both peers' findings into the single verdict JSON, alternating which peer serializes to
-reduce anchoring; the union is `APPROVE` iff **neither** peer has an open blocking finding.
+peers independently attest to the candidate finding set **every round**: one peer assembles the
+deduped candidate, then each peer writes its **own** attestation file (`peer-a.json` / `peer-b.json`)
+and `crucible symmetric-verdict --peer-a --peer-b` records `CONSENSUS` iff **neither** peer has an open
+blocking objection (originally one serialized *union verdict*; superseded 2026-07-20 — see the banner).
 Consensus is **evidence-grounded, not a vote/average** — a finding survives only with a re-verifiable
 `file:line` citation, and a dispute is settled by **returning to the source**. A blocking peer dispute
 is **never** cleared with `--resolutions`/`wontfix`; it clears by grounded agreement or is surfaced as

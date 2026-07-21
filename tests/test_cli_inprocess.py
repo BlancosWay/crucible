@@ -341,3 +341,59 @@ def test_bound_plan_payload_is_none_without_advance_terminal():
     events = [{"gate": "plan", "event": "builder_output", "round": 1, "payload": "X",
                "artifact_sha256": "a" * 64}]
     assert _bound_plan_payload(events) is None
+
+
+# --- symmetric-verdict routing + atomic decision (in-process) ----------------
+
+def _init_workflow(tmp_path, workflow) -> str:
+    rc = main(["init-run", "--goal", "g", "--base-dir", str(tmp_path), "--workflow", workflow])
+    assert rc == 0
+    runs = [p for p in Path(tmp_path).iterdir() if p.is_dir()]
+    assert len(runs) == 1
+    return str(runs[0])
+
+
+def _peer(tmp_path, slot, gate, round_index, binding, name, verdict="APPROVE", objections=None):
+    return _write(tmp_path, name, {
+        "peer": slot, "gate": gate, "round": round_index, "verdict": verdict,
+        "summary": "s", "objections": objections or [], **binding,
+    })
+
+
+def test_verdict_rejects_symmetric_run_inprocess(tmp_path):
+    run = _init_workflow(tmp_path, "deep-dive")
+    vfile = _write(tmp_path, "v.json", {"gate": "plan", "round": 1, "verdict": "APPROVE",
+                                        "summary": "", "findings": []})
+    with pytest.raises(SystemExit, match="symmetric-verdict"):
+        main(["verdict", "--run", run, "--gate", "plan", "--round", "1", "--file", vfile])
+
+
+def test_symmetric_verdict_rejects_build_inprocess(tmp_path):
+    run = _init(tmp_path)  # build workflow
+    a = _peer(tmp_path, "A", "plan", 1, {}, "a.json")
+    b = _peer(tmp_path, "B", "plan", 1, {}, "b.json")
+    with pytest.raises(SystemExit, match="build"):
+        main(["symmetric-verdict", "--run", run, "--gate", "plan", "--round", "1",
+              "--peer-a", a, "--peer-b", b])
+
+
+def test_symmetric_verdict_plan_consensus_inprocess(tmp_path, capsys):
+    run = _init_workflow(tmp_path, "pr-review")
+    r = RunLog(run)
+    r.save_dag(DAG.from_dict({"nodes": [{"id": "a", "title": "A", "description": "",
+               "files": [], "test_plan": "", "status": "pending"}], "edges": []}).to_dict())
+    body = b"# investigation plan"
+    r.append("builder_output", gate="plan", round=1, payload=body.decode("utf-8"),
+             artifact_sha256=artifact_sha256(body))
+    binding = current_bindings(r, "plan", 1).to_dict()
+    capsys.readouterr()
+    a = _peer(tmp_path, "A", "plan", 1, binding, "a.json")
+    b = _peer(tmp_path, "B", "plan", 1, binding, "b.json")
+    rc = main(["symmetric-verdict", "--run", run, "--gate", "plan", "--round", "1",
+               "--peer-a", a, "--peer-b", b])
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == "CONSENSUS"
+    events = r.read_events()
+    sym = [e for e in events if e["event"] == "symmetric_verdict"]
+    assert len(sym) == 1 and sym[0]["peers"]["A"]["attestation"]["verdict"] == "APPROVE"
+    assert any(e["event"] == "gate_consensus" and e.get("gate") == "plan" for e in events)

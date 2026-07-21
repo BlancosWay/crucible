@@ -111,10 +111,14 @@ two-model **symmetric** adversarial *investigation* rather than construction. Tw
 (no Builder/Critic asymmetry) each interrogate the actual code or data independently, cross-examine
 each other, and converge on an **evidence-grounded consensus finding set** (each finding cites a
 re-verifiable `file:line` / data locator; disputes are settled by returning to the source, never by a
-vote or an average). It **reuses the same deterministic `crucible` CLI** with no config-schema change
-— each round both peers review the merged set and the recorded verdict is the union of their
-findings. See [`skills/deep-dive/SKILL.md`](skills/deep-dive/SKILL.md) and its design in
-[`docs/superpowers/specs/2026-07-15-deep-dive-skill-design.md`](docs/superpowers/specs/2026-07-15-deep-dive-skill-design.md).
+vote or an average). It **reuses the same deterministic `crucible` CLI** (initialized with `--workflow
+deep-dive`; each round both peers independently attest in their own `peer-a.json` / `peer-b.json` and
+`crucible symmetric-verdict` decides, and the finding set is assembled by `accepted-findings` /
+`review-result` — no config-schema change). See [`skills/deep-dive/SKILL.md`](skills/deep-dive/SKILL.md)
+and its design in
+[`docs/superpowers/specs/2026-07-15-deep-dive-skill-design.md`](docs/superpowers/specs/2026-07-15-deep-dive-skill-design.md)
+(two-peer consensus:
+[`docs/superpowers/specs/2026-07-20-symmetric-consensus-design.md`](docs/superpowers/specs/2026-07-20-symmetric-consensus-design.md)).
 
 ### Companion skill: `pr-review`
 
@@ -122,9 +126,11 @@ The repo also ships an independent third skill, **`pr-review`** (`/pr-review <pr
 two-model **symmetric** adversarial *review* of a pull request. Two **equal peers** (no Builder/Critic
 asymmetry) review a **GitHub PR** (via `gh`) or a **local diff** independently against the real code,
 cross-examine, and converge on an **evidence-grounded consensus finding set** plus a **derived**
-Approve/Comment/Request-changes recommendation. It **reuses the same deterministic `crucible` CLI**
-with no config-schema change, and is **read-only** over the target by default (posting the review to
-the PR happens only for a GitHub PR, only after consensus, and only with your explicit OK).
+Approve/Comment/Request-changes recommendation (computed by `crucible review-result`). It **reuses the
+same deterministic `crucible` CLI** (initialized with `--workflow pr-review`; each round both peers
+independently attest in their own `peer-a.json` / `peer-b.json` and `crucible symmetric-verdict`
+decides — no config-schema change), and is **read-only** over the target by default (posting the review
+to the PR happens only for a GitHub PR, only after consensus, and only with your explicit OK).
 **Execution safety:** reviewed code is untrusted, so a PR-URL and a diff-file review are
 **static/CI-only** and never execute locally; running tests or builds is available only for a
 **trusted local checkout**, after explicit execution **consent** to the exact commands (with an

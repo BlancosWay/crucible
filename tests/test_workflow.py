@@ -26,6 +26,29 @@ from crucible.workflow import (
 )
 
 
+def _peers(gate, rnd, bindings, outer_objs=()):
+    """A valid persisted A/B peers object matching the CLI write path (round-9): each slot carries its
+    configured model/effort, a `raw` JSON string, and a parsed `attestation` bound to the decision;
+    peer objections are the outer namespaced aggregate de-namespaced to their slot, with a consistent
+    verdict."""
+    from crucible.symmetric import peer_slot_provenance
+    prov = peer_slot_provenance(Config.from_dict({}))
+    per = {"A": [], "B": []}
+    for o in outer_objs:
+        slot, _, base = str(o["id"]).partition(":")
+        if slot in per:
+            per[slot].append({**o, "id": base})
+    peers = {}
+    for slot in ("A", "B"):
+        objs = per[slot]
+        has_blocking = any(o["severity"] in ("blocker", "major") for o in objs)
+        att = {"peer": slot, "gate": gate, "round": rnd,
+               "verdict": "REQUEST_CHANGES" if has_blocking else "APPROVE",
+               "summary": f"peer {slot} review", "objections": objs, **bindings}
+        peers[slot] = {**prov[slot], "raw": json.dumps(att), "attestation": att}
+    return peers
+
+
 def _dag(files=None, status="pending"):
     """A one-node ('a') DAG; ``files`` varies the immutable definition so its digest changes."""
     return DAG.from_dict({
@@ -437,3 +460,720 @@ def test_workflow_issues_allows_approval_before_dependency_work(tmp_path):
     run.append("plan_approved", gate="plan", artifact_sha256=artifact, dag_sha256=dag_hash)
     _bind_dep_a(run, dag)
     assert workflow_issues(run.read_events(), dag, cfg) == []
+
+
+# --- symmetric accepted-finding-set integrity (Task 3) -----------------------
+
+def _af(source_gate="dep:a", fid="F1", severity="major"):
+    return {"source_gate": source_gate, "id": fid, "severity": severity,
+            "location": "src/a.py:1", "claim": "c", "suggestion": "s"}
+
+
+def _symmetric_run(tmp_path, *, accepted="valid", final=None, verdict="match", plan="valid"):
+    """A pr-review run with one done node 'a' backed by a symmetric dependency gate, plus optional
+    FINAL. ``accepted`` selects a dependency accepted-set fault: ``"valid"``, ``"binding"`` (its
+    bindings differ from the terminal), or ``"malformed"`` (its payload is not a valid finding set).
+    ``verdict`` selects a peer-decision fault: ``"match"`` (the symmetric_verdict binds the same
+    artifact/DAG/node as the accepted set + terminal) or ``"mismatch"`` (it binds a different
+    artifact, so the accepted result is not the candidate the peers reviewed).
+    ``final`` selects the FINAL accepted-set inclusion: ``None`` (no FINAL gate), ``"valid"`` (adds a
+    ``source_gate: final`` extra), or ``"drops"`` (omits the accepted dependency finding).
+    ``plan`` selects the symmetric PLAN attestation: ``"valid"`` (a bound symmetric_verdict backs the
+    accepted PLAN terminal), ``"bare"`` (a terminal with no symmetric_verdict), ``"critic"`` (a
+    build-style critic_verdict instead of two-peer), ``"wrong_round"``/``"wrong_bindings"``/
+    ``"wrong_outcome"`` (a symmetric_verdict that does not correspond to the terminal)."""
+    cfg = Config.from_dict({"final_review": final is not None})
+    run = init_run("sym", cfg, base_dir=tmp_path, workflow="pr-review")
+    dag = _dag(status="done")
+    run.save_dag(dag.to_dict())
+    dsha, nsha = dag_sha256(dag), node_sha256(dag, "a")
+
+    plan_art = artifact_sha256(b"plan")
+    run.append("builder_output", gate="plan", round=1, payload="plan", artifact_sha256=plan_art)
+    plan_bind = {"artifact_sha256": plan_art, "dag_sha256": dsha}
+    if plan == "critic":
+        run.append("critic_verdict", gate="plan", round=1, verdict="APPROVE", **plan_bind)
+    elif plan != "bare":
+        v_round = 2 if plan == "wrong_round" else 1
+        v_bind = ({**plan_bind, "artifact_sha256": "7" * 64} if plan == "wrong_bindings"
+                  else plan_bind)
+        v_outcome = "CHANGES" if plan == "wrong_outcome" else "CONSENSUS"
+        run.append("symmetric_verdict", gate="plan", round=v_round, outcome=v_outcome,
+                   objections=[], peers=_peers("plan", v_round, v_bind), **v_bind)
+    run.append("gate_consensus", gate="plan", round=1, **plan_bind)
+
+    candidate = {"summary": "", "findings": [_af("dep:a", "F1")]}
+    cand_text = json.dumps(candidate)
+    cand_art = artifact_sha256(cand_text.encode("utf-8"))
+    dep_bind = {"artifact_sha256": cand_art, "dag_sha256": dsha, "node_sha256": nsha}
+    run.append("builder_output", gate="dep:a", round=1, payload=cand_text, artifact_sha256=cand_art)
+    ver_bind = dep_bind if verdict == "match" else {**dep_bind, "artifact_sha256": "9" * 64}
+    run.append("symmetric_verdict", gate="dep:a", round=1, outcome="CONSENSUS", objections=[],
+               peers=_peers("dep:a", 1, ver_bind), candidate=candidate, **ver_bind)
+    acc_bind = dep_bind if accepted != "binding" else {**dep_bind, "artifact_sha256": "0" * 64}
+    acc_payload = candidate if accepted != "malformed" else {"findings": "not-a-list"}
+    run.append("accepted_finding_set", gate="dep:a", round=1, payload=acc_payload, **acc_bind)
+    run.append("gate_consensus", gate="dep:a", round=1, **dep_bind)
+    run.append("node_status_change", node="a", status="done")
+
+    if final is not None:
+        if final == "drops":
+            final_findings = [_af("final", "C1", "nit")]  # drops the accepted dependency finding
+        else:
+            final_findings = [_af("dep:a", "F1"), _af("final", "C1", "nit")]
+        final_payload = {"summary": "", "findings": final_findings}
+        final_text = json.dumps(final_payload)
+        final_art = artifact_sha256(final_text.encode("utf-8"))
+        fbind = {"artifact_sha256": final_art, "dag_sha256": dsha}
+        run.append("builder_output", gate="final", round=1, payload=final_text,
+                   artifact_sha256=final_art)
+        run.append("symmetric_verdict", gate="final", round=1, outcome="CONSENSUS", objections=[],
+                   peers=_peers("final", 1, fbind), candidate=final_payload, **fbind)
+        run.append("accepted_finding_set", gate="final", round=1, payload=final_payload, **fbind)
+        run.append("gate_consensus", gate="final", round=1, **fbind)
+
+    return run, dag, cfg
+
+
+def test_workflow_issues_clean_for_valid_symmetric_run_with_final(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid", final="valid")
+    assert workflow_issues(run.read_events(), dag, cfg) == []
+
+
+def test_workflow_issues_flags_symmetric_binding_mismatched_accepted_set(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="binding")
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "invalid" and "dep:a" in i.message for i in issues)
+
+
+def test_workflow_issues_flags_symmetric_peer_decision_binding_mismatch(tmp_path):
+    # F1: the symmetric_verdict (the two peers' decision) binds a different artifact than the
+    # accepted set + terminal it brackets, so the accepted result is not the reviewed candidate.
+    run, dag, cfg = _symmetric_run(tmp_path, verdict="mismatch")
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "invalid" and "dep:a" in i.message for i in issues)
+
+
+def test_workflow_issues_flags_symmetric_malformed_accepted_set(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="malformed")
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "invalid" for i in issues)
+
+
+def test_workflow_issues_flags_symmetric_final_inclusion_violation(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid", final="drops")
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "invalid" and "final" in i.message.lower() for i in issues)
+
+
+def _corrupt_dep_trio(events, corruption):
+    """Return a copy of a valid symmetric run's events with the ``dep:a`` atomic trio corrupted.
+
+    ``duplicate`` inserts a SECOND pre-terminal accepted set (distinct id); ``nonimmediate`` inserts
+    a mismatched ``symmetric_verdict`` immediately before the accepted set (a matching decision then a
+    later mismatched one); ``intervening`` inserts an extra ``symmetric_verdict`` between the accepted
+    set and its terminal. Each breaks the exact ``symmetric_verdict -> accepted_finding_set ->
+    terminal`` adjacency for the same gate/round.
+    """
+    events = [dict(e) for e in events]
+    acc_idx = next(i for i, e in enumerate(events)
+                   if e.get("event") == "accepted_finding_set" and e.get("gate") == "dep:a")
+    term_idx = next(i for i, e in enumerate(events)
+                    if e.get("event") == "gate_consensus" and e.get("gate") == "dep:a")
+    sv = next(e for e in events
+              if e.get("event") == "symmetric_verdict" and e.get("gate") == "dep:a")
+    if corruption == "duplicate":
+        dup = dict(events[acc_idx])
+        dup["payload"] = {"summary": "", "findings": [_af("dep:a", "F2")]}
+        events.insert(term_idx, dup)  # two accepted sets before the terminal (distinct ids)
+    elif corruption == "nonimmediate":
+        mismatched = dict(sv)
+        mismatched["artifact_sha256"] = "9" * 64
+        events.insert(acc_idx, mismatched)  # matching sv, then mismatched sv, then accepted set
+    elif corruption == "intervening":
+        events.insert(term_idx, dict(sv))  # an extra verdict between the accepted set and terminal
+    return events
+
+
+def test_workflow_issues_clean_for_valid_symmetric_dependency_only(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    assert workflow_issues(run.read_events(), dag, cfg) == []
+
+
+def test_workflow_issues_flags_two_pre_terminal_accepted_sets(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    events = _corrupt_dep_trio(run.read_events(), "duplicate")
+    issues = workflow_issues(events, dag, cfg)
+    assert any(i.kind == "invalid" and "dep:a" in i.message for i in issues)
+
+
+def test_workflow_issues_flags_non_immediate_peer_decision(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    events = _corrupt_dep_trio(run.read_events(), "nonimmediate")
+    issues = workflow_issues(events, dag, cfg)
+    assert any(i.kind == "invalid" and "dep:a" in i.message for i in issues)
+
+
+def test_workflow_issues_flags_intervening_protocol_event(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    events = _corrupt_dep_trio(run.read_events(), "intervening")
+    issues = workflow_issues(events, dag, cfg)
+    assert any(i.kind == "invalid" and "dep:a" in i.message for i in issues)
+
+
+def _forge_trio(run, gate, findings, bindings):
+    """Append a fully bound-looking ``symmetric_verdict -> accepted_finding_set -> gate_consensus``
+    trio for ``gate`` (the corrupt history a real CLI write path never produces)."""
+    payload = {"summary": "", "findings": findings}
+    run.append("symmetric_verdict", gate=gate, round=1, outcome="CONSENSUS", objections=[],
+               candidate=payload, **bindings)
+    run.append("accepted_finding_set", gate=gate, round=1, payload=payload, **bindings)
+    run.append("gate_consensus", gate=gate, round=1, **bindings)
+
+
+def test_workflow_issues_flags_out_of_scope_dependency_accepted_set(tmp_path):
+    # Round-3 F2: a fully bound-looking dep:ghost trio whose node is absent from the current DAG must
+    # be flagged invalid — never silently accepted — even though every current node is valid.
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")  # one done node 'a', final_review off
+    _forge_trio(run, "dep:ghost", [_af("dep:ghost", "G1")],
+                {"artifact_sha256": "e" * 64, "dag_sha256": dag_sha256(dag), "node_sha256": "f" * 64})
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "invalid" and "ghost" in i.message for i in issues)
+
+
+def test_workflow_issues_flags_final_trio_when_final_review_disabled(tmp_path):
+    # Round-3 F1: final_review is off, but a valid-looking FINAL trio was forged into the log. FINAL
+    # is not part of this run's configured workflow, so its terminal is a configured-forbidden phase
+    # (mirrors the disabled-REPRODUCE rule) — workflow invalid.
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")  # final_review off, no FINAL
+    assert cfg.final_review is False
+    _forge_trio(run, "final", [_af("dep:a", "F1"), _af("final", "C1", "nit")],
+                {"artifact_sha256": "c" * 64, "dag_sha256": dag_sha256(dag)})
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "invalid" and "final" in i.message.lower() for i in issues)
+
+
+def _forge_objection_gate(run, gate, terminal, objections, bindings):
+    """Append a forged ``symmetric_verdict -> capped/proceeded terminal`` pair carrying objections
+    but NO accepted set (a CAPPED halt persists no accepted set) — the out-of-scope history a real
+    CLI write path never produces. ``terminal`` is ``gate_capped`` or ``gate_proceeded_with_flags``."""
+    outcome = "PROCEED_WITH_FLAGS" if terminal == "gate_proceeded_with_flags" else "CAPPED"
+    run.append("symmetric_verdict", gate=gate, round=1, outcome=outcome, objections=objections,
+               candidate={"summary": "", "findings": []}, **bindings)
+    run.append(terminal, gate=gate, round=1, open_findings=[o["id"] for o in objections], **bindings)
+
+
+def _obj(oid="A:G1", severity="blocker"):
+    return {"id": oid, "severity": severity, "location": "candidate:F1", "claim": "c",
+            "suggestion": "s"}
+
+
+def test_workflow_issues_flags_out_of_scope_capped_dependency_gate(tmp_path):
+    # Round-4: a forged dep:ghost gate that CAPS with a blocking objection but persists NO accepted
+    # set. The accepted-set scope guard would miss it (no accepted set); the protocol-wide guard flags
+    # it invalid so an out-of-scope objection can never reach the recommendation.
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")  # one done node 'a', final_review off
+    _forge_objection_gate(run, "dep:ghost", "gate_capped", [_obj("A:G1", "blocker")],
+                          {"artifact_sha256": "e" * 64, "dag_sha256": dag_sha256(dag),
+                           "node_sha256": "f" * 64})
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "invalid" and "ghost" in i.message for i in issues)
+
+
+def test_workflow_issues_flags_out_of_scope_proceeded_dependency_gate(tmp_path):
+    # Round-4: same, but the forged out-of-scope ghost gate PROCEEDS WITH FLAGS.
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    _forge_objection_gate(run, "dep:ghost", "gate_proceeded_with_flags", [_obj("A:G1", "blocker")],
+                          {"artifact_sha256": "e" * 64, "dag_sha256": dag_sha256(dag),
+                           "node_sha256": "f" * 64})
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "invalid" and "ghost" in i.message for i in issues)
+
+
+# --- round-5 F1: a same-gate symmetric protocol event after the authoritative terminal is invalid ---
+
+def _copy_bindings(events, gate):
+    """The artifact/DAG/node bindings recorded on ``gate``'s symmetric_verdict, for forging residue."""
+    sv = next(e for e in events
+              if e.get("event") == "symmetric_verdict" and e.get("gate") == gate)
+    return {k: sv[k] for k in ("artifact_sha256", "dag_sha256", "node_sha256") if k in sv}
+
+
+def test_workflow_issues_flags_post_terminal_symmetric_verdict(tmp_path):
+    # A valid complete symmetric run, then a forged post-terminal symmetric_verdict for the same dep
+    # gate/round. A same-gate protocol event after the authoritative terminal can rewrite the gate's
+    # unresolved objections, so it is invalid history — not only a post-terminal accepted set.
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    bind = _copy_bindings(run.read_events(), "dep:a")
+    run.append("symmetric_verdict", gate="dep:a", round=1, outcome="CONSENSUS", objections=[],
+               candidate={"summary": "", "findings": []}, **bind)
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "invalid" and "dep:a" in i.message for i in issues)
+
+
+def test_workflow_issues_flags_post_terminal_accepted_set_as_residue(tmp_path):
+    # The accepted-set variant of the same rule: an accepted_finding_set appended after the gate's
+    # authoritative terminal is post-terminal residue (invalid), never accepted state.
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    bind = _copy_bindings(run.read_events(), "dep:a")
+    run.append("accepted_finding_set", gate="dep:a", round=1,
+               payload={"summary": "", "findings": []}, **bind)
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "invalid" and "dep:a" in i.message for i in issues)
+
+
+# --- round-5 F3: an arbitrary non-schema gate carrying symmetric protocol events is out of scope ---
+
+def test_workflow_issues_flags_arbitrary_symmetric_gate(tmp_path):
+    # A forged symmetric_verdict + capped terminal for an arbitrary gate name (sidequest) carrying a
+    # blocker. It is not plan / an in-scope dep / the enabled FINAL gate, so it is out of scope and
+    # flagged invalid before its objection can reach the recommendation.
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    _forge_objection_gate(run, "sidequest", "gate_capped", [_obj("A:S1", "blocker")],
+                          {"artifact_sha256": "e" * 64, "dag_sha256": dag_sha256(dag),
+                           "node_sha256": "f" * 64})
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "invalid" and "sidequest" in i.message for i in issues)
+
+
+def test_workflow_issues_flags_reproduce_symmetric_protocol_event(tmp_path):
+    # Symmetric protocols have no reproduce gate; a forged reproduce symmetric_verdict + capped
+    # terminal is out of scope for a symmetric run and flagged invalid.
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    _forge_objection_gate(run, "reproduce", "gate_capped", [_obj("A:R1", "blocker")],
+                          {"artifact_sha256": "e" * 64, "dag_sha256": dag_sha256(dag),
+                           "node_sha256": "f" * 64})
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "invalid" and "reproduce" in i.message.lower() for i in issues)
+
+
+# --- round-7 F1: an accepted DEPENDENCY set whose finding is attributed to another gate is invalid ---
+
+def test_workflow_issues_flags_mis_scoped_dependency_finding(tmp_path):
+    # A valid dep:a trio, but its accepted set attributes its finding to source_gate "final" — a
+    # forged dep:auth set injecting a FINAL/ghost finding. workflow_issues must surface it as invalid
+    # (reusing FindingSet.validate_for_gate), never leave the run CLEAN.
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    events = run.read_events()
+    for e in events:
+        if e.get("event") == "accepted_finding_set" and e.get("gate") == "dep:a":
+            e["payload"]["findings"][0]["source_gate"] = "final"
+    issues = workflow_issues(events, dag, cfg)
+    assert any(i.kind == "invalid" and "dep:a" in i.message for i in issues)
+
+
+def test_workflow_issues_flags_mis_scoped_dependency_finding_ghost(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    events = run.read_events()
+    for e in events:
+        if e.get("event") == "accepted_finding_set" and e.get("gate") == "dep:a":
+            e["payload"]["findings"][0]["source_gate"] = "dep:ghost"
+    issues = workflow_issues(events, dag, cfg)
+    assert any(i.kind == "invalid" and "dep:a" in i.message for i in issues)
+
+
+# --- round-7 F2: a FINAL symmetric protocol event while final_review is disabled is invalid --------
+#
+# The earlier terminal-only check only sees a FINAL *terminal*. A FINAL symmetric_verdict or
+# accepted_finding_set WITHOUT a terminal (verdict-only / accepted-set-only residue) evaded it while
+# _symmetric_accepted_set_issues unconditionally skipped out-of-scope `final`, leaving the run CLEAN.
+
+def test_workflow_issues_flags_disabled_final_verdict_only_residue(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")  # final_review off, no FINAL
+    assert cfg.final_review is False
+    run.append("symmetric_verdict", gate="final", round=1, outcome="CONSENSUS", objections=[],
+               candidate={"summary": "", "findings": []},
+               artifact_sha256="e" * 64, dag_sha256=dag_sha256(dag))
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "invalid" and "final" in i.message.lower() for i in issues)
+
+
+def test_workflow_issues_flags_disabled_final_accepted_set_only_residue(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")  # final_review off, no FINAL
+    assert cfg.final_review is False
+    run.append("accepted_finding_set", gate="final", round=1,
+               payload={"summary": "", "findings": []},
+               artifact_sha256="e" * 64, dag_sha256=dag_sha256(dag))
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "invalid" and "final" in i.message.lower() for i in issues)
+
+
+def test_workflow_issues_clean_when_final_review_disabled_and_no_final_events(tmp_path):
+    # Guard against over-flagging: a valid final_review=off run with NO final protocol events stays
+    # CLEAN (the disabled-FINAL rule only fires on an actual FINAL protocol event).
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    assert cfg.final_review is False
+    assert workflow_issues(run.read_events(), dag, cfg) == []
+
+
+# --- round-8 F3: a symmetric PLAN accepted terminal must be backed by a two-peer symmetric_verdict ---
+
+def _dep_gate_bindings_w(events, gate):
+    sv = next(e for e in events
+              if e.get("event") == "symmetric_verdict" and e.get("gate") == gate)
+    return {k: sv[k] for k in ("artifact_sha256", "dag_sha256", "node_sha256") if k in sv}
+
+
+@pytest.mark.parametrize("plan", ["bare", "critic", "wrong_round", "wrong_bindings", "wrong_outcome"])
+def test_workflow_issues_flags_unattested_symmetric_plan(tmp_path, plan):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid", plan=plan)
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "invalid" and "plan" in i.message.lower() for i in issues), \
+        [(i.kind, i.message) for i in issues]
+
+
+def test_workflow_issues_clean_for_valid_symmetric_plan(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid", plan="valid")
+    assert workflow_issues(run.read_events(), dag, cfg) == []
+
+
+# --- F2: a symmetric PLAN gate never persists an accepted finding set ----------------------------
+
+def _plan_bindings_w(events):
+    sv = next(e for e in events
+              if e.get("event") == "symmetric_verdict" and e.get("gate") == "plan")
+    return {k: sv[k] for k in ("artifact_sha256", "dag_sha256", "node_sha256") if k in sv}
+
+
+def _inject_plan_accepted_set(events, placement):
+    """Return a copy of a valid symmetric run's events with a forged PLAN accepted_finding_set added at
+    ``placement``: ``"before"`` (before the plan decision), ``"between"`` (between the plan decision
+    and its terminal — an otherwise-valid trio), or ``"after"`` (after the plan terminal)."""
+    events = [dict(e) for e in events]
+    acc = {"event": "accepted_finding_set", "gate": "plan", "round": 1,
+           "payload": {"summary": "", "findings": []}, **_plan_bindings_w(events)}
+    sv_idx = next(i for i, e in enumerate(events)
+                  if e.get("event") == "symmetric_verdict" and e.get("gate") == "plan")
+    term_idx = next(i for i, e in enumerate(events)
+                    if e.get("event") == "gate_consensus" and e.get("gate") == "plan")
+    if placement == "before":
+        events.insert(sv_idx, acc)
+    elif placement == "between":
+        events.insert(term_idx, acc)
+    else:  # after
+        events.insert(term_idx + 1, acc)
+    return events
+
+
+@pytest.mark.parametrize("placement", ["before", "between", "after"])
+def test_workflow_issues_flags_plan_accepted_finding_set(tmp_path, placement):
+    # A symmetric PLAN advances on a two-peer decision and NEVER persists an accepted finding set. Any
+    # PLAN accepted set (any placement) is forged history workflow_issues must flag invalid — and the
+    # forged set must not make the PLAN attestation appear valid.
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid", plan="valid")
+    events = _inject_plan_accepted_set(run.read_events(), placement)
+    issues = workflow_issues(events, dag, cfg)
+    assert any(i.kind == "invalid" and "plan" in i.message.lower()
+               and "accepted finding set" in i.message.lower() for i in issues), \
+        [(i.kind, i.message) for i in issues]
+
+
+def test_workflow_issues_flags_orphan_plan_accepted_finding_set(tmp_path):
+    # A PLAN accepted set with no PLAN terminal at all (orphan) is also forged history — flagged even
+    # though the run's PLAN is otherwise "missing" (in progress).
+    run, dag, cfg = _symmetric_no_plan(tmp_path)
+    run.append("accepted_finding_set", gate="plan", round=1,
+               payload={"summary": "", "findings": []},
+               artifact_sha256="a" * 64, dag_sha256=dag_sha256(dag))
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "invalid" and "plan" in i.message.lower()
+               and "accepted finding set" in i.message.lower() for i in issues)
+
+
+# --- F1: corrupt run workflow metadata fails workflow_issues closed without crashing -------------
+
+@pytest.mark.parametrize("bad", [None, 123, "bogus"])
+def test_workflow_issues_flags_corrupt_workflow_metadata(tmp_path, bad):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    events = run.read_events()
+    for e in events:
+        if e.get("event") == "run_start":
+            e["workflow"] = bad  # present but null/non-string/unrecognized => corrupt
+    issues = workflow_issues(events, dag, cfg)  # must not raise
+    assert issues
+    assert all(i.kind == "invalid" for i in issues)
+    assert any("workflow" in i.message.lower() and "corrupt" in i.message.lower() for i in issues)
+
+
+def test_workflow_issues_absent_workflow_reads_as_build(tmp_path):
+    # Regression guard: an ABSENT workflow key stays build (legacy readability) and is NOT treated as
+    # corrupt — a build run with a clean PLAN + dep stays CLEAN.
+    cfg = Config.from_dict({"final_review": False})
+    run = init_run("g", cfg, base_dir=tmp_path)  # default build workflow
+    dag = _dag(status="done")
+    _bind_plan(run, dag)
+    _bind_dep_a(run, dag)
+    run.append("node_status_change", node="a", status="done")
+    events = [dict(e) for e in run.read_events()]
+    for e in events:
+        if e.get("event") == "run_start":
+            e.pop("workflow", None)  # legacy schema-v2 metadata: the field predates the run
+    assert workflow_issues(events, dag, cfg) == []
+
+
+def test_workflow_issues_build_plan_critic_verdict_unchanged(tmp_path):
+    # F3 must not touch the asymmetric build workflow: a build run's PLAN is a critic_verdict +
+    # terminal and stays CLEAN (the symmetric attestation rule is symmetric-only).
+    cfg = Config.from_dict({"final_review": False})
+    run = init_run("g", cfg, base_dir=tmp_path)  # default = build workflow
+    dag = _dag(status="done")
+    _bind_plan(run, dag)
+    _bind_dep_a(run, dag)
+    run.append("node_status_change", node="a", status="done")
+    assert workflow_issues(run.read_events(), dag, cfg) == []
+
+
+# --- round-8 F2: symmetric protocol integrity still runs when PLAN is missing --------------------
+
+def _symmetric_no_plan(tmp_path):
+    """A pr-review run whose PLAN never reached a terminal (no plan events at all)."""
+    cfg = Config.from_dict({"final_review": False})
+    run = init_run("sym", cfg, base_dir=tmp_path, workflow="pr-review")
+    dag = _dag(status="pending")
+    run.save_dag(dag.to_dict())
+    return run, dag, cfg
+
+
+def test_workflow_issues_flags_arbitrary_residue_when_plan_missing(tmp_path):
+    run, dag, cfg = _symmetric_no_plan(tmp_path)
+    _forge_objection_gate(run, "sidequest", "gate_capped", [_obj("A:S1", "blocker")],
+                          {"artifact_sha256": "e" * 64, "dag_sha256": dag_sha256(dag),
+                           "node_sha256": "f" * 64})
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "missing" and "PLAN" in i.message for i in issues)
+    assert any(i.kind == "invalid" and "sidequest" in i.message for i in issues)
+
+
+def test_workflow_issues_flags_ghost_dep_residue_when_plan_missing(tmp_path):
+    run, dag, cfg = _symmetric_no_plan(tmp_path)
+    _forge_objection_gate(run, "dep:ghost", "gate_proceeded_with_flags", [_obj("A:G1", "blocker")],
+                          {"artifact_sha256": "e" * 64, "dag_sha256": dag_sha256(dag),
+                           "node_sha256": "f" * 64})
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "invalid" and "ghost" in i.message for i in issues)
+
+
+def test_workflow_issues_flags_disabled_final_residue_when_plan_missing(tmp_path):
+    run, dag, cfg = _symmetric_no_plan(tmp_path)  # final_review off
+    run.append("symmetric_verdict", gate="final", round=1, outcome="CONSENSUS", objections=[],
+               candidate={"summary": "", "findings": []},
+               artifact_sha256="e" * 64, dag_sha256=dag_sha256(dag))
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "invalid" and "final" in i.message.lower() for i in issues)
+
+
+def test_workflow_issues_flags_disabled_final_terminal_when_plan_missing(tmp_path):
+    run, dag, cfg = _symmetric_no_plan(tmp_path)  # final_review off
+    fb = {"artifact_sha256": "e" * 64, "dag_sha256": dag_sha256(dag)}
+    run.append("symmetric_verdict", gate="final", round=1, outcome="CONSENSUS", objections=[],
+               candidate={"summary": "", "findings": []}, **fb)
+    run.append("accepted_finding_set", gate="final", round=1,
+               payload={"summary": "", "findings": []}, **fb)
+    run.append("gate_consensus", gate="final", round=1, **fb)
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "invalid" and "final" in i.message.lower() for i in issues)
+
+
+# --- round-8 F4: decision outcome must match its terminal (dep/final trio) -----------------------
+
+def _find_ev(events, event, gate):
+    return next(e for e in events if e.get("event") == event and e.get("gate") == gate)
+
+
+def test_workflow_issues_flags_consensus_terminal_with_proceed_verdict(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    events = run.read_events()
+    _find_ev(events, "symmetric_verdict", "dep:a")["outcome"] = "PROCEED_WITH_FLAGS"
+    issues = workflow_issues(events, dag, cfg)
+    assert any(i.kind == "invalid" and "dep:a" in i.message for i in issues)
+
+
+def test_workflow_issues_flags_consensus_terminal_with_changes_verdict(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    events = run.read_events()
+    _find_ev(events, "symmetric_verdict", "dep:a")["outcome"] = "CHANGES"
+    issues = workflow_issues(events, dag, cfg)
+    assert any(i.kind == "invalid" and "dep:a" in i.message for i in issues)
+
+
+def test_workflow_issues_flags_proceeded_terminal_with_consensus_verdict(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    events = run.read_events()
+    term = _find_ev(events, "gate_consensus", "dep:a")
+    term["event"] = "gate_proceeded_with_flags"
+    term["open_findings"] = []
+    issues = workflow_issues(events, dag, cfg)
+    assert any(i.kind == "invalid" and "dep:a" in i.message for i in issues)
+
+
+# --- round-8 F1: decision objections must be blocking and match the terminal's open_findings -----
+
+def test_workflow_issues_flags_proceeded_with_only_nonblocking_objection(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    events = run.read_events()
+    sv = _find_ev(events, "symmetric_verdict", "dep:a")
+    sv["outcome"] = "PROCEED_WITH_FLAGS"
+    sv["objections"] = [_obj("A:m", "minor")]
+    acc = _find_ev(events, "accepted_finding_set", "dep:a")
+    acc["accepted_with_flags"] = True
+    acc["open_objections"] = ["A:m"]
+    term = _find_ev(events, "gate_consensus", "dep:a")
+    term["event"] = "gate_proceeded_with_flags"
+    term["open_findings"] = ["A:m"]
+    issues = workflow_issues(events, dag, cfg)
+    assert any(i.kind == "invalid" and "dep:a" in i.message for i in issues)
+
+
+def test_workflow_issues_flags_consensus_decision_with_objections(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    events = run.read_events()
+    _find_ev(events, "symmetric_verdict", "dep:a")["objections"] = [_obj("A:x", "blocker")]
+    issues = workflow_issues(events, dag, cfg)
+    assert any(i.kind == "invalid" and "dep:a" in i.message for i in issues)
+
+
+def test_workflow_issues_flags_proceeded_open_findings_mismatch(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    events = run.read_events()
+    sv = _find_ev(events, "symmetric_verdict", "dep:a")
+    sv["outcome"] = "PROCEED_WITH_FLAGS"
+    sv["objections"] = [_obj("A:b", "blocker")]
+    acc = _find_ev(events, "accepted_finding_set", "dep:a")
+    acc["accepted_with_flags"] = True
+    acc["open_objections"] = ["A:b"]
+    term = _find_ev(events, "gate_consensus", "dep:a")
+    term["event"] = "gate_proceeded_with_flags"
+    term["open_findings"] = ["A:DIFFERENT"]  # does not match the decision's objection ids
+    issues = workflow_issues(events, dag, cfg)
+    assert any(i.kind == "invalid" and "dep:a" in i.message for i in issues)
+
+
+def test_workflow_issues_flags_proceeded_nonblocking_under_custom_severities(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    cfg = Config.from_dict({"final_review": False, "blocking_severities": ["blocker"]})
+    events = run.read_events()
+    sv = _find_ev(events, "symmetric_verdict", "dep:a")
+    sv["outcome"] = "PROCEED_WITH_FLAGS"
+    sv["objections"] = [_obj("A:maj", "major")]  # major is NOT blocking here
+    acc = _find_ev(events, "accepted_finding_set", "dep:a")
+    acc["accepted_with_flags"] = True
+    acc["open_objections"] = ["A:maj"]
+    term = _find_ev(events, "gate_consensus", "dep:a")
+    term["event"] = "gate_proceeded_with_flags"
+    term["open_findings"] = ["A:maj"]
+    issues = workflow_issues(events, dag, cfg)
+    assert any(i.kind == "invalid" and "dep:a" in i.message for i in issues)
+
+
+# --- round-9: workflow validates the persisted A/B peer attestations + candidate handoff ----------
+
+def _svf(events, gate):
+    return next(e for e in events if e.get("event") == "symmetric_verdict" and e.get("gate") == gate)
+
+
+def test_workflow_issues_clean_for_valid_symmetric_run_with_peers(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid", final="valid")
+    assert workflow_issues(run.read_events(), dag, cfg) == []
+
+
+def test_workflow_issues_flags_missing_dep_peers(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    events = run.read_events()
+    del _svf(events, "dep:a")["peers"]
+    issues = workflow_issues(events, dag, cfg)
+    assert any(i.kind == "invalid" and "dep:a" in i.message for i in issues)
+
+
+def test_workflow_issues_flags_swapped_dep_peers(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    events = run.read_events()
+    peers = _svf(events, "dep:a")["peers"]
+    peers["A"], peers["B"] = peers["B"], peers["A"]
+    issues = workflow_issues(events, dag, cfg)
+    assert any(i.kind == "invalid" and "dep:a" in i.message for i in issues)
+
+
+def test_workflow_issues_flags_wrong_model_dep_peers(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    events = run.read_events()
+    _svf(events, "dep:a")["peers"]["A"]["model"] = "totally-wrong-model"
+    issues = workflow_issues(events, dag, cfg)
+    assert any(i.kind == "invalid" and "dep:a" in i.message for i in issues)
+
+
+def test_workflow_issues_flags_divergent_raw_dep_peers(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    events = run.read_events()
+    att = dict(_svf(events, "dep:a")["peers"]["B"]["attestation"])
+    att["summary"] = "raw diverges from parsed"
+    _svf(events, "dep:a")["peers"]["B"]["raw"] = json.dumps(att)
+    issues = workflow_issues(events, dag, cfg)
+    assert any(i.kind == "invalid" and "dep:a" in i.message for i in issues)
+
+
+def test_workflow_issues_flags_fabricated_dep_aggregate_objection(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    events = run.read_events()
+    # Both peers APPROVE (no objections), but forge the outer aggregate to claim a blocker and flip
+    # the CONSENSUS terminal to proceeded-with-flags carrying it.
+    sv = _svf(events, "dep:a")
+    sv["outcome"] = "PROCEED_WITH_FLAGS"
+    sv["objections"] = [{"id": "A:FAB", "severity": "blocker", "location": "c", "claim": "c",
+                         "suggestion": "s"}]
+    acc = next(e for e in events
+               if e.get("event") == "accepted_finding_set" and e.get("gate") == "dep:a")
+    acc["accepted_with_flags"] = True
+    acc["open_objections"] = ["A:FAB"]
+    term = next(e for e in events
+                if e.get("event") == "gate_consensus" and e.get("gate") == "dep:a")
+    term["event"] = "gate_proceeded_with_flags"
+    term["open_findings"] = ["A:FAB"]
+    issues = workflow_issues(events, dag, cfg)
+    assert any(i.kind == "invalid" and "dep:a" in i.message for i in issues)
+
+
+def test_workflow_issues_flags_missing_plan_peers(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    events = run.read_events()
+    del _svf(events, "plan")["peers"]
+    issues = workflow_issues(events, dag, cfg)
+    assert any(i.kind == "invalid" and "plan" in i.message.lower() for i in issues)
+
+
+def test_workflow_issues_flags_missing_final_peers(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid", final="valid")
+    events = run.read_events()
+    del _svf(events, "final")["peers"]
+    issues = workflow_issues(events, dag, cfg)
+    assert any(i.kind == "invalid" and "final" in i.message.lower() for i in issues)
+
+
+def test_workflow_issues_flags_forged_accepted_payload_candidate_handoff(tmp_path):
+    # The accepted_finding_set.payload is forged to differ from the decision candidate + the bound
+    # Builder artifact the two peers reviewed. The published findings would not be what was attested.
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    events = run.read_events()
+    acc = next(e for e in events
+               if e.get("event") == "accepted_finding_set" and e.get("gate") == "dep:a")
+    acc["payload"] = {"summary": "", "findings": [_af("dep:a", "FORGED", "blocker")]}
+    issues = workflow_issues(events, dag, cfg)
+    assert any(i.kind == "invalid" and "dep:a" in i.message for i in issues)
+
+
+def test_workflow_issues_flags_candidate_diverges_from_accepted_set(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    events = run.read_events()
+    _svf(events, "dep:a")["candidate"] = {"summary": "", "findings": [_af("dep:a", "OTHER", "nit")]}
+    issues = workflow_issues(events, dag, cfg)
+    assert any(i.kind == "invalid" and "dep:a" in i.message for i in issues)
+
+
+def test_accepted_findings_rejects_forged_accepted_payload_via_workflow(tmp_path):
+    # Direct projection at the module boundary: a forged accepted payload is caught by the workflow
+    # integrity the result commands enforce before publishing (candidate handoff).
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    events = run.read_events()
+    acc = next(e for e in events
+               if e.get("event") == "accepted_finding_set" and e.get("gate") == "dep:a")
+    acc["payload"] = {"summary": "", "findings": [_af("dep:a", "FORGED", "blocker")]}
+    assert any(i.kind == "invalid" for i in workflow_issues(events, dag, cfg))

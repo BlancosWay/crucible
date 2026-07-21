@@ -1,3 +1,4 @@
+import json
 import re
 from pathlib import Path
 
@@ -53,9 +54,31 @@ def _flat(s: str) -> str:
     return " ".join(s.lower().replace("*", "").replace("`", "").replace("#", " ").split())
 
 
+def _json_blocks(text: str) -> list[dict]:
+    """Every fenced ```json block in `text`, parsed. Also enforces that EVERY json example in the doc
+    is valid JSON (a copy/pasteable schema, not prose) — an invalid example raises here."""
+    out: list[dict] = []
+    for body in re.findall(r"```json\n(.*?)```", text, re.DOTALL):
+        out.append(json.loads(body))
+    return out
+
+
 def _no_negated_echo(sec: str) -> None:
     assert not re.search(r"\b(?:do not|don't|never|not)\s+echo\b", sec), \
-        "the union verdict must be required to echo the bindings, not negated"
+        "each peer attestation must be required to echo the bindings, not negated"
+
+
+def _no_plain_verdict(text: str) -> None:
+    """The build-only asymmetric `verdict` command (and its `--resolutions` flag) must never be
+    INVOKED by a symmetric skill: every gate is settled by `symmetric-verdict` with two peer files.
+    Prose may still name `--resolutions` to state the ban — only command-invocation lines are
+    forbidden from carrying it."""
+    for line in text.splitlines():
+        assert "-m crucible verdict " not in line and not line.rstrip().endswith("-m crucible verdict"), \
+            f"symmetric skill must not invoke the build-only `verdict`: {line!r}"
+        if "python3 -m crucible" in line:
+            assert "--resolutions" not in line, \
+                f"symmetric-verdict takes no --resolutions (peer objections are not Builder rebuttals): {line!r}"
 
 
 def test_skill_exists_with_frontmatter():
@@ -80,48 +103,134 @@ def test_skill_requires_resolved_run_config():
     assert "authoritative for this run" in text
 
 
+def test_skill_initializes_with_deep_dive_workflow_kind():
+    # The symmetric flow is selected by the immutable `--workflow deep-dive` run metadata on init-run
+    # (default `build` is the asymmetric Builder/Critic flow) — asserted on the actual init-run line.
+    text = SKILL.read_text()
+    init_lines = [l for l in text.splitlines() if "init-run" in l and "python3 -m crucible" in l]
+    assert init_lines, "SKILL.md must show the init-run command"
+    assert any("--workflow deep-dive" in l for l in init_lines), \
+        "init-run must pass --workflow deep-dive to select the symmetric two-peer flow"
+
+
 def test_skill_reuses_crucible_cli_for_decisions():
     text = SKILL.read_text()
-    for cmd in ["init-run", "load-dag", "next", "verdict", "set-status", "report", "bindings"]:
+    for cmd in ["init-run", "load-dag", "next", "symmetric-verdict", "set-status", "report",
+                "bindings", "accepted-findings", "review-result"]:
         assert cmd in text, f"SKILL.md should reference `crucible {cmd}`"
 
 
+def test_skill_intro_states_cli_extended_not_unmodified():
+    # The intro must not call the CLI "unmodified": the symmetric flow adds the `--workflow` run
+    # metadata + the `symmetric-verdict`/`accepted-findings`/`review-result` commands (a CLI change),
+    # even though the config SCHEMA is unchanged. Require that accurate positive wording (scoped to the
+    # "for all bookkeeping" intro paragraph), not just a phrase ban, so the intro does not contradict
+    # the command protocol the rest of the skill teaches.
+    para = _flat(_para(SKILL.read_text(), "for all bookkeeping"))
+    assert "unmodified" not in para
+    assert "no config-schema change" in para
+    assert "--workflow" in para
+    assert "symmetric-verdict" in para
+
+
+def test_skill_settles_gates_with_symmetric_verdict_never_plain_verdict():
+    # Every gate decision goes through `symmetric-verdict` with two separately produced peer files;
+    # the asymmetric build-only `verdict` command is never invoked (and no --resolutions).
+    text = SKILL.read_text()
+    assert "symmetric-verdict" in text
+    _no_plain_verdict(text)
+
+
+def test_skill_produces_separate_peer_attestation_files_with_schema():
+    # Two equal peers each emit their OWN attestation file (peer-a.json / peer-b.json), not one
+    # serialized union verdict. Assert both files AND the attestation JSON schema (peer slot, verdict,
+    # objections, echoed bindings) — a schema check, not a keyword.
+    text = SKILL.read_text()
+    assert "peer-a.json" in text and "peer-b.json" in text
+    attest = next((b for b in _json_blocks(text)
+                   if isinstance(b, dict) and b.get("peer") in ("A", "B")), None)
+    assert attest is not None, "SKILL.md must show a peer attestation JSON example"
+    for key in ("peer", "gate", "round", "verdict", "summary", "objections", "artifact_sha256"):
+        assert key in attest, f"peer attestation schema missing {key!r}"
+    assert attest["verdict"] in ("APPROVE", "REQUEST_CHANGES")
+    assert isinstance(attest["objections"], list)
+
+
+def test_skill_logs_structured_finding_set_for_dep_and_final():
+    # For dependency/FINAL gates the merged candidate artifact is a STRUCTURED finding set (JSON),
+    # not free text. Assert the finding-set schema (findings[] of source_gate/id/severity/location/
+    # claim/suggestion) is documented as a copy/pasteable JSON example.
+    text = SKILL.read_text()
+    fs = next((b for b in _json_blocks(text)
+               if isinstance(b, dict) and isinstance(b.get("findings"), list) and b["findings"]), None)
+    assert fs is not None, "SKILL.md must show the structured candidate finding-set JSON"
+    finding = fs["findings"][0]
+    for key in ("source_gate", "id", "severity", "location", "claim", "suggestion"):
+        assert key in finding, f"candidate finding schema missing {key!r}"
+
+
+def test_skill_distinguishes_candidate_findings_from_peer_objections():
+    # The engine separates ACCEPTED candidate findings (the investigation result) from PEER OBJECTIONS
+    # (defects in that candidate). Gate progress is decided from objections, never from an accepted
+    # finding's severity — so a candidate that accepts a blocker can still reach consensus.
+    low = _norm(SKILL)
+    assert "objection" in low
+    assert "candidate" in low
+    assert re.search(r"objection[^.]{0,160}(consensus|gate progress|decided)", low) or \
+        re.search(r"(consensus|gate progress|decided)[^.]{0,160}objection", low), \
+        "SKILL must state gate progress is decided from peer objections"
+    assert "accepts a blocker" in low or "accept a blocker" in low or "accepted blocker" in low
+
+
 def test_skill_binds_every_gate_to_merged_artifact():
-    # Schema-2 binding handshake (symmetric), asserted PER GATE (section-scoped, not whole-document
-    # substrings): every gate logs the merged artifact, asks `crucible bindings --gate <that gate>`,
-    # seeds Peer B with the JSON as TRUSTED CLI METADATA, and the single serialized UNION verdict must
-    # ECHO exactly that gate's hash fields — artifact+DAG at PLAN/FINAL, all three at dep:<thread>. A
-    # gate that dropped `bindings`, echoed the wrong field set (a stray node hash at PLAN/FINAL), lost
-    # the union framing, or negated the echo must FAIL here. (deep-dive has no REPRODUCE gate.)
+    # Schema-2 binding handshake (symmetric two-peer), asserted PER GATE (section-scoped): every gate
+    # logs the candidate, asks `crucible bindings --gate <that gate>`, seeds Peer B with the JSON as
+    # TRUSTED CLI METADATA, and BOTH peer attestation files ECHO exactly that gate's hash fields —
+    # artifact+DAG at PLAN/FINAL, all three at dep:<thread> — then `symmetric-verdict --peer-a
+    # --peer-b` decides. A gate that dropped `bindings`, echoed the wrong field set (a stray node hash
+    # at PLAN/FINAL), or negated the echo must FAIL here. (deep-dive has no REPRODUCE gate.)
     text = SKILL.read_text()
 
-    # PLAN — bindings --gate plan, trusted metadata, union verdict echoes ARTIFACT + DAG (no node), verdict --file
     plan = _flat(_section(text, "PLAN gate"))
     assert 'bindings --run "$run" --gate plan' in plan
     assert "trusted cli metadata" in plan
-    assert "union" in plan
+    assert "peer-a.json" in plan and "peer-b.json" in plan
     assert re.search(r"echo\w*\s+artifact_sha256 \+ dag_sha256", plan)
     assert "node_sha256" not in plan, "PLAN carries no node hash"
-    assert 'verdict --run "$run" --gate plan --round n --file' in plan
+    assert ('symmetric-verdict --run "$run" --gate plan --round n --peer-a "$run"/peer-a.json '
+            '--peer-b "$run"/peer-b.json') in plan
     _no_negated_echo(plan)
 
-    # THREAD (dep:<thread>) — bindings dep, trusted metadata, union verdict echoes ALL THREE, verdict --file
     thread = _flat(_section(text, "THREAD gates"))
     assert 'bindings --run "$run" --gate "dep:$node"' in thread
     assert "trusted cli metadata" in thread
-    assert "union" in thread
     assert "artifact_sha256 + dag_sha256 + node_sha256" in thread
-    assert 'verdict --run "$run" --gate "dep:$node" --round n --file' in thread
+    assert ('symmetric-verdict --run "$run" --gate "dep:$node" --round n --peer-a "$run"/peer-a.json '
+            '--peer-b "$run"/peer-b.json') in thread
     _no_negated_echo(thread)
 
-    # FINAL — bindings --gate final, trusted metadata, union verdict echoes ARTIFACT + DAG (no node)
     final = _flat(_section(text, "FINAL gate"))
     assert 'bindings --run "$run" --gate final' in final
     assert "trusted cli metadata" in final
-    assert "union" in final
     assert re.search(r"echo\w*\s+artifact_sha256 \+ dag_sha256", final)
     assert "node_sha256" not in final, "FINAL carries no node hash"
+    assert 'symmetric-verdict --run "$run" --gate final --round n' in final
     _no_negated_echo(final)
+
+
+def test_skill_assembles_final_from_accepted_findings():
+    # FINAL is assembled deterministically from `crucible accepted-findings` (the accepted dependency
+    # union) plus cross-cutting `source_gate: final` additions — not re-derived by hand.
+    final = _flat(_section(SKILL.read_text(), "FINAL gate"))
+    assert 'accepted-findings --run "$run"' in final
+    assert "source_gate: final" in final or 'source_gate": "final' in final
+
+
+def test_skill_uses_review_result_as_deliverable():
+    # The deterministic findings deliverable at Finish is `crucible review-result` (a projection over
+    # the accepted finding events), not eyeballed prose.
+    finish = _flat(_section(SKILL.read_text(), "Finish"))
+    assert 'review-result --run "$run"' in finish
 
 
 def test_skill_records_human_approval_with_approve_plan():
@@ -155,15 +264,12 @@ def test_skill_grounds_consensus_in_evidence_not_votes():
 
 
 def test_skill_bans_wontfix_for_peer_disputes():
-    # the deep-dive skill must never instruct clearing a blocking peer dispute via
-    # `--resolutions`/`wontfix`. Canonical ban phrasing (never CLEARED with the mechanism) so wrong
-    # text like "never forget to pass --resolutions" fails; plus no `--resolutions` in a verdict example.
+    # A blocking peer objection is NEVER cleared via `--resolutions`/`wontfix` — symmetric-verdict has
+    # no such flag; it is resolved against the cited source or flagged (both positions) at the cap.
     norm = _norm(SKILL)   # de-emphasized so markdown `**never**` doesn't break the phrase
-    assert re.search(r"never\s+clear(?:ed|s)?[^.]{0,40}(--resolutions|wontfix)", norm), \
-        "SKILL must state a blocking peer dispute is NEVER CLEARED via --resolutions/wontfix"
-    for line in SKILL.read_text().splitlines():
-        if "crucible verdict" in line and "--resolutions" in line:
-            raise AssertionError(f"deep-dive SKILL must not invoke --resolutions in a verdict example: {line!r}")
+    assert re.search(r"never\s+clear(?:ed|s)?[^.]{0,60}(--resolutions|wontfix)", norm), \
+        "SKILL must state a blocking peer objection is NEVER CLEARED via --resolutions/wontfix"
+    _no_plain_verdict(SKILL.read_text())
 
 
 def test_skill_advances_thread_on_proceed_with_flags():
@@ -175,11 +281,13 @@ def test_skill_advances_thread_on_proceed_with_flags():
         "SKILL must set a PROCEED_WITH_FLAGS thread node to done and continue"
 
 
-def test_skill_both_peers_review_every_round():
-    # both peers review the merged set each round; consensus needs both to sign off (canonical)
+def test_skill_both_peers_attest_every_round():
+    # Both peers independently attest to the SAME bound candidate each round via their own peer file;
+    # consensus needs both to sign off. No single serialized union verdict.
     low = _norm(SKILL)
-    assert "both peers review the merged set every round" in low
-    assert "union of both peers" in low or "deduped union" in low
+    assert "both peers independently attest" in low
+    assert "peer-a.json" in low and "peer-b.json" in low
+    assert "candidate finding set" in low
 
 
 def test_skill_surfaces_findings_on_copilot():
@@ -221,6 +329,16 @@ def test_command_file_exists_with_frontmatter_and_no_dangling_ref_tokens():
     # must not embed a `references/<x>.md` token (validate_structure resolves those and would
     # break); point at the SKILL instead.
     assert not re.search(r"references/[a-z0-9-]+\.md", text)
+
+
+def test_command_uses_symmetric_commands_not_plain_verdict():
+    # The command doc must name the two-peer decision command and the deterministic deliverable, and
+    # must never direct the build-only `verdict`.
+    low = _norm(CMD)
+    assert "symmetric-verdict" in low
+    assert "--workflow deep-dive" in low
+    assert "review-result" in low
+    _no_plain_verdict(CMD.read_text())
 
 
 def test_changelog_records_deep_dive():

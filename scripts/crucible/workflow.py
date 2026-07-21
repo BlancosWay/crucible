@@ -25,6 +25,22 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from crucible.integrity import artifact_sha256, dag_sha256, node_sha256
+from crucible.symmetric import (
+    SYMMETRIC_WORKFLOWS,
+    CorruptWorkflowError,
+    FindingSet,
+    accepted_finding_set_for_gate,
+    accepted_findings,
+    gate_post_terminal_protocol_indices,
+    out_of_scope_protocol_gates,
+    plan_accepted_finding_set_indices,
+    resolve_gate_acceptance,
+    symmetric_candidate_handoff_issues,
+    symmetric_decision_issues,
+    symmetric_plan_attestation_issues,
+    validate_final_finding_set,
+    workflow_kind,
+)
 
 if TYPE_CHECKING:  # annotation-only imports keep this module free of runtime import cycles
     from crucible.config import Config
@@ -273,6 +289,15 @@ def workflow_issues(events: list[dict[str, Any]], dag: DAG, cfg: Config) -> list
     PLAN and FINAL terminals must additionally bind the CURRENT dependency tree (``dag_sha256``). An
     empty list means every configured phase is present, ordered, accepted, and currently bound.
     """
+    # Corrupt run metadata fails the whole run closed with a single clear issue (and never crashes
+    # this pure validator): a present null/non-string/unrecognized workflow can only be tampering, so
+    # there is no trustworthy asymmetric/symmetric routing to validate. Read once through the single
+    # `workflow_kind` path; ``symmetric`` below reuses the result.
+    try:
+        symmetric = workflow_kind(events) in SYMMETRIC_WORKFLOWS
+    except CorruptWorkflowError as exc:
+        return [WorkflowIssue("invalid", f"the run's recorded workflow metadata is corrupt: {exc}")]
+
     issues: list[WorkflowIssue] = []
 
     reproduce_terminal, reproduce_idx = _accepted_terminal_with_index(events, "reproduce")
@@ -296,7 +321,17 @@ def workflow_issues(events: list[dict[str, Any]], dag: DAG, cfg: Config) -> list
     plan_terminal, plan_idx = _accepted_terminal_with_index(events, "plan")
     if plan_terminal is None:
         issues.append(WorkflowIssue("missing", "PLAN gate never reached an accepted terminal"))
-        return issues  # nothing downstream can be trusted without an accepted plan
+        # round-8 F2: an accepted PLAN gates DOWNSTREAM TRUST (node completion, approval order, FINAL
+        # inclusion), so those checks are still withheld here. But the symmetric protocol's own
+        # SCOPE and DISABLED-PHASE integrity holds regardless of PLAN — an out-of-scope/arbitrary/
+        # ghost gate, a disabled-FINAL residue (verdict / accepted set / terminal), post-terminal
+        # residue, or an inconsistent accepted trio is invalid history even before PLAN concludes.
+        # Run those PLAN-independent checks so forged residue recorded BEFORE PLAN is not merely
+        # reported as "missing".
+        if symmetric:
+            issues.extend(_disabled_final_terminal_issue(events, cfg))
+            issues.extend(_symmetric_accepted_set_issues(events, dag, cfg))
+        return issues
 
     issues.extend(_artifact_binding_issues(events, "plan", plan_terminal, plan_idx, "PLAN"))
 
@@ -344,8 +379,192 @@ def workflow_issues(events: list[dict[str, Any]], dag: DAG, cfg: Config) -> list
 
     if cfg.final_review:
         issues.extend(_final_issues(events, dag))
+    else:
+        issues.extend(_disabled_final_terminal_issue(events, cfg))
+
+    # Symmetric (deep-dive/pr-review) runs additionally persist a structured accepted finding set for
+    # every dependency/FINAL gate that advances, and back every accepted terminal (PLAN included) with
+    # a two-peer symmetric_verdict whose outcome/objections are consistent. A terminal without it — or
+    # an accepted set recorded after the terminal, for a gate outside the configured workflow, or an
+    # inconsistent decision — is invalid history (see Task 2 and round-3/5/7/8 findings).
+    if symmetric:
+        issues.extend(_symmetric_accepted_set_issues(events, dag, cfg))
 
     return issues
+
+
+def _disabled_final_terminal_issue(
+    events: list[dict[str, Any]], cfg: Config
+) -> list["WorkflowIssue"]:
+    """The configured-forbidden FINAL TERMINAL check (PLAN-independent). When ``final_review`` is off,
+    a recorded FINAL terminal — accepted OR capped — is not part of the configured workflow (design:
+    "If FINAL review is disabled, the dependency union is the run's effective accepted finding set"),
+    so it is an integrity violation (mirrors the disabled REPRODUCE rule). Returns [] when
+    ``final_review`` is enabled or no FINAL terminal exists."""
+    if cfg.final_review:
+        return []
+    if any(e.get("gate") == "final" and e.get("event") in _TERMINAL_EVENTS for e in events):
+        return [WorkflowIssue(
+            "invalid",
+            "FINAL gate terminal is recorded though final_review is disabled "
+            "(configured-forbidden phase)")]
+    return []
+
+
+def _symmetric_accepted_set_issues(
+    events: list[dict[str, Any]], dag: DAG, cfg: Config
+) -> list[WorkflowIssue]:
+    """Accepted-finding-set integrity for symmetric dependency/FINAL gates.
+
+    Each in-scope dependency (``dep:<id>`` for a current DAG node) and — only when ``final_review`` is
+    enabled — the FINAL gate carries a structured accepted finding set. Its acceptance is decided by
+    the single shared resolver :func:`resolve_gate_acceptance`: exactly one ``accepted_finding_set``
+    may sit as the middle of an atomic ``symmetric_verdict -> accepted_finding_set -> advancing
+    terminal`` trio for the gate/round, binding the same artifact/DAG/node throughout, with no other
+    same-gate protocol event intervening. Every integrity violation the resolver reports is surfaced
+    here as ``invalid``:
+
+    - a terminal with no accepted set immediately before it (missing set OR an intervening protocol
+      event between the accepted set and its terminal);
+    - an accepted set whose bindings do not match its advancing terminal (bound to another artifact);
+    - an accepted set not immediately preceded by a matching peer decision (the two peers reviewed a
+      different candidate, OR a second pre-terminal accepted set broke the trio);
+    - an accepted set with no advancing terminal, or recorded AFTER its terminal (orphan/post-terminal
+      crash residue that must never count as accepted state).
+
+    A gate OUTSIDE the configured workflow is also ``invalid``: a ``dep:<id>`` whose node is absent
+    from the current tree (a ghost gate) is flagged here — whether it persists an accepted set
+    (round-3 F2) OR only records a verdict + capped/proceeded terminal carrying objections (round-4);
+    a forged FINAL gate while ``final_review`` is off is a configured-forbidden phase reported by the
+    FINAL terminal check in :func:`workflow_issues` (round-3 F1). When the resolver selects an effective
+    set, its payload is additionally checked for validity here, and — when FINAL is configured — the
+    accepted FINAL set must include every accepted dependency finding unchanged and add only
+    ``source_gate: final`` extras (:func:`_final_inclusion_issues`). PLAN gates carry a text artifact
+    and never an accepted finding set, so they are excluded. Pure and never raises.
+    """
+    issues: list[WorkflowIssue] = []
+    finding_gates = [f"dep:{nid}" for nid in dag.order]
+    if cfg.final_review:
+        finding_gates.append("final")
+    # F2: a symmetric PLAN gate carries a text artifact + DAG and NEVER an accepted finding set. Any
+    # `accepted_finding_set` on the plan gate — before/between/after its decision & terminal, or
+    # orphaned — is forged/corrupt history. The plan gate is excluded from the trio resolver below (it
+    # is not a finding gate), and a PLAN set placed between the decision and terminal forms an
+    # otherwise-valid-looking trio the PLAN attestation check would accept — so flag every occurrence
+    # here directly, ensuring a forged set can never make the PLAN attestation appear valid.
+    for _idx in plan_accepted_finding_set_indices(events):
+        issues.append(WorkflowIssue(
+            "invalid",
+            "symmetric PLAN gate records an accepted finding set; a PLAN artifact is text + a DAG "
+            "and never carries an accepted finding set (forged/corrupt history)"))
+    # round-8 F3: a symmetric PLAN advancing terminal must be backed by a terminal-bound two-peer
+    # symmetric_verdict (never a bare terminal, a build-style critic_verdict, or a mismatched verdict)
+    # with a consistent decision. PLAN carries a text artifact and no accepted finding set, so it is
+    # validated here directly rather than through the dependency/FINAL trio resolver.
+    for reason in symmetric_plan_attestation_issues(events, cfg):
+        issues.append(WorkflowIssue("invalid", f"symmetric PLAN gate {reason}"))
+    for gate in finding_gates:
+        resolution = resolve_gate_acceptance(events, gate)
+        for reason in resolution.issues:
+            issues.append(WorkflowIssue("invalid", f"symmetric gate {gate!r} {reason}"))
+        if resolution.accepted_index is not None:
+            try:
+                accepted_set = FindingSet.from_dict(events[resolution.accepted_index].get("payload"))
+            except (ValueError, TypeError):
+                issues.append(WorkflowIssue(
+                    "invalid",
+                    f"symmetric gate {gate!r} accepted finding set payload is not a valid finding "
+                    f"set (malformed)"))
+            else:
+                # A DEPENDENCY accepted set must attribute every finding to its own gate; a forged
+                # dep:<id> set injecting a `source_gate: final`/ghost finding is mis-scoped history
+                # (round-7 F1). FINAL legitimately carries dependency findings, so its inclusion is
+                # validated separately by _final_inclusion_issues, never validate_for_gate.
+                if gate.startswith("dep:"):
+                    try:
+                        accepted_set.validate_for_gate(gate)
+                    except ValueError as exc:
+                        issues.append(WorkflowIssue(
+                            "invalid",
+                            f"symmetric gate {gate!r} accepted finding set is mis-scoped ({exc})"))
+        # round-8 F1/F4: the terminal-bound decision's SEMANTICS must be consistent — its outcome
+        # certifies the terminal (CONSENSUS/PROCEED_WITH_FLAGS/CAPPED), its objections are all
+        # configured-blocking, CONSENSUS carries none while proceeded/capped carry >=1, and a
+        # proceeded/capped terminal's open_findings match the objection ids exactly. It ALSO validates
+        # (round-9) the persisted A/B peer attestations. The shared validator returns [] for a valid
+        # decision or when the resolver already owns the "no bound decision" report, so this never
+        # duplicates the trio-structure diagnostics above.
+        for reason in symmetric_decision_issues(events, gate, cfg):
+            issues.append(WorkflowIssue("invalid", f"symmetric gate {gate!r} {reason}"))
+        # round-9 candidate handoff: the decision's persisted candidate, the accepted set payload, and
+        # the bound Builder artifact the two peers reviewed must all be the same finding set, so the
+        # published findings are exactly what was attested.
+        for reason in symmetric_candidate_handoff_issues(events, gate):
+            issues.append(WorkflowIssue("invalid", f"symmetric gate {gate!r} {reason}"))
+    # Post-terminal protocol residue: a same-gate symmetric protocol event (a verdict that could
+    # rewrite the gate's unresolved objections, an accepted set, or a second terminal) recorded AFTER
+    # the authoritative terminal is forged/crash residue, never part of the concluded decision
+    # (round-5 F1). Checked over every legitimate symmetric gate — including PLAN, which carries a
+    # terminal but no finding set — so a post-terminal verdict is flagged even where the resolver's
+    # post-terminal-accepted-set rule does not reach.
+    for gate in ["plan", *finding_gates]:
+        if gate_post_terminal_protocol_indices(events, gate):
+            issues.append(WorkflowIssue(
+                "invalid",
+                f"symmetric gate {gate!r} records a symmetric protocol event after its authoritative "
+                f"terminal (post-terminal residue that must never rewrite the concluded decision)"))
+    # Out-of-scope protocol gates: any gate carrying a symmetric protocol event that is not the PLAN
+    # gate, a current dependency, or the enabled FINAL gate is out of scope (round-3 F2 ghost dep,
+    # round-4 capped ghost, round-5 arbitrary/off-convention name such as ``sidequest`` or a
+    # ``reproduce`` gate symmetric protocols never use). The protocol-wide scope guard spans every
+    # symmetric_verdict/accepted/terminal, so a gate that only CAPS/proceeds with objections (no
+    # accepted set) is caught too.
+    #
+    # The ``final`` gate is special when ``final_review`` is off (round-7 F2): a FINAL *terminal* is
+    # already reported as a configured-forbidden phase by the FINAL terminal check in workflow_issues,
+    # so that case is skipped here to avoid a duplicate. But a FINAL symmetric_verdict or
+    # accepted_finding_set WITHOUT a terminal evades that terminal-only check, so it must be flagged
+    # here — any FINAL symmetric protocol event while FINAL is disabled is invalid history.
+    final_terminal_present = any(
+        e.get("gate") == "final" and e.get("event") in _TERMINAL_EVENTS for e in events)
+    for gate in out_of_scope_protocol_gates(events, dag, final_enabled=cfg.final_review):
+        if gate == "final":
+            if final_terminal_present:
+                continue
+            issues.append(WorkflowIssue(
+                "invalid",
+                "symmetric FINAL gate records a symmetric protocol event (verdict/accepted set) "
+                "though final_review is disabled (configured-forbidden phase)"))
+            continue
+        issues.append(WorkflowIssue(
+            "invalid",
+            f"symmetric gate {gate!r} records review protocol events outside the configured "
+            f"symmetric workflow (not the plan gate, a current dependency, or the enabled FINAL "
+            f"gate) — out-of-scope/ghost gate"))
+    if cfg.final_review:
+        issues.extend(_final_inclusion_issues(events, dag))
+    return issues
+
+
+def _final_inclusion_issues(
+    events: list[dict[str, Any]], dag: DAG
+) -> list[WorkflowIssue]:
+    """The accepted FINAL set must include every accepted dependency finding unchanged and add only
+    ``source_gate: final`` extras. Guarded so a malformed set (already flagged above) never raises."""
+    final_terminal, _ = _accepted_terminal_with_index(events, "final")
+    if final_terminal is None:
+        return []
+    try:
+        final_set = accepted_finding_set_for_gate(events, "final")
+        if final_set is None:
+            return []
+        validate_final_finding_set(final_set, accepted_findings(events, dag))
+    except (ValueError, TypeError) as exc:
+        return [WorkflowIssue(
+            "invalid",
+            f"symmetric FINAL finding set is inconsistent with the accepted dependency findings "
+            f"({exc})")]
+    return []
 
 
 def _artifact_binding_issues(
@@ -407,7 +626,8 @@ def _final_issues(events: list[dict[str, Any]], dag: DAG) -> list[WorkflowIssue]
     final_terminal, final_idx = _accepted_terminal_with_index(events, "final")
     if final_terminal is None:
         if dag.is_complete():
-            return [WorkflowIssue("missing", "configured FINAL gate never reached consensus")]
+            return [WorkflowIssue("missing", "configured FINAL gate never reached consensus",
+                                  phase="final")]
         return []
     issues = _artifact_binding_issues(events, "final", final_terminal, final_idx, "FINAL")
     if final_terminal.get("dag_sha256") != dag_sha256(dag):
@@ -469,11 +689,15 @@ class WorkflowIssue:
     ``kind`` is exactly one of ``"missing"`` / ``"invalid"`` / ``"flagged"`` and orders the report
     status (``invalid`` > ``flagged`` > ``missing``, i.e. INVALID > FLAGGED > IN PROGRESS); the CLEAN
     status requires *no* issues at all. ``message`` names the phase/node and is rendered (sanitized)
-    in the report Summary.
+    in the report Summary. ``phase`` is an optional stable marker (e.g. ``"final"``) that lets a
+    Finish-time caller tolerate a specific configured-but-not-yet-reached prerequisite without
+    brittle message matching — ``accepted-findings`` deliberately tolerates only ``missing`` + a
+    ``"final"`` phase because it is used to assemble FINAL.
     """
 
     kind: str  # "missing" | "invalid" | "flagged"
     message: str
+    phase: str = ""
 
 
 def _node_completion_issues(

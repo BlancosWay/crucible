@@ -228,13 +228,185 @@ def test_changelog_records_workflow_integrity():
 
 def test_command_docs_mention_artifact_binding():
     # Each command doc must state the canonical binding handshake (bound-to-artifact, schema v2, the
-    # verdict-must-echo bindings, legacy read-only) — a canonical phrase, not just the word "bound".
+    # echo requirement, legacy read-only) — a canonical phrase, not just the word "bound". The build
+    # skill's single Critic verdict echoes the bindings; the two symmetric skills' SEPARATE peer
+    # attestations echo them (no single serialized union verdict).
     for name in ("crucible", "deep-dive", "pr-review"):
         low = _flat((ROOT / "commands" / f"{name}.md").read_text())
         assert "gate decision is bound to the exact" in low, f"commands/{name}.md omits the binding handshake"
         assert "schema v2" in low, f"commands/{name}.md omits the schema-2 claim"
-        assert "bindings" in low and "verdict must echo" in low, f"commands/{name}.md omits the echo requirement"
+        assert "bindings" in low, f"commands/{name}.md omits the bindings"
+        if name == "crucible":
+            assert "verdict must echo" in low, f"commands/{name}.md omits the echo requirement"
+        else:
+            assert "peer attestation" in low and "echo" in low, \
+                f"commands/{name}.md omits the peer-attestation echo requirement"
         assert "legacy / unverified" in low, f"commands/{name}.md omits the legacy behavior"
+
+
+# --- Symmetric two-peer consensus documentation guards --------------------------------------------
+# The deep-dive / pr-review companion skills settle each gate from TWO separately produced peer
+# attestation files via `symmetric-verdict` (never the build-only `verdict`), assemble FINAL from
+# `accepted-findings`, and emit the deterministic deliverable via `review-result`. The public docs
+# must document those commands, the workflow-kind metadata, the derived pr recommendation, and the
+# honest slot-proof scope (two configured slots attested, not cryptographic process identity).
+
+def test_cli_docs_document_symmetric_workflow_commands():
+    # Section-scoped canonical guard: docs/cli.md's symmetric section must document the two-peer
+    # decision command (`symmetric-verdict --peer-a --peer-b`), `accepted-findings`, `review-result`
+    # and its derived APPROVE|COMMENT|REQUEST_CHANGES recommendation, the CLEAN-vs-recommendation
+    # separation, and the slot-proof scope. A doc that dropped a command or overclaimed process
+    # identity must FAIL here.
+    text = (ROOT / "docs" / "cli.md").read_text()
+    sym = _flat(_section(text, "Symmetric workflows"))
+    assert "symmetric-verdict" in sym
+    assert "--peer-a" in sym and "--peer-b" in sym
+    assert "accepted-findings" in sym
+    assert "review-result" in sym
+    assert "deep-dive" in sym and "pr-review" in sym
+    assert "approve" in sym and "comment" in sym and "request_changes" in sym
+    # workflow status (CLEAN/FLAGGED) is SEPARATE from the review recommendation
+    assert "recommendation" in sym and ("separate" in sym or "distinct" in sym)
+    # honest scope: proves two configured slots attested, not cryptographic process identity
+    assert "two configured slots" in sym
+    assert "cryptograph" in sym
+
+
+def test_cli_docs_document_workflow_kind_metadata():
+    text = _flat((ROOT / "docs" / "cli.md").read_text())
+    # init-run records an immutable workflow kind; the symmetric decision command is symmetric-only
+    assert "--workflow" in text
+    assert "build" in text and "deep-dive" in text and "pr-review" in text
+    assert "symmetric-verdict" in text
+
+
+def test_readme_documents_symmetric_two_peer_protocol():
+    # The README companion sections must describe the TWO-PEER attestation protocol (separate peer
+    # files settled by `symmetric-verdict`), not a single serialized union verdict.
+    readme = _flat((ROOT / "README.md").read_text())
+    assert "symmetric-verdict" in readme
+    assert "peer-a.json" in readme or "peer attestation" in readme or \
+        ("peer a" in readme and "peer b" in readme)
+    # the OLD single-serialized-union verdict language must be gone
+    raw = (ROOT / "README.md").read_text().lower()
+    assert "recorded verdict is the union" not in raw
+    assert "the union of their findings" not in raw
+
+
+def test_security_documents_slot_proof_scope():
+    # SECURITY must scope the peer proof honestly: two configured SLOTS attested to the same bound
+    # candidate — not cryptographic proof that two distinct model processes ran.
+    low = _flat((ROOT / "SECURITY.md").read_text())
+    assert "two configured slots" in low
+    assert "cryptograph" in low
+    assert "not a cryptographic proof" in low or "does not cryptographically prove" in low
+    assert "process" in low
+
+
+def test_changelog_records_symmetric_two_peer():
+    # Scope to [Unreleased]: the symmetric two-peer migration is recorded with the new commands.
+    unreleased = _flat(_section((ROOT / "CHANGELOG.md").read_text(), "[Unreleased]"))
+    assert "symmetric-verdict" in unreleased
+    assert "two" in unreleased and "peer" in unreleased
+    assert "accepted-findings" in unreleased and "review-result" in unreleased
+
+
+def test_changelog_pr_review_entry_states_cli_extended_not_unmodified():
+    # Scope to the [Unreleased] pr-review skill bullet: it must NOT claim the CLI was "unmodified" /
+    # that there was "no CLI change" — the symmetric skills added the `symmetric-verdict` /
+    # `accepted-findings` / `review-result` commands and the `--workflow` run metadata. It must state
+    # the accurate scope (no CONFIG-SCHEMA change, but the CLI gained that workflow metadata + those
+    # commands), positively, not merely ban a phrase. The historical release entries are out of scope.
+    unreleased = _section((ROOT / "CHANGELOG.md").read_text(), "[Unreleased]")
+    bullet = _flat(_bullet(unreleased, "New independent `pr-review` skill"))
+    # accurate positive wording (implemented reality)
+    assert "no config-schema change" in bullet
+    assert "symmetric-verdict" in bullet
+    assert "accepted-findings" in bullet
+    assert "review-result" in bullet
+    assert "workflow metadata" in bullet or "--workflow" in bullet
+    # the false "unmodified CLI / no CLI change" claim must be gone from this live entry
+    assert "unmodified" not in bullet
+    assert "no cli/config-schema change" not in bullet
+    assert "no cli change" not in bullet
+
+
+def test_symmetric_design_marked_implemented_and_links_plan():
+    design = (ROOT / "docs" / "superpowers" / "specs"
+              / "2026-07-20-symmetric-consensus-design.md").read_text()
+    assert re.search(r"\*\*Status:\*\*\s*implemented", design, re.IGNORECASE), \
+        "the 2026-07-20 symmetric-consensus design must be marked implemented"
+    assert "2026-07-20-symmetric-consensus.md" in design, "design must link its implementation plan"
+
+
+# --- Companion runtime-guidance guards (docs/cli.md Conventions, AGENTS.md, CLAUDE.md) -------------
+# The three top-level runtime-guidance surfaces must teach the CURRENT symmetric two-peer protocol —
+# `--workflow` init, separate Peer A / Peer B attestation files settled by `symmetric-verdict`,
+# `accepted-findings` before FINAL, the Finish `review-result` (with pr-review's deterministic
+# recommendation + preserved execution/posting safety), and the honest slot-proof scope — and must NOT
+# teach the superseded single-union / merged-set verdict. Section-scoped so a stale sentence in a live
+# surface fails HERE even though docs/cli.md's detailed "Symmetric workflows" section is already
+# correct; these guards exist so a future protocol migration cannot miss the companion summaries.
+
+STALE_SYMMETRIC_MECHANISM = (
+    "verdict is the union",
+    "union of their findings",
+    "union of both peers",
+    "review the merged set",
+    "merged set",
+)
+
+
+def _assert_no_stale_union(scope: str, where: str):
+    for phrase in STALE_SYMMETRIC_MECHANISM:
+        assert phrase not in scope, f"{where} still teaches the superseded {phrase!r} mechanism"
+
+
+def test_cli_docs_conventions_gate_bullet_uses_two_peer_protocol():
+    # The Conventions "Gates" bullet must route each symmetric round through `symmetric-verdict` from
+    # two separate peer attestations (not a single union verdict), while keeping the pr-review
+    # execution-safety scope in the same bullet.
+    bullet = _flat(_bullet((ROOT / "docs" / "cli.md").read_text(), "**Gates**"))
+    assert "symmetric-verdict" in bullet
+    assert "peer attestation" in bullet
+    assert "not a single union verdict" in bullet
+    assert "static/ci-only" in bullet
+    assert "consent" in bullet
+    _assert_no_stale_union(bullet, "docs/cli.md Conventions Gates bullet")
+
+
+@pytest.mark.parametrize("doc", ["AGENTS.md", "CLAUDE.md"])
+def test_companion_deepdive_section_uses_two_peer_protocol(doc):
+    # Required implemented commands/terms (not merely an absent phrase): workflow-kind init, the
+    # symmetric decision command, separate Peer A / Peer B attestations, the FINAL assembly and Finish
+    # deliverable, the honest slot-proof scope, and an explicit negation of the single-union verdict.
+    section = _flat(_section((ROOT / doc).read_text(), "Companion skill: deep-dive"))
+    assert "--workflow deep-dive" in section
+    assert "symmetric-verdict" in section
+    assert "peer a" in section and "peer b" in section
+    assert "attestation" in section
+    assert "accepted-findings" in section
+    assert "review-result" in section
+    assert "two configured slots" in section
+    assert "cryptograph" in section and "process" in section
+    assert "no single serialized union verdict" in section
+    _assert_no_stale_union(section, f"{doc} deep-dive companion section")
+
+
+@pytest.mark.parametrize("doc", ["AGENTS.md", "CLAUDE.md"])
+def test_companion_prreview_section_uses_two_peer_protocol(doc):
+    # pr-review companion summary: same symmetric two-peer decision command, a DETERMINISTIC derived
+    # recommendation from `review-result`, and the preserved execution + posting safety scope.
+    section = _flat(_section((ROOT / doc).read_text(), "Companion skill: pr-review"))
+    assert "--workflow pr-review" in section
+    assert "symmetric-verdict" in section
+    assert "review-result" in section
+    assert "deterministic" in section and "recommendation" in section
+    assert "approve/comment/request-changes" in section
+    assert "static/ci-only" in section
+    assert "consent" in section
+    assert "posting" in section
+    _assert_no_stale_union(section, f"{doc} pr-review companion section")
 
 
 # --- --resolutions grammar guards: the skill/rubric examples must match the CLI parser --------------
