@@ -1099,14 +1099,18 @@ def _sym_peers(gate, rnd, bindings, outer_objs=()):
     return peers
 
 
-def _symmetric_dep_run(tmp_path, *, accepted="pre"):
-    """A pr-review run with one done node 'auth' backed by a symmetric dependency gate.
+def _symmetric_dep_run(tmp_path, *, accepted="pre", workflow="pr-review",
+                       severity="major"):
+    """A symmetric run with one done node 'auth' backed by a symmetric dependency gate.
 
-    ``accepted`` selects the accepted_finding_set placement: ``"pre"`` (valid, before the terminal),
-    ``"missing"`` (never appended), or ``"post"`` (appended after the terminal — orphan/invalid).
+    ``accepted`` selects the accepted_finding_set placement/validity: ``"pre"`` (valid, before the
+    terminal), ``"missing"`` (never appended), ``"post"`` (appended after the terminal —
+    orphan/invalid), or ``"malformed"`` (appended before the terminal but with an invalid-severity
+    payload — invalid). ``workflow`` chooses ``pr-review`` (default) or ``deep-dive``; ``severity``
+    sets the single accepted finding's severity.
     """
     cfg = Config.from_dict({"final_review": False})
-    run = init_run("symmetric dependency", cfg, base_dir=tmp_path, workflow="pr-review")
+    run = init_run("symmetric dependency", cfg, base_dir=tmp_path, workflow=workflow)
     dag = DAG.from_dict({
         "nodes": [{"id": "auth", "title": "Auth", "description": "d", "files": ["auth.py"],
                    "test_plan": "pytest", "status": "done"}],
@@ -1124,7 +1128,7 @@ def _symmetric_dep_run(tmp_path, *, accepted="pre"):
                artifact_sha256=plan_art, dag_sha256=dsha)
     run.append("gate_consensus", gate="plan", round=1, artifact_sha256=plan_art, dag_sha256=dsha)
 
-    candidate = _sym_candidate()
+    candidate = _sym_candidate(severity=severity)
     cand_text = json.dumps(candidate)
     cand_art = artifact_sha256(cand_text.encode("utf-8"))
     bindings = {"artifact_sha256": cand_art, "dag_sha256": dsha, "node_sha256": nsha}
@@ -1133,11 +1137,102 @@ def _symmetric_dep_run(tmp_path, *, accepted="pre"):
     run.append("symmetric_verdict", gate="dep:auth", round=1, outcome="CONSENSUS",
                peers=_sym_peers("dep:auth", 1, bindings),
                objections=[], candidate=candidate, **bindings)
-    if accepted == "pre":
-        run.append("accepted_finding_set", gate="dep:auth", round=1, payload=candidate, **bindings)
+    malformed = {"summary": "x", "findings": [{
+        "source_gate": "dep:auth", "id": "F1", "severity": "not-a-severity",
+        "location": "l", "claim": "c", "suggestion": "s"}]}
+    if accepted in ("pre", "malformed"):
+        payload = malformed if accepted == "malformed" else candidate
+        run.append("accepted_finding_set", gate="dep:auth", round=1, payload=payload, **bindings)
     run.append("gate_consensus", gate="dep:auth", round=1, **bindings)
     if accepted == "post":
         run.append("accepted_finding_set", gate="dep:auth", round=1, payload=candidate, **bindings)
+    run.append("node_status_change", node="auth", status="done")
+    return run
+
+
+def _sym_final_run(tmp_path):
+    """A CLEAN pr-review run (final_review enabled) with one done node 'auth' and an accepted FINAL
+    set that carries the dependency finding plus a cross-cutting ``source_gate: final`` finding — so
+    the effective result spans two source gates (``dep:auth`` and ``final``)."""
+    cfg = Config.from_dict({"final_review": True})
+    run = init_run("symmetric final", cfg, base_dir=tmp_path, workflow="pr-review")
+    dag = DAG.from_dict({
+        "nodes": [{"id": "auth", "title": "Auth", "description": "d", "files": ["auth.py"],
+                   "test_plan": "pytest", "status": "done"}],
+        "edges": [],
+    })
+    run.save_dag(dag.to_dict())
+    dsha, nsha = dag_sha256(dag), node_sha256(dag, "auth")
+
+    plan_art = artifact_sha256(b"plan")
+    run.append("builder_output", gate="plan", round=1, payload="plan", artifact_sha256=plan_art)
+    run.append("symmetric_verdict", gate="plan", round=1, outcome="CONSENSUS", objections=[],
+               peers=_sym_peers("plan", 1, {"artifact_sha256": plan_art, "dag_sha256": dsha}),
+               artifact_sha256=plan_art, dag_sha256=dsha)
+    run.append("gate_consensus", gate="plan", round=1, artifact_sha256=plan_art, dag_sha256=dsha)
+
+    candidate = _sym_candidate()
+    cand_text = json.dumps(candidate)
+    cand_art = artifact_sha256(cand_text.encode("utf-8"))
+    bindings = {"artifact_sha256": cand_art, "dag_sha256": dsha, "node_sha256": nsha}
+    run.append("builder_output", gate="dep:auth", round=1, payload=cand_text,
+               artifact_sha256=cand_art)
+    run.append("symmetric_verdict", gate="dep:auth", round=1, outcome="CONSENSUS", objections=[],
+               peers=_sym_peers("dep:auth", 1, bindings), candidate=candidate, **bindings)
+    run.append("accepted_finding_set", gate="dep:auth", round=1, payload=candidate, **bindings)
+    run.append("gate_consensus", gate="dep:auth", round=1, **bindings)
+    run.append("node_status_change", node="auth", status="done")
+
+    final_payload = {"summary": "final", "findings": candidate["findings"] + [{
+        "source_gate": "final", "id": "C1", "severity": "nit",
+        "location": "src/auth.py:1", "claim": "Cross-cutting note.", "suggestion": "Consider it."}]}
+    final_text = json.dumps(final_payload)
+    final_art = artifact_sha256(final_text.encode("utf-8"))
+    fbind = {"artifact_sha256": final_art, "dag_sha256": dsha}
+    run.append("builder_output", gate="final", round=1, payload=final_text, artifact_sha256=final_art)
+    run.append("symmetric_verdict", gate="final", round=1, outcome="CONSENSUS", objections=[],
+               peers=_sym_peers("final", 1, fbind), candidate=final_payload, **fbind)
+    run.append("accepted_finding_set", gate="final", round=1, payload=final_payload, **fbind)
+    run.append("gate_consensus", gate="final", round=1, **fbind)
+    return run
+
+
+def _sym_flags_run(tmp_path):
+    """A settled pr-review run whose dependency gate PROCEEDED WITH FLAGS: it persists an accepted
+    finding set AND carries an unresolved blocking peer objection. Exercises the report's separation
+    of accepted findings (result section) from peer objections (gate provenance)."""
+    cfg = Config.from_dict({"final_review": False, "on_cap": "proceed_with_flags"})
+    run = init_run("symmetric flags", cfg, base_dir=tmp_path, workflow="pr-review")
+    dag = DAG.from_dict({
+        "nodes": [{"id": "auth", "title": "Auth", "description": "d", "files": ["auth.py"],
+                   "test_plan": "pytest", "status": "done"}],
+        "edges": [],
+    })
+    run.save_dag(dag.to_dict())
+    dsha, nsha = dag_sha256(dag), node_sha256(dag, "auth")
+
+    plan_art = artifact_sha256(b"plan")
+    run.append("builder_output", gate="plan", round=1, payload="plan", artifact_sha256=plan_art)
+    run.append("symmetric_verdict", gate="plan", round=1, outcome="CONSENSUS", objections=[],
+               peers=_sym_peers("plan", 1, {"artifact_sha256": plan_art, "dag_sha256": dsha}),
+               artifact_sha256=plan_art, dag_sha256=dsha)
+    run.append("gate_consensus", gate="plan", round=1, artifact_sha256=plan_art, dag_sha256=dsha)
+
+    candidate = _sym_candidate(severity="nit")
+    cand_text = json.dumps(candidate)
+    cand_art = artifact_sha256(cand_text.encode("utf-8"))
+    bindings = {"artifact_sha256": cand_art, "dag_sha256": dsha, "node_sha256": nsha}
+    objections = [{"id": "A:OBJ1", "severity": "blocker", "location": "candidate:F1",
+                   "claim": "Peer A disputes the finding set.", "suggestion": "Add the missing case."}]
+    run.append("builder_output", gate="dep:auth", round=1, payload=cand_text,
+               artifact_sha256=cand_art)
+    run.append("symmetric_verdict", gate="dep:auth", round=1, outcome="PROCEED_WITH_FLAGS",
+               objections=objections, peers=_sym_peers("dep:auth", 1, bindings, objections),
+               candidate=candidate, **bindings)
+    run.append("accepted_finding_set", gate="dep:auth", round=1, payload=candidate,
+               accepted_with_flags=True, open_objections=["A:OBJ1"], **bindings)
+    run.append("gate_proceeded_with_flags", gate="dep:auth", round=1,
+               open_findings=["A:OBJ1"], **bindings)
     run.append("node_status_change", node="auth", status="done")
     return run
 
@@ -1187,3 +1282,132 @@ def test_report_symmetric_post_terminal_accepted_set_is_invalid(tmp_path):
     md = render_markdown(run)
     assert "INVALID" in md
     assert "CLEAN" not in md
+
+
+# --- Task 4: mode-aware symmetric result rendering ---------------------------
+
+def _section(md, heading):
+    """The lines of the ``## heading`` section (up to the next ``## `` heading), or ''."""
+    lines = md.split("\n")
+    out, capturing = [], False
+    for line in lines:
+        if line.startswith("## "):
+            if capturing:
+                break
+            capturing = line[3:].strip().startswith(heading)
+            if capturing:
+                continue
+        elif capturing:
+            out.append(line)
+    return "\n".join(out)
+
+
+def test_report_symmetric_header_labels_peers_not_builder_critic(tmp_path):
+    # A symmetric run's header attributes the two configured role slots as Peer A / Peer B — never the
+    # Builder/Critic asymmetry. The configured models still appear; the Builder:/Critic: header labels
+    # do not.
+    run = _symmetric_dep_run(tmp_path, accepted="pre")
+    md = render_markdown(run)
+    header = md.split("## ", 1)[0]  # everything before the first section heading
+    assert "**Peer A:**" in header and "**Peer B:**" in header
+    assert DEFAULTS["builder"]["model"] in header and DEFAULTS["critic"]["model"] in header
+    assert "**Builder:**" not in md and "**Critic:**" not in md
+
+
+def test_report_build_header_retains_builder_critic_labels(tmp_path):
+    # Backward compatibility: the asymmetric build workflow keeps the Builder/Critic header and never
+    # relabels to peers.
+    run = _build_run(tmp_path)
+    md = render_markdown(run)
+    assert "**Builder:**" in md and "**Critic:**" in md
+    assert "Peer A" not in md and "Peer B" not in md
+
+
+def test_report_symmetric_accepted_findings_grouped_by_source_gate(tmp_path):
+    # The effective (FINAL) result spans two source gates; the report groups accepted findings under
+    # each source_gate heading, keeping every finding under its own gate.
+    run = _sym_final_run(tmp_path)
+    md = render_markdown(run)
+    result = _section(md, "Review result")
+    assert "dep:auth" in result and "final" in result
+    assert "F1" in result and "C1" in result
+    # The dep finding is grouped under dep:auth and the cross-cutting one under final: the final
+    # group header appears after the dep:auth group header.
+    assert result.index("dep:auth") < result.index("final")
+
+
+def test_report_symmetric_clean_status_coexists_with_request_changes(tmp_path):
+    # Workflow status (CLEAN = every configured phase accepted and bound) is independent of the PR
+    # recommendation (derived from the accepted finding set): a CLEAN run with an accepted blocking
+    # finding still recommends REQUEST_CHANGES.
+    run = _symmetric_dep_run(tmp_path, accepted="pre", severity="major")
+    md = render_markdown(run)
+    assert "**Status:** CLEAN" in md
+    assert "**Review recommendation:** REQUEST_CHANGES" in md
+
+
+def test_report_symmetric_clean_no_findings_recommends_approve(tmp_path):
+    # No accepted findings and no unresolved objections -> APPROVE, rendered as the exact separate
+    # recommendation line.
+    run = init_run("clean approve", Config.from_dict({"final_review": False}),
+                   base_dir=tmp_path, workflow="pr-review")
+    dag = DAG.from_dict({"nodes": [{"id": "auth", "title": "Auth", "description": "d",
+                                    "files": ["auth.py"], "test_plan": "pytest",
+                                    "status": "done"}], "edges": []})
+    run.save_dag(dag.to_dict())
+    dsha, nsha = dag_sha256(dag), node_sha256(dag, "auth")
+    plan_art = artifact_sha256(b"plan")
+    run.append("builder_output", gate="plan", round=1, payload="plan", artifact_sha256=plan_art)
+    run.append("symmetric_verdict", gate="plan", round=1, outcome="CONSENSUS", objections=[],
+               peers=_sym_peers("plan", 1, {"artifact_sha256": plan_art, "dag_sha256": dsha}),
+               artifact_sha256=plan_art, dag_sha256=dsha)
+    run.append("gate_consensus", gate="plan", round=1, artifact_sha256=plan_art, dag_sha256=dsha)
+    empty = {"summary": "clean", "findings": []}
+    cand_text = json.dumps(empty)
+    cand_art = artifact_sha256(cand_text.encode("utf-8"))
+    bindings = {"artifact_sha256": cand_art, "dag_sha256": dsha, "node_sha256": nsha}
+    run.append("builder_output", gate="dep:auth", round=1, payload=cand_text, artifact_sha256=cand_art)
+    run.append("symmetric_verdict", gate="dep:auth", round=1, outcome="CONSENSUS", objections=[],
+               peers=_sym_peers("dep:auth", 1, bindings), candidate=empty, **bindings)
+    run.append("accepted_finding_set", gate="dep:auth", round=1, payload=empty, **bindings)
+    run.append("gate_consensus", gate="dep:auth", round=1, **bindings)
+    run.append("node_status_change", node="auth", status="done")
+    md = render_markdown(run)
+    assert "**Status:** CLEAN" in md
+    assert "**Review recommendation:** APPROVE" in md
+
+
+def test_report_symmetric_peer_objections_separate_from_accepted_findings(tmp_path):
+    # A proceeded-with-flags gate persists an accepted finding AND an unresolved blocking objection.
+    # The accepted finding renders in the result section; the peer objection stays in gate
+    # provenance — never mixed into the accepted-findings result.
+    run = _sym_flags_run(tmp_path)
+    md = render_markdown(run)
+    result = _section(md, "Review result")
+    gates = _section(md, "Gates")
+    assert "A:OBJ1" in gates  # objection lives in gate provenance
+    assert "A:OBJ1" not in result  # never surfaced as an accepted finding
+    assert "F1" in result  # the accepted finding is in the result section
+    # A settled-with-flags run is not CLEAN, so no final recommendation is fabricated.
+    assert "**Review recommendation:**" not in md
+
+
+def test_report_deep_dive_omits_recommendation(tmp_path):
+    # A deep-dive investigation returns a finding set, never an Approve/Comment/Request-changes call.
+    run = _symmetric_dep_run(tmp_path, accepted="pre", workflow="deep-dive")
+    md = render_markdown(run)
+    assert "**Status:** CLEAN" in md
+    assert "recommendation" not in md.lower()
+    result = _section(md, "Investigation result")
+    assert "F1" in result  # the accepted finding is still rendered
+
+
+def test_report_symmetric_malformed_accepted_history_is_invalid_no_result(tmp_path):
+    # Malformed accepted finding history renders INVALID in the Summary and NEVER a success-shaped
+    # result: no result section and no fabricated recommendation.
+    run = _symmetric_dep_run(tmp_path, accepted="malformed")
+    md = render_markdown(run)
+    assert "INVALID" in md
+    assert "CLEAN" not in md
+    assert "**Review recommendation:**" not in md
+    assert "## Review result" not in md

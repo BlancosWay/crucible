@@ -10,6 +10,13 @@ from crucible.config import Config, resolved_config_shape_error
 from crucible.dag import DAG
 from crucible.integrity import RUN_SCHEMA_VERSION, run_schema_version
 from crucible.runlog import RunLog
+from crucible.symmetric import (
+    PEER_SLOT_ROLES,
+    SYMMETRIC_WORKFLOWS,
+    accepted_findings,
+    review_result,
+    workflow_kind,
+)
 from crucible.workflow import WorkflowIssue, workflow_issues
 
 
@@ -125,6 +132,101 @@ def _config_aware_issues(
     return workflow_issues(events, dag_obj, cfg_obj)
 
 
+def _gate_tally(
+    gates: dict[str, list[dict[str, Any]]]
+) -> tuple[int, int, int, int, list[tuple[str, list[str]]]]:
+    """Each gate's authoritative outcome is its LAST terminal event (or None => undecided).
+
+    Returns ``(consensus, flagged, capped, undecided, findings)`` where ``findings`` is the list of
+    ``(gate_id, open finding ids)`` for the flagged/capped gates. Shared by the run summary and the
+    symmetric result section so both read gate outcomes identically.
+    """
+    consensus = flagged = capped = undecided = 0
+    findings: list[tuple[str, list[str]]] = []
+    for gate, gate_events in gates.items():
+        terminal = [e for e in gate_events if e["event"] in _TERMINAL_EVENTS]
+        if not terminal:
+            undecided += 1
+            continue
+        last = terminal[-1]
+        if last["event"] == "gate_consensus":
+            consensus += 1
+        elif last["event"] == "gate_proceeded_with_flags":
+            flagged += 1
+            findings.append((gate, list(last.get("open_findings", []))))
+        else:  # gate_capped
+            capped += 1
+            findings.append((gate, list(last.get("open_findings", []))))
+    return consensus, flagged, capped, undecided, findings
+
+
+def _schema_v2_issues(
+    events: list[dict[str, Any]],
+    dag: dict[str, Any],
+    config: dict[str, Any] | None,
+    schema_version: int | None,
+    dag_present: bool,
+    dag_load_error: bool,
+) -> list[WorkflowIssue]:
+    """The schema-v2 configured-workflow issues, or ``[]`` for a legacy/absent-tree run.
+
+    The single owner of the schema/config-aware validation the report consumes. A PRESENT current
+    tree that cannot be loaded as a JSON object fails closed to an ``invalid`` issue; a present,
+    loadable tree is validated by :func:`_config_aware_issues` (which itself fails closed on a
+    malformed tree/config). A legacy run or an ABSENT tree yields ``[]`` (never certifiable / still
+    in progress). Shared by the run summary and the symmetric result section so both agree on
+    INVALID/MISSING integrity.
+    """
+    schema_current = schema_version is not None and schema_version >= RUN_SCHEMA_VERSION
+    if not schema_current:
+        return []
+    if dag_load_error:
+        return [WorkflowIssue(
+            "invalid",
+            "the current dependency tree (dag.json) is present but is not a well-formed JSON "
+            "object and cannot be parsed, bound, or certified")]
+    if dag_present:
+        return _config_aware_issues(events, dag, config)
+    return []
+
+
+def _overall_status(
+    schema_current: bool,
+    issues: list[WorkflowIssue],
+    tally: tuple[int, int, int, int],
+    dag_done: bool,
+) -> str:
+    """The run's overall status label + rationale, by the precedence (most severe first):
+
+        LEGACY / UNVERIFIED > INVALID > BLOCKED > FLAGGED > CLEAN > IN PROGRESS
+
+    Derived purely from the schema flag, the workflow issues, the gate tally, and whether every node
+    is ``done``. Owned in one place so the summary banner and the symmetric result section never
+    disagree about whether a run is CLEAN (complete and valid).
+    """
+    consensus, flagged, capped, undecided = tally
+    total = consensus + flagged + capped + undecided
+    invalid = [i for i in issues if i.kind == "invalid"]
+    missing = [i for i in issues if i.kind == "missing"]
+    flagged_issues = [i for i in issues if i.kind == "flagged"]
+    if not schema_current:
+        return (f"LEGACY / UNVERIFIED — this run predates schema v{RUN_SCHEMA_VERSION}; its "
+                f"provenance is unverified and can never be certified")
+    if invalid:
+        return (f"INVALID — {len(invalid)} workflow integrity violation(s) recorded in the run "
+                f"log")
+    if capped:
+        return f"BLOCKED — {capped} of {total} gate(s) capped with unresolved findings"
+    if flagged:
+        return f"FLAGGED — {flagged} of {total} gate(s) proceeded with unresolved findings"
+    if flagged_issues:
+        return (f"FLAGGED — {len(flagged_issues)} node(s) completed outside an accepted review "
+                f"gate")
+    if not missing and total and consensus == total and dag_done:
+        return f"CLEAN — all {total} gate(s) reached consensus"
+    return "IN PROGRESS — the run has not settled every configured phase"
+
+
 def _run_summary_lines(
     events: list[dict[str, Any]],
     dag: dict[str, Any],
@@ -159,22 +261,7 @@ def _run_summary_lines(
     """
     gates = _events_by_gate(events)
     # Each gate's authoritative outcome is its LAST terminal event (or None => undecided).
-    consensus = flagged = capped = undecided = 0
-    findings: list[tuple[str, list[str]]] = []  # (gate_id, open finding ids) for flagged/capped
-    for gate, gate_events in gates.items():
-        terminal = [e for e in gate_events if e["event"] in _TERMINAL_EVENTS]
-        if not terminal:
-            undecided += 1
-            continue
-        last = terminal[-1]
-        if last["event"] == "gate_consensus":
-            consensus += 1
-        elif last["event"] == "gate_proceeded_with_flags":
-            flagged += 1
-            findings.append((gate, list(last.get("open_findings", []))))
-        else:  # gate_capped
-            capped += 1
-            findings.append((gate, list(last.get("open_findings", []))))
+    consensus, flagged, capped, undecided, findings = _gate_tally(gates)
 
     total = consensus + flagged + capped + undecided
     nodes = dag.get("nodes", [])
@@ -188,36 +275,10 @@ def _run_summary_lines(
     # inside `_config_aware_issues`. Either way the raw `dag_done` CLEAN check below can never certify
     # an uncertifiable run. An ABSENT tree is not routed here at all and stays IN PROGRESS below.
     schema_current = schema_version is not None and schema_version >= RUN_SCHEMA_VERSION
-    issues: list[WorkflowIssue] = []
-    if schema_current:
-        if dag_load_error:
-            issues = [WorkflowIssue(
-                "invalid",
-                "the current dependency tree (dag.json) is present but is not a well-formed JSON "
-                "object and cannot be parsed, bound, or certified")]
-        elif dag_present:
-            issues = _config_aware_issues(events, dag, config)
-    invalid = [i for i in issues if i.kind == "invalid"]
-    missing = [i for i in issues if i.kind == "missing"]
-    flagged_issues = [i for i in issues if i.kind == "flagged"]
+    issues = _schema_v2_issues(events, dag, config, schema_version, dag_present, dag_load_error)
 
-    if not schema_current:
-        status = (f"LEGACY / UNVERIFIED — this run predates schema v{RUN_SCHEMA_VERSION}; its "
-                  f"provenance is unverified and can never be certified")
-    elif invalid:
-        status = (f"INVALID — {len(invalid)} workflow integrity violation(s) recorded in the run "
-                  f"log")
-    elif capped:
-        status = f"BLOCKED — {capped} of {total} gate(s) capped with unresolved findings"
-    elif flagged:
-        status = f"FLAGGED — {flagged} of {total} gate(s) proceeded with unresolved findings"
-    elif flagged_issues:
-        status = (f"FLAGGED — {len(flagged_issues)} node(s) completed outside an accepted review "
-                  f"gate")
-    elif not missing and total and consensus == total and dag_done:
-        status = f"CLEAN — all {total} gate(s) reached consensus"
-    else:
-        status = "IN PROGRESS — the run has not settled every configured phase"
+    status = _overall_status(schema_current, issues,
+                             (consensus, flagged, capped, undecided), dag_done)
 
     counts = f"{total} total \u00b7 {consensus} consensus \u00b7 {flagged} flagged \u00b7 {capped} capped"
     if undecided:
@@ -314,6 +375,100 @@ def _run_summary_lines(
     return lines
 
 
+def _symmetric_result_lines(
+    events: list[dict[str, Any]],
+    dag: dict[str, Any],
+    config: dict[str, Any],
+    *,
+    schema_version: int | None,
+    dag_present: bool,
+    dag_load_error: bool,
+) -> list[str]:
+    """The deterministic symmetric review deliverable section (deep-dive / pr-review only).
+
+    Renders the accepted finding set (grouped by ``source_gate``) and — for a COMPLETE, valid
+    pr-review run only — the separate, exact ``**Review recommendation:** APPROVE|COMMENT|
+    REQUEST_CHANGES`` line. Deliberately SEPARATE from the workflow ``## Summary`` status: a CLEAN
+    workflow can still recommend REQUEST_CHANGES (the recommendation is derived from the accepted
+    findings, never from workflow integrity). Peer objections are NOT part of this set — they stay in
+    the ``## Gates`` provenance, visually separate from the accepted findings.
+
+    Fails closed rather than fabricate: a run that is not a certifiable schema-v2 run with a present,
+    loadable tree, or whose accepted history records ANY integrity violation (the Summary renders it
+    ``INVALID``), yields NO result section. A recommendation is derived ONLY once the configured
+    workflow is CLEAN (complete and valid); an in-progress/flagged/capped run shows the partial
+    accepted findings so far with no recommendation. The projection helpers (``accepted_findings`` /
+    ``review_result``) own the finding/recommendation logic; this only renders their output. Gating on
+    "no invalid issue" also keeps those helpers off history that would raise (a malformed/forged
+    accepted set is an ``invalid`` issue, so the partial ``accepted_findings`` union here is total).
+    """
+    workflow = workflow_kind(events)
+    if workflow not in SYMMETRIC_WORKFLOWS:
+        return []
+    schema_current = schema_version is not None and schema_version >= RUN_SCHEMA_VERSION
+    if not schema_current or dag_load_error or not dag_present:
+        return []
+    issues = _schema_v2_issues(events, dag, config, schema_version, dag_present, dag_load_error)
+    if any(i.kind == "invalid" for i in issues):
+        return []
+
+    nodes = dag.get("nodes", [])
+    dag_done = bool(nodes) and all(n.get("status") == "done" for n in nodes)
+    consensus, flagged, capped, undecided, _ = _gate_tally(_events_by_gate(events))
+    complete = _overall_status(
+        schema_current, issues, (consensus, flagged, capped, undecided), dag_done).startswith("CLEAN")
+
+    recommendation: str | None = None
+    if complete:
+        # A valid CLEAN run has a complete resolved config (else `_config_aware_issues` would have
+        # returned an `invalid` issue and we would have bailed), so this never raises. `review_result`
+        # promotes the accepted FINAL set when FINAL is configured, else the dependency union.
+        cfg = Config.from_dict(config)
+        result = review_result(events, cfg, workflow)
+        finding_dicts = result["findings"]
+        recommendation = result.get("recommendation")
+    else:
+        # Partial in-progress helper: the accepted dependency union so far (no scope guard needed —
+        # a valid, in-scope run has no out-of-scope/duplicate/malformed accepted sets).
+        finding_dicts = [f.to_dict() for f in accepted_findings(events).findings]
+        if not finding_dicts:
+            return []  # nothing accepted yet; the Summary already shows the in-progress status
+
+    heading = "Review result" if workflow == "pr-review" else "Investigation result"
+    lines = [f"## {heading}", ""]
+    if recommendation is not None:
+        # A separate, exact line — derived from the accepted finding set, never the workflow status.
+        lines.append(f"**Review recommendation:** {recommendation}")
+        lines.append("")
+    if not complete:
+        lines.append("_Partial result — the review has not settled every configured gate; no "
+                     "recommendation is derived until it is complete._")
+        lines.append("")
+
+    lines.append(f"**Accepted findings:** {len(finding_dicts)}")
+    lines.append("")
+    # Group by source_gate in first-appearance order. Every untrusted field is `_san`-sanitized —
+    # the same non-injection convention as the gate-provenance findings.
+    order: list[str] = []
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for finding in finding_dicts:
+        gate = finding.get("source_gate")
+        if gate not in groups:
+            groups[gate] = []
+            order.append(gate)
+        groups[gate].append(finding)
+    for gate in order:
+        lines.append(f"- **{_san(gate)}**")
+        for finding in groups[gate]:
+            lines.append(
+                f"  - `{_san(finding.get('id'))}` [{_san(finding.get('severity'))}] "
+                f"{_san(finding.get('location'))}: {_san(finding.get('claim'))} -> "
+                f"{_san(finding.get('suggestion'))}"
+            )
+    lines.append("")
+    return lines
+
+
 
 def render_markdown(run: RunLog) -> str:
     events = run.read_events()
@@ -325,17 +480,33 @@ def render_markdown(run: RunLog) -> str:
     config = start.get("config")
     if not isinstance(config, dict):
         config = {}
+    workflow = workflow_kind(events)
+    schema_version = run_schema_version(events)
 
     lines: list[str] = []
     lines.append("# Crucible Run Report")
     lines.append("")
     lines.append(f"**Goal:** {_san(goal)}")
-    builder = config.get("builder", {})
-    critic = config.get("critic", {})
-    lines.append(
-        f"**Builder:** {_san(builder.get('model', '?'))} ({_san(builder.get('effort', '?'))}) - "
-        f"**Critic:** {_san(critic.get('model', '?'))} ({_san(critic.get('effort', '?'))})"
-    )
+    if workflow in SYMMETRIC_WORKFLOWS:
+        # Symmetric workflows reuse the two configured role slots as two EQUAL peers (Peer A = the
+        # builder slot, Peer B = the critic slot) — a provenance mapping, never a Builder/Critic
+        # asymmetry. Nested slots are isinstance-guarded so a malformed config degrades to `?`
+        # rather than raising (the schema-aware Summary fails such a run closed separately).
+        peer_a = config.get(PEER_SLOT_ROLES["A"], {})
+        peer_b = config.get(PEER_SLOT_ROLES["B"], {})
+        peer_a = peer_a if isinstance(peer_a, dict) else {}
+        peer_b = peer_b if isinstance(peer_b, dict) else {}
+        lines.append(
+            f"**Peer A:** {_san(peer_a.get('model', '?'))} ({_san(peer_a.get('effort', '?'))}) - "
+            f"**Peer B:** {_san(peer_b.get('model', '?'))} ({_san(peer_b.get('effort', '?'))})"
+        )
+    else:
+        builder = config.get("builder", {})
+        critic = config.get("critic", {})
+        lines.append(
+            f"**Builder:** {_san(builder.get('model', '?'))} ({_san(builder.get('effort', '?'))}) - "
+            f"**Critic:** {_san(critic.get('model', '?'))} ({_san(critic.get('effort', '?'))})"
+        )
     lines.append("")
 
     # Load the current dependency tree, fail-closed. Three outcomes drive the Summary:
@@ -360,7 +531,17 @@ def render_markdown(run: RunLog) -> str:
             dag_load_error = True
 
     lines.extend(_run_summary_lines(
-        events, dag, config=config, schema_version=run_schema_version(events),
+        events, dag, config=config, schema_version=schema_version,
+        dag_present=dag_present, dag_load_error=dag_load_error,
+    ))
+
+    # The symmetric (deep-dive/pr-review) review deliverable: accepted findings grouped by source
+    # gate and — only for a COMPLETE, valid pr-review run — the separate PR recommendation. Empty for
+    # build runs and for any run the Summary cannot certify, so the workflow status and the review
+    # recommendation stay strictly separate. Rendered before the gate provenance so the peers'
+    # objections (in `## Gates`) remain visually separate from the accepted findings.
+    lines.extend(_symmetric_result_lines(
+        events, dag, config, schema_version=schema_version,
         dag_present=dag_present, dag_load_error=dag_load_error,
     ))
 

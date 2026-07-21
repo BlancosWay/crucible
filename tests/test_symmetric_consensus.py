@@ -7,6 +7,7 @@ from pathlib import Path
 from crucible.config import Config
 from crucible.dag import DAG
 from crucible.integrity import artifact_sha256, dag_sha256, node_sha256
+from crucible.report import render_markdown
 from crucible.runlog import init_run
 
 
@@ -210,3 +211,56 @@ def test_review_result_rejects_forged_final_when_final_review_disabled(tmp_path)
     result = _run(["review-result", "--run", str(run.path)])
 
     assert result.returncode != 0, result.stdout
+
+
+def test_report_recommendation_matches_review_result_cli(tmp_path):
+    # Task 4 integration: the rendered report and the deterministic `review-result` CLI agree on the
+    # PR recommendation for the SAME complete run, and the report keeps workflow status (CLEAN)
+    # separate from the recommendation (REQUEST_CHANGES). Both derive it from the accepted finding
+    # set, never from workflow integrity.
+    run = init_run("report matches cli", Config.from_dict({"final_review": False}),
+                   base_dir=tmp_path, workflow="pr-review")
+    dag = DAG.from_dict({
+        "nodes": [{"id": "auth", "title": "Auth", "description": "d", "files": ["auth.py"],
+                   "test_plan": "pytest", "status": "done"}],
+        "edges": [],
+    })
+    run.save_dag(dag.to_dict())
+    dsha, nsha = dag_sha256(dag), node_sha256(dag, "auth")
+
+    plan_payload = "investigation plan"
+    plan_art = artifact_sha256(plan_payload.encode("utf-8"))
+    run.append("builder_output", gate="plan", round=1, payload=plan_payload,
+               artifact_sha256=plan_art)
+    run.append("symmetric_verdict", gate="plan", round=1, outcome="CONSENSUS", objections=[],
+               peers=_peers("plan", 1, {"artifact_sha256": plan_art, "dag_sha256": dsha}),
+               artifact_sha256=plan_art, dag_sha256=dsha)
+    run.append("gate_consensus", gate="plan", round=1, artifact_sha256=plan_art, dag_sha256=dsha)
+
+    candidate = {
+        "summary": "accepted findings",
+        "findings": [{
+            "source_gate": "dep:auth", "id": "F1", "severity": "major",
+            "location": "src/auth.py:42", "claim": "Expired refresh tokens are accepted.",
+            "suggestion": "Reject expired refresh tokens.",
+        }],
+    }
+    cand_text = json.dumps(candidate)
+    cand_art = artifact_sha256(cand_text.encode("utf-8"))
+    bindings = {"artifact_sha256": cand_art, "dag_sha256": dsha, "node_sha256": nsha}
+    run.append("builder_output", gate="dep:auth", round=1, payload=cand_text,
+               artifact_sha256=cand_art)
+    run.append("symmetric_verdict", gate="dep:auth", round=1, outcome="CONSENSUS", objections=[],
+               peers=_peers("dep:auth", 1, bindings), candidate=candidate, **bindings)
+    run.append("accepted_finding_set", gate="dep:auth", round=1, payload=candidate, **bindings)
+    run.append("gate_consensus", gate="dep:auth", round=1, **bindings)
+    run.append("node_status_change", node="auth", status="done")
+
+    cli = _run(["review-result", "--run", str(run.path)])
+    assert cli.returncode == 0, cli.stderr
+    recommendation = json.loads(cli.stdout)["recommendation"]
+    assert recommendation == "REQUEST_CHANGES"
+
+    md = render_markdown(run)
+    assert "**Status:** CLEAN" in md  # workflow integrity is CLEAN ...
+    assert f"**Review recommendation:** {recommendation}" in md  # ... yet recommends REQUEST_CHANGES
