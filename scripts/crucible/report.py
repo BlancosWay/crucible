@@ -19,7 +19,7 @@ from crucible.symmetric import (
     review_result,
     workflow_kind,
 )
-from crucible.target import target_from_events, target_sha256
+from crucible.target import target_from_events, target_sha256, validate_source_materialization
 from crucible.workflow import WorkflowIssue, workflow_issues
 
 
@@ -176,8 +176,10 @@ def _schema_v2_issues(
     The single owner of the schema/config-aware validation the report consumes. A PRESENT current
     tree that cannot be loaded as a JSON object fails closed to an ``invalid`` issue; a present,
     loadable tree is validated by :func:`_config_aware_issues` (which itself fails closed on a
-    malformed tree/config). A legacy run or an ABSENT tree yields ``[]`` (never certifiable / still
-    in progress). Shared by the run summary and the symmetric result section so both agree on
+    malformed tree/config). A legacy run yields ``[]`` (never certifiable). An ABSENT tree yields only
+    the fail-closed source-materialization integrity issues (F2/F3) — a forged/duplicate/target-less
+    ``source_materialized`` is INVALID even before a tree is loaded — and otherwise ``[]`` (still in
+    progress). Shared by the run summary and the symmetric result section so both agree on
     INVALID/MISSING integrity.
     """
     schema_current = schema_version is not None and schema_version >= RUN_SCHEMA_VERSION
@@ -188,7 +190,7 @@ def _schema_v2_issues(
     # single `workflow_kind` read path) BEFORE the tree checks, so it renders INVALID even when no
     # tree is loaded and it never routes a corrupt run down the config-aware validator.
     try:
-        workflow_kind(events)
+        workflow = workflow_kind(events)
     except CorruptWorkflowError as exc:
         return [WorkflowIssue(
             "invalid", f"the run's recorded workflow metadata is corrupt: {exc}")]
@@ -199,7 +201,13 @@ def _schema_v2_issues(
             "object and cannot be parsed, bound, or certified")]
     if dag_present:
         return _config_aware_issues(events, dag, config)
-    return []
+    # An ABSENT tree normally stays IN PROGRESS (nothing to certify yet). But a source snapshot is
+    # fail-closed downstream work (F2/F3): a `source_materialized` event is a concrete materialization
+    # that either bound a valid revision-bound target or is tampering — it is validated NOW, tree or
+    # no tree, so a forged/duplicate/target-less/wrong source event renders the run INVALID rather than
+    # being masked as merely in progress. Tree-dependent phases still wait for the tree.
+    return [WorkflowIssue("invalid", msg)
+            for msg in validate_source_materialization(events, workflow).issues]
 
 
 def _overall_status(
@@ -526,15 +534,16 @@ def _symmetric_result_lines(
     return lines
 
 
-def _source_snapshot_line(events: list[dict[str, Any]], target_hash: str) -> str | None:
-    """Render the source-snapshot status ONLY from a ``source_materialized`` event bound to the same
-    target (its ``target_sha256`` equals the loaded target's hash). A snapshot recorded against any
-    other target is not a snapshot of THIS review target, so its status is never shown here."""
-    bound = [e for e in events if e.get("event") == "source_materialized"
-             and e.get("target_sha256") == target_hash]
-    if not bound:
+def _source_snapshot_line(events: list[dict[str, Any]], workflow: str | None) -> str | None:
+    """Render the source-snapshot status ONLY from the centrally-VALIDATED ``source_materialized``
+    event (:func:`crucible.target.validate_source_materialization`): a single, in-order snapshot of a
+    valid revision-bound loaded target with a matching kind/hash and a well-formed archive digest. A
+    forged diff-file snapshot, a duplicate, a malformed/wrong-kind/wrong-hash/out-of-order event, or a
+    snapshot of any other target never renders here (the Summary renders such a run INVALID)."""
+    event = validate_source_materialization(events, workflow).event
+    if event is None:
         return None
-    archive = str(bound[-1].get("archive_sha256", ""))
+    archive = str(event.get("archive_sha256", ""))
     return f"**Source snapshot:** materialized (archive `{_san(archive[:12])}…`)"
 
 
@@ -581,7 +590,7 @@ def _review_target_lines(events: list[dict[str, Any]], workflow: str | None) -> 
     lines.append(f"**Changed files ({len(files)}):** {listed}")
     lines.append(f"**Patch hash:** `{_san(target.diff_sha256)}`")
     lines.append(f"**Target hash:** `{_san(sha)}`")
-    snapshot = _source_snapshot_line(events, sha)
+    snapshot = _source_snapshot_line(events, workflow)
     if snapshot is not None:
         lines.append(snapshot)
     lines.append("")

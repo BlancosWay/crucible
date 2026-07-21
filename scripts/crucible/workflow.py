@@ -41,7 +41,12 @@ from crucible.symmetric import (
     validate_final_finding_set,
     workflow_kind,
 )
-from crucible.target import target_event_issues, target_from_events, target_sha256
+from crucible.target import (
+    target_event_issues,
+    target_from_events,
+    target_sha256,
+    validate_source_materialization,
+)
 
 if TYPE_CHECKING:  # annotation-only imports keep this module free of runtime import cycles
     from crucible.config import Config
@@ -290,8 +295,17 @@ def _target_issues(
       decision (and any source snapshot) must bind that target's authoritative hash. A
       missing/mismatched target on an in-scope ``symmetric_verdict``/``accepted_finding_set``/terminal
       or a ``source_materialized`` is ``invalid`` (a decision bound to a substituted/absent target).
+    - source-MATERIALIZATION integrity (:func:`crucible.target.validate_source_materialization`) —
+      evaluated on EVERY path so a source snapshot is fail-closed even when no target is loaded: a
+      source event without a single valid revision-bound preceding target, or one with the wrong
+      kind/hash/archive/order, or a duplicate, is ``invalid`` — never merely 'missing'.
     """
     issues = [WorkflowIssue("invalid", msg) for msg in target_event_issues(events, workflow)]
+    # Source materialization is validated on EVERY workflow path (fail-closed): a source event bound
+    # to a missing/invalid/wrong/revision-unbound target — or recorded in a non-pr-review run — is
+    # invalid, never merely missing. Centralized in crucible.target so workflow and report agree.
+    issues.extend(WorkflowIssue("invalid", msg)
+                  for msg in validate_source_materialization(events, workflow).issues)
     if workflow != "pr-review":
         return issues
     try:
@@ -299,8 +313,9 @@ def _target_issues(
     except ValueError:
         return issues  # duplicate/malformed already reported by target_event_issues above
     if target is None:
-        # No target loaded. If protocol work happened, target_event_issues already flagged it invalid;
-        # otherwise this is an init-only pr-review run that is simply in progress.
+        # No target loaded. If protocol work (or an invalid source event) happened, that is already
+        # flagged invalid above; otherwise this is an init-only pr-review run that is simply in
+        # progress.
         if not issues:
             issues.append(WorkflowIssue(
                 "missing", "pr-review target is not loaded yet (run load-target)", phase="target"))
@@ -312,7 +327,7 @@ def _target_issues(
 def _target_binding_issues(
     events: list[dict[str, Any]], dag: DAG, cfg: Config, expected: str
 ) -> list["WorkflowIssue"]:
-    """Every IN-SCOPE gate decision (and any source snapshot) must bind the loaded target's hash.
+    """Every IN-SCOPE gate decision must bind the loaded target's hash.
 
     In scope are the ``plan`` gate, the current dependency gates, and — only when ``final_review`` —
     the ``final`` gate; an out-of-scope/ghost gate is already rejected by the symmetric scope guards,
@@ -320,7 +335,8 @@ def _target_binding_issues(
     terminal <-> peers) is enforced by ``resolve_gate_acceptance``/``_peer_attestation_issues`` via the
     shared ``event_bindings`` (which now includes ``target_sha256``); this adds the AUTHORITATIVE
     anchor against the loaded target so a fully consistent trio bound to a substituted target still
-    fails closed.
+    fails closed. The ``source_materialized`` snapshot is validated separately and fail-closed by
+    :func:`crucible.target.validate_source_materialization` (consumed in :func:`_target_issues`).
     """
     in_scope = {"plan", *(f"dep:{nid}" for nid in dag.order)}
     if cfg.final_review:
@@ -334,10 +350,6 @@ def _target_binding_issues(
                     "invalid",
                     f"symmetric gate {e.get('gate')!r} {event} is not bound to the loaded review "
                     f"target (target hash missing or mismatched)"))
-        elif event == "source_materialized" and e.get("target_sha256") != expected:
-            issues.append(WorkflowIssue(
-                "invalid",
-                "source snapshot is bound to a different target than the loaded review target"))
     return issues
 
 

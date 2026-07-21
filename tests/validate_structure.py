@@ -37,9 +37,10 @@ SEMVER = re.compile(
 # Deterministic helper modules the skill/CLI depend on.
 PACKAGE_MODULES = ("__init__", "__main__", "config", "dag", "integrity", "verdict", "runlog", "symmetric", "workflow", "report", "target", "cli")
 
-# Test modules that must accompany their deterministic package module (registered here so a dropped
-# suite is caught structurally, not only by a green run that silently skipped it).
-REQUIRED_TESTS = ("test_target.py",)
+# Test modules that must accompany their deterministic module (registered here so a dropped suite is
+# caught structurally, not only by a green run that silently skipped it). ``test_check.py`` guards the
+# governance entrypoint's Git-environment isolation (``scripts/check.py``).
+REQUIRED_TESTS = ("test_target.py", "test_check.py")
 
 # Reference docs each skill's orchestrator depends on, keyed by skill directory name. Additive:
 # registering a new skill's required refs here does not touch crucible's set.

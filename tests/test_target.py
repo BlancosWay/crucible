@@ -33,6 +33,7 @@ from crucible.target import (
     target_event_issues,
     target_from_events,
     target_sha256,
+    validate_source_materialization,
 )
 
 
@@ -482,6 +483,134 @@ def test_target_event_issues_flags_malformed():
     ev = _loaded_event(diff_target())
     ev["target_sha256"] = "0" * 64
     assert target_event_issues([{"event": "run_start"}, ev], "pr-review")
+
+
+# --------------------------------------------------------------------------------------
+# validate_source_materialization — centralized fail-closed source-snapshot validation (F2/F3)
+# --------------------------------------------------------------------------------------
+
+def _source_event(manifest, **overrides):
+    target = ReviewTarget.from_dict(manifest)
+    ev = {"event": "source_materialized", "kind": target.kind,
+          "target_sha256": target_sha256(target), "archive_sha256": "d" * 64}
+    ev.update(overrides)
+    return ev
+
+
+def _materialized_run(manifest, **overrides):
+    """run_start + target_loaded + one source_materialized (fields overridable) for ``manifest``."""
+    return [{"event": "run_start"}, _loaded_event(manifest), _source_event(manifest, **overrides)]
+
+
+def test_validate_source_materialization_absent_is_clean():
+    events = [{"event": "run_start"}, _loaded_event(local_target())]
+    result = validate_source_materialization(events, "pr-review")
+    assert result.issues == []
+    assert result.event is None
+
+
+def test_validate_source_materialization_valid_local_range():
+    result = validate_source_materialization(_materialized_run(local_target()), "pr-review")
+    assert result.issues == []
+    assert result.event is not None
+    assert result.event["kind"] == "local-range"
+
+
+def test_validate_source_materialization_valid_github_pr():
+    result = validate_source_materialization(_materialized_run(github_target()), "pr-review")
+    assert result.issues == []
+    assert result.event is not None
+    assert result.event["kind"] == "github-pr"
+
+
+def test_validate_source_materialization_diff_file_target_is_invalid():
+    # A revision-unbound diff-file target has no source snapshot; a source event is INVALID, not
+    # merely missing, and never surfaces a validated event.
+    result = validate_source_materialization(_materialized_run(diff_target()), "pr-review")
+    assert result.issues
+    assert result.event is None
+
+
+def test_validate_source_materialization_without_target_is_invalid():
+    # A source event with NO valid preceding target is INVALID (fail-closed), never merely missing.
+    src = {"event": "source_materialized", "kind": "local-range",
+           "target_sha256": "d" * 64, "archive_sha256": "d" * 64}
+    result = validate_source_materialization([{"event": "run_start"}, src], "pr-review")
+    assert result.issues
+    assert result.event is None
+
+
+def test_validate_source_materialization_after_malformed_target_is_invalid():
+    ev = _loaded_event(local_target())
+    ev["target_sha256"] = "0" * 64  # target payload/hash disagreement -> no valid preceding target
+    events = [{"event": "run_start"}, ev, _source_event(local_target())]
+    result = validate_source_materialization(events, "pr-review")
+    assert result.issues
+    assert result.event is None
+
+
+def test_validate_source_materialization_wrong_kind_is_invalid():
+    result = validate_source_materialization(
+        _materialized_run(local_target(), kind="github-pr"), "pr-review")
+    assert result.issues
+    assert result.event is None
+
+
+def test_validate_source_materialization_wrong_target_hash_is_invalid():
+    result = validate_source_materialization(
+        _materialized_run(local_target(), target_sha256="9" * 64), "pr-review")
+    assert result.issues
+    assert result.event is None
+
+
+@pytest.mark.parametrize("bad", ["D" * 64, "d" * 63, "d" * 65, "xyz", "", "g" * 64, None, 123])
+def test_validate_source_materialization_bad_archive_hash_is_invalid(bad):
+    result = validate_source_materialization(
+        _materialized_run(local_target(), archive_sha256=bad), "pr-review")
+    assert result.issues, bad
+    assert result.event is None, bad
+
+
+def test_validate_source_materialization_duplicate_is_invalid():
+    events = _materialized_run(local_target())
+    events.append(_source_event(local_target(), archive_sha256="e" * 64))  # a second snapshot
+    result = validate_source_materialization(events, "pr-review")
+    assert result.issues
+    assert result.event is None
+
+
+def test_validate_source_materialization_before_target_is_invalid():
+    # Recorded BEFORE the target_loaded event -> out of order.
+    events = [{"event": "run_start"}, _source_event(local_target()), _loaded_event(local_target())]
+    result = validate_source_materialization(events, "pr-review")
+    assert result.issues
+    assert result.event is None
+
+
+def test_validate_source_materialization_after_protocol_work_is_invalid():
+    # Recorded AFTER DAG/PLAN/review/status work began -> out of order.
+    events = [{"event": "run_start"}, _loaded_event(local_target()),
+              {"event": "dag_loaded", "gate": "plan"}, _source_event(local_target())]
+    result = validate_source_materialization(events, "pr-review")
+    assert result.issues
+    assert result.event is None
+
+
+def test_validate_source_materialization_non_pr_review_is_invalid():
+    src = {"event": "source_materialized", "kind": "local-range",
+           "target_sha256": "d" * 64, "archive_sha256": "d" * 64}
+    for wf in ("build", "deep-dive"):
+        result = validate_source_materialization([{"event": "run_start"}, src], wf)
+        assert result.issues, wf
+        assert result.event is None, wf
+
+
+def test_validate_source_materialization_non_pr_review_absent_is_clean():
+    events = [{"event": "run_start"}, {"event": "dag_loaded", "gate": "plan"}]
+    for wf in ("build", "deep-dive"):
+        result = validate_source_materialization(events, wf)
+        assert result.issues == []
+        assert result.event is None
 
 
 # --------------------------------------------------------------------------------------

@@ -1716,3 +1716,54 @@ def test_report_ignores_source_snapshot_bound_to_other_target(tmp_path):
                archive_sha256="d" * 64)
     target = _section(render_markdown(run), "Review target")
     assert "materialized" not in target.lower()
+
+
+def test_report_ignores_forged_diff_file_source(tmp_path):
+    # A diff-file target is revision-unbound: it never has a source snapshot. A forged
+    # source_materialized bound to it (even with the correct target hash) never renders and the run
+    # is INVALID.
+    run, sha = _pr_review_with_target(tmp_path, _DIFF_TARGET)
+    run.append("source_materialized", kind="diff-file", target_sha256=sha, archive_sha256="d" * 64)
+    md = render_markdown(run)
+    assert "materialized" not in _section(md, "Review target").lower()
+    assert "**Status:** INVALID" in md
+
+
+def test_report_ignores_duplicate_source_materialization(tmp_path):
+    run, sha = _pr_review_with_target(tmp_path, _LOCAL_TARGET)
+    run.append("source_materialized", kind="local-range", target_sha256=sha, archive_sha256="d" * 64)
+    run.append("source_materialized", kind="local-range", target_sha256=sha, archive_sha256="e" * 64)
+    md = render_markdown(run)
+    assert "materialized" not in _section(md, "Review target").lower()
+    assert "**Status:** INVALID" in md
+
+
+def test_report_ignores_malformed_archive_source(tmp_path):
+    run, sha = _pr_review_with_target(tmp_path, _LOCAL_TARGET)
+    run.append("source_materialized", kind="local-range", target_sha256=sha,
+               archive_sha256="NOT-A-HEX-DIGEST")
+    md = render_markdown(run)
+    assert "materialized" not in _section(md, "Review target").lower()
+    assert "**Status:** INVALID" in md
+
+
+def test_report_ignores_wrong_kind_source(tmp_path):
+    run, sha = _pr_review_with_target(tmp_path, _LOCAL_TARGET)
+    run.append("source_materialized", kind="github-pr", target_sha256=sha, archive_sha256="d" * 64)
+    md = render_markdown(run)
+    assert "materialized" not in _section(md, "Review target").lower()
+    assert "**Status:** INVALID" in md
+
+
+def test_report_ignores_out_of_order_source(tmp_path):
+    # A source_materialized recorded AFTER DAG/PLAN work is out of order: no snapshot, INVALID.
+    run, sha = _pr_review_with_target(tmp_path, _LOCAL_TARGET)
+    dag = DAG.from_dict({"nodes": [{"id": "a", "title": "A", "description": "d",
+                                    "files": ["a.py"], "test_plan": "pytest",
+                                    "status": "pending"}], "edges": []})
+    run.save_dag(dag.to_dict())
+    run.append("dag_loaded", gate="plan", nodes=1)
+    run.append("source_materialized", kind="local-range", target_sha256=sha, archive_sha256="d" * 64)
+    md = render_markdown(run)
+    assert "materialized" not in _section(md, "Review target").lower()
+    assert "**Status:** INVALID" in md

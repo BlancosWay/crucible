@@ -44,6 +44,30 @@ def _load_target(run):
     return sha
 
 
+# A minimal revision-bound (local-range) target — the smallest valid target that legitimately carries
+# a materialized source snapshot, used by the source-materialization workflow tests.
+_LOCAL_TARGET_MANIFEST = {
+    "version": 1, "kind": "local-range", "revision_bound": True,
+    "repository": "https://github.com/owner/repo.git",
+    "base": {"ref": "main", "sha": "1" * 40}, "head": {"ref": "feature", "sha": "2" * 40},
+    "merge_base_sha": "3" * 40, "diff_sha256": "b" * 64, "changed_files": ["a.py"],
+    "intent": {"title": "t", "body": "b"},
+}
+
+
+def _load_local_range_target(run):
+    """Append a revision-bound local-range ``target_loaded`` event; return its target hash."""
+    target = ReviewTarget.from_dict(_LOCAL_TARGET_MANIFEST)
+    sha = target_sha256(target)
+    run.append("target_loaded", target=target.to_dict(), target_sha256=sha)
+    return sha
+
+
+def _empty_dag():
+    return DAG.from_dict({"nodes": [], "edges": []})
+
+
+
 def _peers(gate, rnd, bindings, outer_objs=()):
     """A valid persisted A/B peers object matching the CLI write path (round-9): each slot carries its
     configured model/effort, a `raw` JSON string, and a parsed `attestation` bound to the decision;
@@ -758,6 +782,51 @@ def test_workflow_issues_source_materialized_wrong_target_invalid(tmp_path):
     issues = workflow_issues(run.read_events(), dag, cfg)
     assert any(i.kind == "invalid" and ("target" in i.message.lower()
                                         or "source" in i.message.lower()) for i in issues)
+
+
+def test_workflow_issues_valid_source_materialization_has_no_source_issue(tmp_path):
+    # A valid revision-bound materialization (correct kind/hash/archive/order) yields NO source issue;
+    # workflow_issues consumes the centralized validator, which accepts it.
+    cfg = Config.from_dict({"final_review": False})
+    run = init_run("sym", cfg, base_dir=tmp_path, workflow="pr-review")
+    sha = _load_local_range_target(run)
+    run.append("source_materialized", kind="local-range", target_sha256=sha, archive_sha256="d" * 64)
+    issues = workflow_issues(run.read_events(), _empty_dag(), cfg)
+    assert not any("source" in i.message.lower() for i in issues)
+
+
+def test_workflow_issues_source_without_target_is_invalid_not_missing(tmp_path):
+    # F2/F3: a source event with NO loaded target must render INVALID (fail-closed), never a plain
+    # in-progress 'missing target'. The invalid source issue suppresses the missing-target note.
+    cfg = Config.from_dict({"final_review": False})
+    run = init_run("sym", cfg, base_dir=tmp_path, workflow="pr-review")
+    run.append("source_materialized", kind="local-range", target_sha256="d" * 64,
+               archive_sha256="d" * 64)
+    issues = workflow_issues(run.read_events(), _empty_dag(), cfg)
+    assert any(i.kind == "invalid" and "source" in i.message.lower() for i in issues)
+    assert not any(i.kind == "missing" and "target is not loaded" in i.message for i in issues)
+
+
+def test_workflow_issues_forged_diff_file_source_is_invalid(tmp_path):
+    # A diff-file (revision-unbound) target carries no source snapshot; a forged source_materialized
+    # bound to it — even with the CORRECT target hash — is invalid history.
+    cfg = Config.from_dict({"final_review": False})
+    run = init_run("sym", cfg, base_dir=tmp_path, workflow="pr-review")
+    sha = _load_target(run)  # the diff-file _TARGET_MANIFEST
+    run.append("source_materialized", kind="diff-file", target_sha256=sha, archive_sha256="d" * 64)
+    issues = workflow_issues(run.read_events(), _empty_dag(), cfg)
+    assert any(i.kind == "invalid" and "source" in i.message.lower() for i in issues)
+
+
+def test_workflow_issues_source_in_build_run_is_invalid(tmp_path):
+    # A build run has no review target; a recorded source_materialized is invalid history.
+    cfg = Config.from_dict({"final_review": False})
+    run = init_run("b", cfg, base_dir=tmp_path)  # default build workflow
+    run.append("source_materialized", kind="local-range", target_sha256="d" * 64,
+               archive_sha256="d" * 64)
+    issues = workflow_issues(run.read_events(), _empty_dag(), cfg)
+    assert any(i.kind == "invalid" and "source" in i.message.lower() for i in issues)
+
 
 
 def test_workflow_issues_valid_pr_review_has_no_target_issue(tmp_path):

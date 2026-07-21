@@ -456,6 +456,99 @@ def target_event_issues(events: list[dict[str, Any]], workflow: str) -> list[str
     return issues
 
 
+@dataclass(frozen=True)
+class SourceMaterialization:
+    """Result of validating the at-most-one ``source_materialized`` event against the loaded target.
+
+    ``issues`` are human-readable ``invalid`` strings (empty when the run has no source event, or when
+    exactly one fully-valid event is present); ``event`` is that single VALIDATED event, else
+    ``None``. The workflow validator folds ``issues`` into the run's integrity verdict and the report
+    renders a source snapshot ONLY from ``event`` — both consume this single result so they can never
+    disagree about whether a snapshot is trustworthy.
+    """
+    issues: list[str]
+    event: dict[str, Any] | None
+
+
+def _source_event_issues(events: list[dict[str, Any]], event: dict[str, Any],
+                         target: ReviewTarget) -> list[str]:
+    """Field/ordering checks for the one source event against a valid revision-bound target."""
+    issues: list[str] = []
+    if event.get("kind") != target.kind:
+        issues.append("source_materialized kind does not match the loaded review target kind")
+    archive = event.get("archive_sha256")
+    if not (isinstance(archive, str) and SHA256_RE.match(archive)):
+        issues.append("source_materialized archive_sha256 is not a lowercase 64-hex digest")
+    if event.get("target_sha256") != target_sha256(target):
+        issues.append("source snapshot is bound to a different target than the loaded review target")
+    idx = events.index(event)
+    loaded_idx = next(i for i, e in enumerate(events) if e.get("event") == "target_loaded")
+    if idx < loaded_idx:
+        issues.append("source materialized before the review target was loaded (out of order)")
+    first_protocol = _first_protocol_index(events)
+    if first_protocol is not None and idx > first_protocol:
+        issues.append("source materialized after DAG/PLAN/review work began (out of order)")
+    return issues
+
+
+def validate_source_materialization(events: list[dict[str, Any]],
+                                    workflow: str) -> SourceMaterialization:
+    """Centralized fail-closed validation of the source-snapshot (``source_materialized``) event.
+
+    A source snapshot is downstream, target-dependent work: it is trustworthy ONLY as a snapshot of a
+    single valid, revision-bound review target that precedes it. Any source event that is not is
+    ``invalid`` history, never merely *missing*. Exactly these conditions make the one event valid
+    (and eligible to render):
+
+    - at most one ``source_materialized`` event;
+    - the run is a pr-review run carrying exactly one valid ``target_loaded`` (a build/deep-dive run,
+      or a pr-review run with no/duplicate/malformed target, can have no snapshot);
+    - the target is revision-bound (``github-pr``/``local-range``); a ``diff-file`` target is
+      revision-unbound and has no source snapshot;
+    - the event's ``kind`` equals the target ``kind``;
+    - ``archive_sha256`` is a lowercase 64-hex digest;
+    - ``target_sha256`` equals the loaded target's authoritative hash; and
+    - it is ordered AFTER the ``target_loaded`` event and BEFORE any DAG/PLAN/review/status work.
+
+    Returns the validated event only when every condition holds; otherwise returns the accumulated
+    invalid reasons and ``event=None`` (a forged/duplicate/malformed/wrong-kind/-hash/-order event
+    never surfaces as a trustworthy snapshot).
+    """
+    materialized = [e for e in events if e.get("event") == "source_materialized"]
+    if not materialized:
+        return SourceMaterialization([], None)
+    if workflow != "pr-review":
+        return SourceMaterialization(
+            [f"{workflow} runs must not record a source_materialized event"], None)
+
+    issues: list[str] = []
+    if len(materialized) > 1:
+        issues.append(
+            "multiple source_materialized events (a source snapshot is materialized at most once)")
+
+    # A snapshot is meaningful only against a single valid revision-bound target that precedes it.
+    try:
+        target = target_from_events(events)
+    except ValueError:
+        # A duplicate/malformed target is separately reported by target_event_issues; the source
+        # event cannot be validated against a target that does not cleanly exist.
+        issues.append("source materialized without a valid loaded review target")
+        return SourceMaterialization(issues, None)
+    if target is None:
+        issues.append("source materialized without a loaded review target")
+        return SourceMaterialization(issues, None)
+    if not target.revision_bound:
+        issues.append(
+            "source materialized for a revision-unbound diff-file target "
+            "(only revision-bound github-pr/local-range targets have a source snapshot)")
+        return SourceMaterialization(issues, None)
+
+    issues.extend(_source_event_issues(events, materialized[0], target))
+    if issues:
+        return SourceMaterialization(issues, None)
+    return SourceMaterialization(issues, materialized[0])
+
+
 # ---------------------------------------------------------------------------------------------------
 # Repository identity (credential-free)
 # ---------------------------------------------------------------------------------------------------
