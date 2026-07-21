@@ -12,6 +12,7 @@ from crucible.symmetric import (
     accepted_findings,
     decide_symmetric,
     review_result,
+    symmetric_decision_issues,
     validate_final_finding_set,
     workflow_kind,
 )
@@ -294,6 +295,34 @@ def _obj(fid="A:O1", severity="blocker"):
             "claim": "Set is incomplete.", "suggestion": "Add the missing case."}
 
 
+def _prov():
+    from crucible.symmetric import peer_slot_provenance
+    return peer_slot_provenance(Config.from_dict({}))
+
+
+def _peers(gate, rnd, bindings, outer_objs=(), *, blocking=("blocker", "major")):
+    """A valid persisted A/B peers object matching the write path: each slot carries its configured
+    model/effort, a `raw` JSON string, and a parsed `attestation` bound to the decision. Peer
+    objections are the outer NAMESPACED aggregate objections de-namespaced back to their slot, and each
+    peer's verdict is consistent with them (REQUEST_CHANGES iff it holds a blocking objection)."""
+    import json as _json
+    prov = _prov()
+    per = {"A": [], "B": []}
+    for o in outer_objs:
+        slot, _, base = str(o["id"]).partition(":")
+        if slot in per:
+            per[slot].append({**o, "id": base})
+    peers = {}
+    for slot in ("A", "B"):
+        objs = per[slot]
+        has_blocking = any(o["severity"] in blocking for o in objs)
+        att = {"peer": slot, "gate": gate, "round": rnd,
+               "verdict": "REQUEST_CHANGES" if has_blocking else "APPROVE",
+               "summary": f"peer {slot} review", "objections": objs, **bindings}
+        peers[slot] = {**prov[slot], "raw": _json.dumps(att), "attestation": att}
+    return peers
+
+
 def _gate_events(gate, *, findings=None, outcome="CONSENSUS", objections=None, bindings=None, rnd=1):
     """A gate's symmetric_verdict [-> accepted_finding_set] -> terminal, in atomic-decision order.
 
@@ -305,7 +334,7 @@ def _gate_events(gate, *, findings=None, outcome="CONSENSUS", objections=None, b
     objections = objections or []
     payload = {"summary": "", "findings": findings if findings is not None else []}
     evs = [{"event": "symmetric_verdict", "gate": gate, "round": rnd, "outcome": outcome,
-            "objections": objections, **b}]
+            "objections": objections, "peers": _peers(gate, rnd, b, objections), **b}]
     if outcome in ("CONSENSUS", "PROCEED_WITH_FLAGS"):
         acc = {"event": "accepted_finding_set", "gate": gate, "round": rnd, "payload": payload, **b}
         if outcome == "PROCEED_WITH_FLAGS":
@@ -463,7 +492,8 @@ def test_accepted_findings_rejects_duplicate_composite_keys_across_gates():
 def test_accepted_findings_rejects_malformed_effective_payload():
     b = _bindings()
     events = [
-        {"event": "symmetric_verdict", "gate": "dep:auth", "round": 1, "outcome": "CONSENSUS", **b},
+        {"event": "symmetric_verdict", "gate": "dep:auth", "round": 1, "outcome": "CONSENSUS",
+         "objections": [], "peers": _peers("dep:auth", 1, b), **b},
         {"event": "accepted_finding_set", "gate": "dep:auth", "round": 1,
          "payload": {"findings": "not-a-list"}, **b},
         {"event": "gate_consensus", "gate": "dep:auth", "round": 1, **b},
@@ -1087,3 +1117,130 @@ def test_accepted_finding_set_for_gate_none_on_wrong_outcome():
     events = _trio_outcome("dep:a", "PROCEED_WITH_FLAGS", "gate_consensus",
                            findings=[_finding("dep:a", "F1")], objections=[_obj("A:b", "blocker")])
     assert accepted_finding_set_for_gate(events, "dep:a") is None
+
+
+# --- round-9: a terminal-bound symmetric_verdict must carry two verified persisted peer attestations ---
+#
+# The decision is trusted only if its persisted `peers` object proves both A/B attestations exist,
+# are bound to this decision, agree with the outer aggregate objections, and match configured
+# provenance. The structural (cfg-free) subset gates accepted state; the cfg-aware path enforces all.
+
+def _dep_trio_peers(objs=(), outcome="CONSENSUS", findings=None, node="a"):
+    """A valid dependency trio WITH a persisted peers object (via _gate_events), for mutation."""
+    return _dep_events(node, findings=(findings if findings is not None else [_finding(f"dep:{node}", "F1")]),
+                       outcome=outcome, objections=list(objs), bindings=_bindings(node[0], "d", "n" + node[0]))
+
+
+def _sv(events):
+    return next(e for e in events if e.get("event") == "symmetric_verdict")
+
+
+def test_symmetric_decision_valid_peers_are_clean():
+    events = _dep_trio_peers()
+    assert symmetric_decision_issues(events, "dep:a", Config.from_dict({})) == []
+
+
+def test_resolve_gate_acceptance_rejects_missing_peers_cfg_free():
+    from crucible.symmetric import resolve_gate_acceptance
+    events = _dep_trio_peers()
+    del _sv(events)["peers"]
+    assert resolve_gate_acceptance(events, "dep:a").accepted_index is None
+    assert symmetric_decision_issues(events, "dep:a", Config.from_dict({}))
+
+
+def test_resolve_gate_acceptance_rejects_one_slot_peers_cfg_free():
+    from crucible.symmetric import resolve_gate_acceptance
+    events = _dep_trio_peers()
+    _sv(events)["peers"] = {"A": _sv(events)["peers"]["A"]}
+    assert resolve_gate_acceptance(events, "dep:a").accepted_index is None
+
+
+def test_resolve_gate_acceptance_rejects_extra_slot_peers_cfg_free():
+    from crucible.symmetric import resolve_gate_acceptance
+    events = _dep_trio_peers()
+    _sv(events)["peers"]["C"] = _sv(events)["peers"]["A"]
+    assert resolve_gate_acceptance(events, "dep:a").accepted_index is None
+
+
+def test_resolve_gate_acceptance_rejects_swapped_peer_labels_cfg_free():
+    from crucible.symmetric import resolve_gate_acceptance
+    events = _dep_trio_peers()
+    peers = _sv(events)["peers"]
+    peers["A"], peers["B"] = peers["B"], peers["A"]  # slot A now holds peer B's attestation
+    assert resolve_gate_acceptance(events, "dep:a").accepted_index is None
+    assert symmetric_decision_issues(events, "dep:a", Config.from_dict({}))
+
+
+def test_resolve_gate_acceptance_rejects_malformed_attestation_cfg_free():
+    from crucible.symmetric import resolve_gate_acceptance
+    events = _dep_trio_peers()
+    _sv(events)["peers"]["A"]["attestation"] = {"peer": "A"}  # missing required fields
+    assert resolve_gate_acceptance(events, "dep:a").accepted_index is None
+
+
+def test_symmetric_decision_flags_attestation_gate_round_binding_mismatch():
+    events = _dep_trio_peers()
+    _sv(events)["peers"]["A"]["attestation"]["round"] = 9
+    assert symmetric_decision_issues(events, "dep:a", Config.from_dict({}))
+    events2 = _dep_trio_peers()
+    _sv(events2)["peers"]["B"]["attestation"]["artifact_sha256"] = "9" * 64
+    from crucible.symmetric import resolve_gate_acceptance
+    assert resolve_gate_acceptance(events2, "dep:a").accepted_index is None
+
+
+def test_symmetric_decision_flags_inconsistent_peer_under_custom_severities():
+    # blocking=["blocker"]: a peer that says APPROVE but holds a 'blocker' objection is inconsistent.
+    events = _dep_trio_peers(outcome="PROCEED_WITH_FLAGS", objs=[_obj("A:b", "blocker")], findings=[])
+    att = _sv(events)["peers"]["A"]["attestation"]
+    att["verdict"] = "APPROVE"  # but it holds a blocker objection
+    assert symmetric_decision_issues(events, "dep:a", Config.from_dict({"blocking_severities": ["blocker"]}))
+
+
+def test_symmetric_decision_flags_wrong_model_effort():
+    events = _dep_trio_peers()
+    _sv(events)["peers"]["A"]["model"] = "not-the-configured-model"
+    assert symmetric_decision_issues(events, "dep:a", Config.from_dict({}))
+    events2 = _dep_trio_peers()
+    _sv(events2)["peers"]["B"]["effort"] = "not-the-configured-effort"
+    assert symmetric_decision_issues(events2, "dep:a", Config.from_dict({}))
+
+
+def test_symmetric_decision_flags_malformed_or_divergent_raw():
+    events = _dep_trio_peers()
+    _sv(events)["peers"]["A"]["raw"] = "{not json"
+    assert symmetric_decision_issues(events, "dep:a", Config.from_dict({}))
+    events2 = _dep_trio_peers()
+    import json as _json
+    diverged = dict(_sv(events2)["peers"]["B"]["attestation"])
+    diverged["summary"] = "DIVERGENT raw summary"
+    _sv(events2)["peers"]["B"]["raw"] = _json.dumps(diverged)
+    assert symmetric_decision_issues(events2, "dep:a", Config.from_dict({}))
+
+
+def test_symmetric_decision_flags_fabricated_aggregate_objection():
+    # Both peers APPROVE (no blocking objections), but the outer aggregate fabricates a blocker.
+    b = _bindings("a", "d", "na")
+    events = [
+        {"event": "symmetric_verdict", "gate": "dep:a", "round": 1, "outcome": "PROCEED_WITH_FLAGS",
+         "objections": [_obj("A:X", "blocker")], "peers": _peers("dep:a", 1, b, []),
+         "candidate": {"summary": "", "findings": []}, **b},
+        {"event": "accepted_finding_set", "gate": "dep:a", "round": 1,
+         "payload": {"summary": "", "findings": []}, "accepted_with_flags": True,
+         "open_objections": ["A:X"], **b},
+        {"event": "gate_proceeded_with_flags", "gate": "dep:a", "round": 1,
+         "open_findings": ["A:X"], **b},
+    ]
+    assert symmetric_decision_issues(events, "dep:a", Config.from_dict({}))
+
+
+def test_symmetric_decision_flags_altered_aggregate_objection():
+    # Peer A genuinely holds a blocker, but the outer aggregate ALTERS its claim text.
+    events = _dep_trio_peers(outcome="PROCEED_WITH_FLAGS", objs=[_obj("A:b", "blocker")], findings=[])
+    _sv(events)["objections"][0]["claim"] = "an altered claim that the peer never made"
+    assert symmetric_decision_issues(events, "dep:a", Config.from_dict({}))
+
+
+def test_symmetric_decision_valid_proceeded_peers_are_clean():
+    events = _dep_trio_peers(outcome="PROCEED_WITH_FLAGS", objs=[_obj("A:b", "blocker")], findings=[])
+    cfg = Config.from_dict({"on_cap": "proceed_with_flags"})
+    assert symmetric_decision_issues(events, "dep:a", cfg) == []

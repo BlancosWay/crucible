@@ -2830,6 +2830,55 @@ def test_review_result_rejects_nonblocking_proceeded_objection(tmp_path):
     assert r.returncode != 0, r.stdout
 
 
+def test_result_commands_reject_forged_peer_attestations(tmp_path):
+    # Round-9: a complete valid run (real two-peer attestations), then the dep:auth persisted peers
+    # are stripped, leaving a symmetric_verdict with correct outer metadata but no proof both peers
+    # attested. Both Finish-time result commands must fail closed.
+    run_dir = _complete_one_node_symmetric(tmp_path, "auth",
+                                           findings=[_accepted_finding("dep:auth", "F1", "major")])
+
+    def _strip_peers(records):
+        for rec in records:
+            if rec.get("event") == "symmetric_verdict" and rec.get("gate") == "dep:auth":
+                rec.pop("peers", None)
+    _rewrite_events(run_dir, _strip_peers)
+    for command in ("accepted-findings", "review-result"):
+        r = _run([command, "--run", run_dir])
+        assert r.returncode != 0, command
+
+
+def test_result_commands_reject_swapped_peer_labels(tmp_path):
+    run_dir = _complete_one_node_symmetric(tmp_path, "auth",
+                                           findings=[_accepted_finding("dep:auth", "F1", "major")])
+
+    def _swap(records):
+        for rec in records:
+            if rec.get("event") == "symmetric_verdict" and rec.get("gate") == "dep:auth":
+                peers = rec["peers"]
+                peers["A"], peers["B"] = peers["B"], peers["A"]
+    _rewrite_events(run_dir, _swap)
+    for command in ("accepted-findings", "review-result"):
+        r = _run([command, "--run", run_dir])
+        assert r.returncode != 0, command
+
+
+def test_result_commands_reject_forged_accepted_payload_candidate_handoff(tmp_path):
+    # Round-9 candidate handoff: the accepted payload is forged to differ from the decision candidate
+    # and the bound Builder artifact the peers reviewed. Both result commands must fail closed.
+    run_dir = _complete_one_node_symmetric(tmp_path, "auth",
+                                           findings=[_accepted_finding("dep:auth", "F1", "major")])
+
+    def _forge_payload(records):
+        for rec in records:
+            if rec.get("event") == "accepted_finding_set" and rec.get("gate") == "dep:auth":
+                rec["payload"] = {"summary": "",
+                                  "findings": [_accepted_finding("dep:auth", "FORGED", "blocker")]}
+    _rewrite_events(run_dir, _forge_payload)
+    for command in ("accepted-findings", "review-result"):
+        r = _run([command, "--run", run_dir])
+        assert r.returncode != 0, command
+
+
 def test_symmetric_verdict_final_rejects_dropped_dependency_finding(tmp_path):
     run_dir = _complete_one_node_symmetric(tmp_path, "auth", final_review=True,
                                            findings=[_accepted_finding("dep:auth", "F1", "major")])

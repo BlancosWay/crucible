@@ -26,6 +26,29 @@ from crucible.workflow import (
 )
 
 
+def _peers(gate, rnd, bindings, outer_objs=()):
+    """A valid persisted A/B peers object matching the CLI write path (round-9): each slot carries its
+    configured model/effort, a `raw` JSON string, and a parsed `attestation` bound to the decision;
+    peer objections are the outer namespaced aggregate de-namespaced to their slot, with a consistent
+    verdict."""
+    from crucible.symmetric import peer_slot_provenance
+    prov = peer_slot_provenance(Config.from_dict({}))
+    per = {"A": [], "B": []}
+    for o in outer_objs:
+        slot, _, base = str(o["id"]).partition(":")
+        if slot in per:
+            per[slot].append({**o, "id": base})
+    peers = {}
+    for slot in ("A", "B"):
+        objs = per[slot]
+        has_blocking = any(o["severity"] in ("blocker", "major") for o in objs)
+        att = {"peer": slot, "gate": gate, "round": rnd,
+               "verdict": "REQUEST_CHANGES" if has_blocking else "APPROVE",
+               "summary": f"peer {slot} review", "objections": objs, **bindings}
+        peers[slot] = {**prov[slot], "raw": json.dumps(att), "attestation": att}
+    return peers
+
+
 def _dag(files=None, status="pending"):
     """A one-node ('a') DAG; ``files`` varies the immutable definition so its digest changes."""
     return DAG.from_dict({
@@ -476,7 +499,7 @@ def _symmetric_run(tmp_path, *, accepted="valid", final=None, verdict="match", p
                   else plan_bind)
         v_outcome = "CHANGES" if plan == "wrong_outcome" else "CONSENSUS"
         run.append("symmetric_verdict", gate="plan", round=v_round, outcome=v_outcome,
-                   objections=[], **v_bind)
+                   objections=[], peers=_peers("plan", v_round, v_bind), **v_bind)
     run.append("gate_consensus", gate="plan", round=1, **plan_bind)
 
     candidate = {"summary": "", "findings": [_af("dep:a", "F1")]}
@@ -486,7 +509,7 @@ def _symmetric_run(tmp_path, *, accepted="valid", final=None, verdict="match", p
     run.append("builder_output", gate="dep:a", round=1, payload=cand_text, artifact_sha256=cand_art)
     ver_bind = dep_bind if verdict == "match" else {**dep_bind, "artifact_sha256": "9" * 64}
     run.append("symmetric_verdict", gate="dep:a", round=1, outcome="CONSENSUS", objections=[],
-               candidate=candidate, **ver_bind)
+               peers=_peers("dep:a", 1, ver_bind), candidate=candidate, **ver_bind)
     acc_bind = dep_bind if accepted != "binding" else {**dep_bind, "artifact_sha256": "0" * 64}
     acc_payload = candidate if accepted != "malformed" else {"findings": "not-a-list"}
     run.append("accepted_finding_set", gate="dep:a", round=1, payload=acc_payload, **acc_bind)
@@ -505,37 +528,7 @@ def _symmetric_run(tmp_path, *, accepted="valid", final=None, verdict="match", p
         run.append("builder_output", gate="final", round=1, payload=final_text,
                    artifact_sha256=final_art)
         run.append("symmetric_verdict", gate="final", round=1, outcome="CONSENSUS", objections=[],
-                   candidate=final_payload, **fbind)
-        run.append("accepted_finding_set", gate="final", round=1, payload=final_payload, **fbind)
-        run.append("gate_consensus", gate="final", round=1, **fbind)
-
-    return run, dag, cfg
-    cand_text = json.dumps(candidate)
-    cand_art = artifact_sha256(cand_text.encode("utf-8"))
-    dep_bind = {"artifact_sha256": cand_art, "dag_sha256": dsha, "node_sha256": nsha}
-    run.append("builder_output", gate="dep:a", round=1, payload=cand_text, artifact_sha256=cand_art)
-    ver_bind = dep_bind if verdict == "match" else {**dep_bind, "artifact_sha256": "9" * 64}
-    run.append("symmetric_verdict", gate="dep:a", round=1, outcome="CONSENSUS", objections=[],
-               candidate=candidate, **ver_bind)
-    acc_bind = dep_bind if accepted != "binding" else {**dep_bind, "artifact_sha256": "0" * 64}
-    acc_payload = candidate if accepted != "malformed" else {"findings": "not-a-list"}
-    run.append("accepted_finding_set", gate="dep:a", round=1, payload=acc_payload, **acc_bind)
-    run.append("gate_consensus", gate="dep:a", round=1, **dep_bind)
-    run.append("node_status_change", node="a", status="done")
-
-    if final is not None:
-        if final == "drops":
-            final_findings = [_af("final", "C1", "nit")]  # drops the accepted dependency finding
-        else:
-            final_findings = [_af("dep:a", "F1"), _af("final", "C1", "nit")]
-        final_payload = {"summary": "", "findings": final_findings}
-        final_text = json.dumps(final_payload)
-        final_art = artifact_sha256(final_text.encode("utf-8"))
-        fbind = {"artifact_sha256": final_art, "dag_sha256": dsha}
-        run.append("builder_output", gate="final", round=1, payload=final_text,
-                   artifact_sha256=final_art)
-        run.append("symmetric_verdict", gate="final", round=1, outcome="CONSENSUS", objections=[],
-                   candidate=final_payload, **fbind)
+                   peers=_peers("final", 1, fbind), candidate=final_payload, **fbind)
         run.append("accepted_finding_set", gate="final", round=1, payload=final_payload, **fbind)
         run.append("gate_consensus", gate="final", round=1, **fbind)
 
@@ -986,3 +979,117 @@ def test_workflow_issues_flags_proceeded_nonblocking_under_custom_severities(tmp
     term["open_findings"] = ["A:maj"]
     issues = workflow_issues(events, dag, cfg)
     assert any(i.kind == "invalid" and "dep:a" in i.message for i in issues)
+
+
+# --- round-9: workflow validates the persisted A/B peer attestations + candidate handoff ----------
+
+def _svf(events, gate):
+    return next(e for e in events if e.get("event") == "symmetric_verdict" and e.get("gate") == gate)
+
+
+def test_workflow_issues_clean_for_valid_symmetric_run_with_peers(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid", final="valid")
+    assert workflow_issues(run.read_events(), dag, cfg) == []
+
+
+def test_workflow_issues_flags_missing_dep_peers(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    events = run.read_events()
+    del _svf(events, "dep:a")["peers"]
+    issues = workflow_issues(events, dag, cfg)
+    assert any(i.kind == "invalid" and "dep:a" in i.message for i in issues)
+
+
+def test_workflow_issues_flags_swapped_dep_peers(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    events = run.read_events()
+    peers = _svf(events, "dep:a")["peers"]
+    peers["A"], peers["B"] = peers["B"], peers["A"]
+    issues = workflow_issues(events, dag, cfg)
+    assert any(i.kind == "invalid" and "dep:a" in i.message for i in issues)
+
+
+def test_workflow_issues_flags_wrong_model_dep_peers(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    events = run.read_events()
+    _svf(events, "dep:a")["peers"]["A"]["model"] = "totally-wrong-model"
+    issues = workflow_issues(events, dag, cfg)
+    assert any(i.kind == "invalid" and "dep:a" in i.message for i in issues)
+
+
+def test_workflow_issues_flags_divergent_raw_dep_peers(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    events = run.read_events()
+    att = dict(_svf(events, "dep:a")["peers"]["B"]["attestation"])
+    att["summary"] = "raw diverges from parsed"
+    _svf(events, "dep:a")["peers"]["B"]["raw"] = json.dumps(att)
+    issues = workflow_issues(events, dag, cfg)
+    assert any(i.kind == "invalid" and "dep:a" in i.message for i in issues)
+
+
+def test_workflow_issues_flags_fabricated_dep_aggregate_objection(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    events = run.read_events()
+    # Both peers APPROVE (no objections), but forge the outer aggregate to claim a blocker and flip
+    # the CONSENSUS terminal to proceeded-with-flags carrying it.
+    sv = _svf(events, "dep:a")
+    sv["outcome"] = "PROCEED_WITH_FLAGS"
+    sv["objections"] = [{"id": "A:FAB", "severity": "blocker", "location": "c", "claim": "c",
+                         "suggestion": "s"}]
+    acc = next(e for e in events
+               if e.get("event") == "accepted_finding_set" and e.get("gate") == "dep:a")
+    acc["accepted_with_flags"] = True
+    acc["open_objections"] = ["A:FAB"]
+    term = next(e for e in events
+                if e.get("event") == "gate_consensus" and e.get("gate") == "dep:a")
+    term["event"] = "gate_proceeded_with_flags"
+    term["open_findings"] = ["A:FAB"]
+    issues = workflow_issues(events, dag, cfg)
+    assert any(i.kind == "invalid" and "dep:a" in i.message for i in issues)
+
+
+def test_workflow_issues_flags_missing_plan_peers(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    events = run.read_events()
+    del _svf(events, "plan")["peers"]
+    issues = workflow_issues(events, dag, cfg)
+    assert any(i.kind == "invalid" and "plan" in i.message.lower() for i in issues)
+
+
+def test_workflow_issues_flags_missing_final_peers(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid", final="valid")
+    events = run.read_events()
+    del _svf(events, "final")["peers"]
+    issues = workflow_issues(events, dag, cfg)
+    assert any(i.kind == "invalid" and "final" in i.message.lower() for i in issues)
+
+
+def test_workflow_issues_flags_forged_accepted_payload_candidate_handoff(tmp_path):
+    # The accepted_finding_set.payload is forged to differ from the decision candidate + the bound
+    # Builder artifact the two peers reviewed. The published findings would not be what was attested.
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    events = run.read_events()
+    acc = next(e for e in events
+               if e.get("event") == "accepted_finding_set" and e.get("gate") == "dep:a")
+    acc["payload"] = {"summary": "", "findings": [_af("dep:a", "FORGED", "blocker")]}
+    issues = workflow_issues(events, dag, cfg)
+    assert any(i.kind == "invalid" and "dep:a" in i.message for i in issues)
+
+
+def test_workflow_issues_flags_candidate_diverges_from_accepted_set(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    events = run.read_events()
+    _svf(events, "dep:a")["candidate"] = {"summary": "", "findings": [_af("dep:a", "OTHER", "nit")]}
+    issues = workflow_issues(events, dag, cfg)
+    assert any(i.kind == "invalid" and "dep:a" in i.message for i in issues)
+
+
+def test_accepted_findings_rejects_forged_accepted_payload_via_workflow(tmp_path):
+    # Direct projection at the module boundary: a forged accepted payload is caught by the workflow
+    # integrity the result commands enforce before publishing (candidate handoff).
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    events = run.read_events()
+    acc = next(e for e in events
+               if e.get("event") == "accepted_finding_set" and e.get("gate") == "dep:a")
+    acc["payload"] = {"summary": "", "findings": [_af("dep:a", "FORGED", "blocker")]}
+    assert any(i.kind == "invalid" for i in workflow_issues(events, dag, cfg))

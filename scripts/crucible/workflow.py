@@ -33,6 +33,7 @@ from crucible.symmetric import (
     gate_post_terminal_protocol_indices,
     out_of_scope_protocol_gates,
     resolve_gate_acceptance,
+    symmetric_candidate_handoff_issues,
     symmetric_decision_issues,
     symmetric_plan_attestation_issues,
     validate_final_finding_set,
@@ -468,10 +469,16 @@ def _symmetric_accepted_set_issues(
         # round-8 F1/F4: the terminal-bound decision's SEMANTICS must be consistent — its outcome
         # certifies the terminal (CONSENSUS/PROCEED_WITH_FLAGS/CAPPED), its objections are all
         # configured-blocking, CONSENSUS carries none while proceeded/capped carry >=1, and a
-        # proceeded/capped terminal's open_findings match the objection ids exactly. The shared
-        # validator returns [] for a valid decision or when the resolver already owns the "no bound
-        # decision" report, so this never duplicates the trio-structure diagnostics above.
+        # proceeded/capped terminal's open_findings match the objection ids exactly. It ALSO validates
+        # (round-9) the persisted A/B peer attestations. The shared validator returns [] for a valid
+        # decision or when the resolver already owns the "no bound decision" report, so this never
+        # duplicates the trio-structure diagnostics above.
         for reason in symmetric_decision_issues(events, gate, cfg):
+            issues.append(WorkflowIssue("invalid", f"symmetric gate {gate!r} {reason}"))
+        # round-9 candidate handoff: the decision's persisted candidate, the accepted set payload, and
+        # the bound Builder artifact the two peers reviewed must all be the same finding set, so the
+        # published findings are exactly what was attested.
+        for reason in symmetric_candidate_handoff_issues(events, gate):
             issues.append(WorkflowIssue("invalid", f"symmetric gate {gate!r} {reason}"))
     # Post-terminal protocol residue: a same-gate symmetric protocol event (a verdict that could
     # rewrite the gate's unresolved objections, an accepted set, or a second terminal) recorded AFTER

@@ -1079,6 +1079,26 @@ def _sym_candidate(source_gate="dep:auth", fid="F1", severity="major"):
     }]}
 
 
+def _sym_peers(gate, rnd, bindings, outer_objs=()):
+    """A valid persisted A/B peers object matching the CLI write path (round-9)."""
+    from crucible.symmetric import peer_slot_provenance
+    prov = peer_slot_provenance(Config.from_dict({}))
+    per = {"A": [], "B": []}
+    for o in outer_objs:
+        slot, _, base = str(o["id"]).partition(":")
+        if slot in per:
+            per[slot].append({**o, "id": base})
+    peers = {}
+    for slot in ("A", "B"):
+        objs = per[slot]
+        has_blocking = any(o["severity"] in ("blocker", "major") for o in objs)
+        att = {"peer": slot, "gate": gate, "round": rnd,
+               "verdict": "REQUEST_CHANGES" if has_blocking else "APPROVE",
+               "summary": f"peer {slot} review", "objections": objs, **bindings}
+        peers[slot] = {**prov[slot], "raw": json.dumps(att), "attestation": att}
+    return peers
+
+
 def _symmetric_dep_run(tmp_path, *, accepted="pre"):
     """A pr-review run with one done node 'auth' backed by a symmetric dependency gate.
 
@@ -1100,6 +1120,7 @@ def _symmetric_dep_run(tmp_path, *, accepted="pre"):
     run.append("builder_output", gate="plan", round=1, payload=plan_payload,
                artifact_sha256=plan_art)
     run.append("symmetric_verdict", gate="plan", round=1, outcome="CONSENSUS", objections=[],
+               peers=_sym_peers("plan", 1, {"artifact_sha256": plan_art, "dag_sha256": dsha}),
                artifact_sha256=plan_art, dag_sha256=dsha)
     run.append("gate_consensus", gate="plan", round=1, artifact_sha256=plan_art, dag_sha256=dsha)
 
@@ -1110,14 +1131,7 @@ def _symmetric_dep_run(tmp_path, *, accepted="pre"):
     run.append("builder_output", gate="dep:auth", round=1, payload=cand_text,
                artifact_sha256=cand_art)
     run.append("symmetric_verdict", gate="dep:auth", round=1, outcome="CONSENSUS",
-               peers={
-                   "A": {"model": "ma", "effort": "ea", "raw": "{}",
-                         "attestation": {"peer": "A", "verdict": "APPROVE",
-                                         "summary": "complete", "objections": []}},
-                   "B": {"model": "mb", "effort": "eb", "raw": "{}",
-                         "attestation": {"peer": "B", "verdict": "APPROVE",
-                                         "summary": "grounded", "objections": []}},
-               },
+               peers=_sym_peers("dep:auth", 1, bindings),
                objections=[], candidate=candidate, **bindings)
     if accepted == "pre":
         run.append("accepted_finding_set", gate="dep:auth", round=1, payload=candidate, **bindings)

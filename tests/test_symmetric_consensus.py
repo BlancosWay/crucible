@@ -13,6 +13,26 @@ from crucible.runlog import init_run
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _peers(gate, rnd, bindings, outer_objs=()):
+    """A valid persisted A/B peers object matching the CLI write path (round-9)."""
+    from crucible.symmetric import peer_slot_provenance
+    prov = peer_slot_provenance(Config.from_dict({}))
+    per = {"A": [], "B": []}
+    for o in outer_objs:
+        slot, _, base = str(o["id"]).partition(":")
+        if slot in per:
+            per[slot].append({**o, "id": base})
+    peers = {}
+    for slot in ("A", "B"):
+        objs = per[slot]
+        has_blocking = any(o["severity"] in ("blocker", "major") for o in objs)
+        att = {"peer": slot, "gate": gate, "round": rnd,
+               "verdict": "REQUEST_CHANGES" if has_blocking else "APPROVE",
+               "summary": f"peer {slot} review", "objections": objs, **bindings}
+        peers[slot] = {**prov[slot], "raw": json.dumps(att), "attestation": att}
+    return peers
+
+
 def _run(args):
     env = {**os.environ, "PYTHONPATH": str(ROOT / "scripts")}
     return subprocess.run(
@@ -98,6 +118,7 @@ def test_review_result_derives_request_changes_from_accepted_blocker(tmp_path):
     run.append("builder_output", gate="plan", round=1, payload=plan_payload,
                artifact_sha256=plan_art)
     run.append("symmetric_verdict", gate="plan", round=1, outcome="CONSENSUS", objections=[],
+               peers=_peers("plan", 1, {"artifact_sha256": plan_art, "dag_sha256": dsha}),
                artifact_sha256=plan_art, dag_sha256=dsha)
     run.append("gate_consensus", gate="plan", round=1, artifact_sha256=plan_art, dag_sha256=dsha)
 
@@ -118,7 +139,7 @@ def test_review_result_derives_request_changes_from_accepted_blocker(tmp_path):
     run.append("builder_output", gate="dep:auth", round=1, payload=cand_text,
                artifact_sha256=cand_art)
     run.append("symmetric_verdict", gate="dep:auth", round=1, outcome="CONSENSUS", objections=[],
-               candidate=candidate, **bindings)
+               peers=_peers("dep:auth", 1, bindings), candidate=candidate, **bindings)
     run.append("accepted_finding_set", gate="dep:auth", round=1, payload=candidate, **bindings)
     run.append("gate_consensus", gate="dep:auth", round=1, **bindings)
     run.append("node_status_change", node="auth", status="done")
@@ -152,6 +173,7 @@ def test_review_result_rejects_forged_final_when_final_review_disabled(tmp_path)
     run.append("builder_output", gate="plan", round=1, payload=plan_payload,
                artifact_sha256=plan_art)
     run.append("symmetric_verdict", gate="plan", round=1, outcome="CONSENSUS", objections=[],
+               peers=_peers("plan", 1, {"artifact_sha256": plan_art, "dag_sha256": dsha}),
                artifact_sha256=plan_art, dag_sha256=dsha)
     run.append("gate_consensus", gate="plan", round=1, artifact_sha256=plan_art, dag_sha256=dsha)
 
@@ -168,7 +190,7 @@ def test_review_result_rejects_forged_final_when_final_review_disabled(tmp_path)
     run.append("builder_output", gate="dep:auth", round=1, payload=cand_text,
                artifact_sha256=cand_art)
     run.append("symmetric_verdict", gate="dep:auth", round=1, outcome="CONSENSUS", objections=[],
-               candidate=candidate, **bindings)
+               peers=_peers("dep:auth", 1, bindings), candidate=candidate, **bindings)
     run.append("accepted_finding_set", gate="dep:auth", round=1, payload=candidate, **bindings)
     run.append("gate_consensus", gate="dep:auth", round=1, **bindings)
     run.append("node_status_change", node="auth", status="done")
@@ -181,7 +203,7 @@ def test_review_result_rejects_forged_final_when_final_review_disabled(tmp_path)
     fbind = {"artifact_sha256": artifact_sha256(json.dumps(final_payload).encode("utf-8")),
              "dag_sha256": dsha}
     run.append("symmetric_verdict", gate="final", round=1, outcome="CONSENSUS", objections=[],
-               candidate=final_payload, **fbind)
+               peers=_peers("final", 1, fbind), candidate=final_payload, **fbind)
     run.append("accepted_finding_set", gate="final", round=1, payload=final_payload, **fbind)
     run.append("gate_consensus", gate="final", round=1, **fbind)
 

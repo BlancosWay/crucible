@@ -16,11 +16,12 @@ the round decision reuse the run's ``blocking_severities`` exactly like ``verdic
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any
 
 from crucible.config import Config
-from crucible.integrity import event_bindings
+from crucible.integrity import artifact_sha256, event_bindings
 from crucible.verdict import (
     VALID_SEVERITIES,
     VALID_VERDICTS,
@@ -437,6 +438,13 @@ def resolve_gate_acceptance(events: list[dict[str, Any]], gate: str) -> GateAcce
     if events[decision_idx].get("outcome") != _TERMINAL_OUTCOME.get(events[terminal_idx].get("event")):
         return GateAcceptance(gate, None, terminal_idx, (), ())
 
+    # (5) The decision must carry both peers' bound attestations, structurally sound (round-9): a
+    #     no-peer / one-slot / extra-slot / swapped / malformed-attestation / gate-round-binding-mismatch
+    #     verdict never certifies an accepted set. The cfg-aware validator reports the specifics; here we
+    #     only ensure such a trio yields NO accepted state (and no duplicate orphan diagnostic).
+    if _peers_structurally_invalid(events[decision_idx], gate):
+        return GateAcceptance(gate, None, terminal_idx, (), ())
+
     # Valid trio. Any OTHER accepted set for the gate is post-terminal residue, never accepted state.
     orphans = tuple(i for i in accepted_all if i != accepted_idx)
     issues = (_POST_TERMINAL_RESIDUE,) if orphans else ()
@@ -544,6 +552,166 @@ def symmetric_decision_issues(
         if not isinstance(open_ids, list) or sorted(str(x) for x in open_ids) != sorted(obj_ids):
             issues.append(
                 "terminal open_findings do not correspond exactly to the decision's objection ids")
+    # round-9: the decision is only trusted if its persisted A/B peer attestations exist, are bound to
+    # this decision, agree with the outer aggregate objections, and match configured provenance.
+    issues.extend(_peer_attestation_issues(decision, gate, cfg))
+    return issues
+
+
+def _expected_aggregate_objections(
+    peer_a: PeerAttestation, peer_b: PeerAttestation, cfg: Config
+) -> list[dict[str, Any]]:
+    """The deterministic A-then-B union of BOTH peers' CONFIGURED blocking objections, namespaced by
+    slot with full fields — the exact ``objections`` :func:`decide_symmetric` + the CLI persist on a
+    ``symmetric_verdict``. A forged outer aggregate that fabricates/drops/alters an entry will not
+    equal this."""
+    out: list[dict[str, Any]] = []
+    for peer in (peer_a, peer_b):
+        for objection in peer.open_blocking(cfg):
+            out.append({"id": f"{peer.peer}:{objection.id}", "severity": objection.severity,
+                        "location": objection.location, "claim": objection.claim,
+                        "suggestion": objection.suggestion})
+    return out
+
+
+def _peer_attestation_issues(
+    decision: dict[str, Any], gate: str, cfg: Config | None = None
+) -> list[str]:
+    """Validate the PERSISTED A/B peer attestations inside a ``symmetric_verdict`` (round-9). A
+    terminal-bound verdict is only trusted if it proves both peers independently attested the SAME
+    bound candidate and agree with the outer decision. Pure; never raises.
+
+    Structural (cfg-free) checks — enough for the accepted-state resolver to reject a no-peer /
+    swapped / malformed verdict:
+
+    - ``peers`` is an object with EXACTLY slots ``A`` and ``B`` (no missing/duplicate/extra), each
+      wrapper an object;
+    - each wrapper's ``attestation`` parses via :meth:`PeerAttestation.from_dict`, its ``peer`` equals
+      its slot, and its gate/round/schema-v2 bindings equal the outer decision.
+
+    cfg-aware checks (workflow/completeness/result) — enforced only when ``cfg`` is given:
+
+    - each attestation passes :meth:`PeerAttestation.consistency_error` (APPROVE/REQUEST_CHANGES vs the
+      run's blocking severities);
+    - the wrapper ``model``/``effort`` equal :func:`peer_slot_provenance` for that slot;
+    - the wrapper ``raw`` is a JSON string parsing to the same canonical attestation as ``attestation``;
+    - the outer namespaced ``objections`` equal exactly the A-then-B union of both peers' configured
+      blocking objections (:func:`_expected_aggregate_objections`).
+    """
+    peers = decision.get("peers")
+    if not isinstance(peers, dict):
+        return ["decision has no persisted peers object"]
+    if set(peers.keys()) != {"A", "B"}:
+        return [f"peers must have exactly slots 'A' and 'B' (got {sorted(map(str, peers.keys()))})"]
+    issues: list[str] = []
+    outer_round = decision.get("round")
+    outer_bind = event_bindings(decision)
+    parsed: dict[str, PeerAttestation] = {}
+    for slot in ("A", "B"):
+        wrapper = peers.get(slot)
+        if not isinstance(wrapper, dict):
+            issues.append(f"peer slot {slot!r} wrapper is not an object")
+            continue
+        try:
+            attestation = PeerAttestation.from_dict(wrapper.get("attestation"))
+        except (ValueError, TypeError) as exc:
+            issues.append(f"peer slot {slot!r} attestation is not a valid peer attestation ({exc})")
+            continue
+        parsed[slot] = attestation
+        if attestation.peer != slot:
+            issues.append(
+                f"peer slot {slot!r} holds an attestation for peer {attestation.peer!r} "
+                f"(swapped/mislabelled slots)")
+        if attestation.gate != gate:
+            issues.append(f"peer slot {slot!r} attestation gate {attestation.gate!r} does not match "
+                          f"the decision gate {gate!r}")
+        if attestation.round != outer_round:
+            issues.append(f"peer slot {slot!r} attestation round {attestation.round!r} does not match "
+                          f"the decision round {outer_round!r}")
+        att_bind = event_bindings({"artifact_sha256": attestation.artifact_sha256,
+                                   "dag_sha256": attestation.dag_sha256,
+                                   "node_sha256": attestation.node_sha256})
+        if att_bind != outer_bind:
+            issues.append(f"peer slot {slot!r} attestation bindings do not match the decision bindings")
+        if cfg is not None:
+            inconsistency = attestation.consistency_error(cfg)
+            if inconsistency:
+                issues.append(f"peer slot {slot!r} {inconsistency}")
+            expected_prov = peer_slot_provenance(cfg).get(slot, {})
+            if (wrapper.get("model") != expected_prov.get("model")
+                    or wrapper.get("effort") != expected_prov.get("effort")):
+                issues.append(f"peer slot {slot!r} model/effort do not match the configured provenance "
+                              f"for that slot")
+            raw = wrapper.get("raw")
+            if not isinstance(raw, str):
+                issues.append(f"peer slot {slot!r} raw provenance is not a JSON string")
+            else:
+                try:
+                    raw_attestation = PeerAttestation.from_dict(json.loads(raw))
+                except (ValueError, TypeError, json.JSONDecodeError) as exc:
+                    issues.append(f"peer slot {slot!r} raw provenance does not parse to a valid "
+                                  f"attestation ({exc})")
+                else:
+                    if raw_attestation.to_dict() != attestation.to_dict():
+                        issues.append(f"peer slot {slot!r} raw provenance diverges from the parsed "
+                                      f"attestation")
+    if cfg is not None and "A" in parsed and "B" in parsed:
+        expected = _expected_aggregate_objections(parsed["A"], parsed["B"], cfg)
+        if decision.get("objections") != expected:
+            issues.append("outer objections are not the exact A-then-B union of both peers' configured "
+                          "blocking objections (fabricated/dropped/altered aggregate)")
+    return issues
+
+
+def _peers_structurally_invalid(decision: dict[str, Any], gate: str) -> bool:
+    """True when the decision's persisted peers fail the cfg-free structural attestation checks — used
+    by :func:`resolve_gate_acceptance` so a no-peer / swapped / malformed-attestation / binding-mismatch
+    verdict yields NO accepted state."""
+    return bool(_peer_attestation_issues(decision, gate, cfg=None))
+
+
+def symmetric_candidate_handoff_issues(events: list[dict[str, Any]], gate: str) -> list[str]:
+    """For a dependency/FINAL ADVANCING gate, the decision's persisted ``candidate``, the immediately
+    following ``accepted_finding_set.payload``, and the bound Builder JSON artifact the two peers
+    reviewed must all represent the SAME :class:`FindingSet` (round-9). Otherwise the published findings
+    are not the candidate the peers attested. Empty for gates with no terminal-bound decision + accepted
+    set (PLAN carries text, CAPPED/CHANGES persist no set). Pure; cfg-free; never raises.
+    """
+    decision_idx, terminal_idx, _term, accepted_idx = _terminal_bound_decision_index(events, gate)
+    if decision_idx is None or accepted_idx is None:
+        return []
+    decision = events[decision_idx]
+    accepted = events[accepted_idx]
+    try:
+        candidate_fs = FindingSet.from_dict(decision.get("candidate"))
+    except (ValueError, TypeError):
+        return ["decision does not persist a valid candidate finding set"]
+    try:
+        accepted_fs = FindingSet.from_dict(accepted.get("payload"))
+    except (ValueError, TypeError):
+        return []  # a malformed accepted payload is already reported by the accepted-set payload check
+    issues: list[str] = []
+    if candidate_fs.to_dict() != accepted_fs.to_dict():
+        issues.append("the decision's candidate does not match the accepted finding set payload")
+    want_sha = decision.get("artifact_sha256")
+    want_round = decision.get("round")
+    builder = None
+    for event in events:
+        if (event.get("event") == "builder_output" and event.get("gate") == gate
+                and event.get("round") == want_round and isinstance(event.get("payload"), str)
+                and artifact_sha256(event["payload"].encode("utf-8")) == want_sha):
+            builder = event
+    if builder is None:
+        issues.append("no bound Builder finding-set artifact matches the decision's candidate binding")
+        return issues
+    try:
+        builder_fs = FindingSet.from_dict(json.loads(builder["payload"]))
+    except (ValueError, TypeError, json.JSONDecodeError):
+        issues.append("the bound Builder artifact is not a valid finding set")
+    else:
+        if builder_fs.to_dict() != accepted_fs.to_dict():
+            issues.append("the accepted finding set does not match the bound Builder artifact the two "
+                          "peers reviewed")
     return issues
 
 
