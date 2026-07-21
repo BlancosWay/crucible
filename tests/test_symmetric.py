@@ -209,6 +209,26 @@ def test_peer_attestation_echoes_bindings():
     assert peer.node_sha256 == "n" * 64
 
 
+def test_peer_attestation_parses_and_echoes_target_sha():
+    # Task 2: a pr-review peer echoes the immutable target hash alongside the artifact/DAG/node
+    # bindings, so a symmetric decision can prove both peers reviewed the same target.
+    peer = PeerAttestation.from_dict({
+        "peer": "A", "gate": "dep:auth", "round": 1, "verdict": "APPROVE",
+        "summary": "review", "objections": [],
+        "artifact_sha256": "a" * 64, "dag_sha256": "d" * 64, "node_sha256": "n" * 64,
+        "target_sha256": "t" * 64,
+    })
+    assert peer.target_sha256 == "t" * 64
+    assert peer.to_dict()["target_sha256"] == "t" * 64
+
+
+def test_peer_attestation_omits_target_when_absent():
+    # A build/deep-dive peer carries no target binding; its shape is unchanged (no null placeholder).
+    peer = _peer("A")
+    assert peer.target_sha256 is None
+    assert "target_sha256" not in peer.to_dict()
+
+
 def test_peer_approve_rejects_blocking_objection():
     peer = _peer("A", objections=[{
         "id": "O1", "severity": "major", "location": "candidate:F1",
@@ -735,6 +755,51 @@ def test_require_complete_symmetric_run_accepts_in_scope_final_when_enabled():
     )
     # When FINAL is configured, the in-scope FINAL set does not trip the out-of-scope guard.
     require_complete_symmetric_run(events, dag, require_final=True, final_enabled=True)
+
+
+# --- Task 2: pr-review accepted state must bind the expected review target -----------------------
+
+def test_require_complete_symmetric_run_rejects_accepted_set_not_bound_to_target():
+    from crucible.symmetric import require_complete_symmetric_run
+
+    dag = _one_done_dag("a")
+    events = _dep_events("a", findings=[_finding("dep:a", "F1")], bindings=_bindings("a", "d", "na"))
+    # The accepted dependency set carries no target binding, but a target is expected -> incomplete.
+    with pytest.raises(ValueError, match="incomplete symmetric workflow"):
+        require_complete_symmetric_run(events, dag, require_final=False, final_enabled=False,
+                                       expected_target_sha256="t" * 64)
+
+
+def test_require_complete_symmetric_run_rejects_mismatched_target_binding():
+    from crucible.symmetric import require_complete_symmetric_run
+
+    dag = _one_done_dag("a")
+    bindings = {**_bindings("a", "d", "na"), "target_sha256": "9" * 64}
+    events = _dep_events("a", findings=[_finding("dep:a", "F1")], bindings=bindings)
+    with pytest.raises(ValueError, match="incomplete symmetric workflow"):
+        require_complete_symmetric_run(events, dag, require_final=False, final_enabled=False,
+                                       expected_target_sha256="t" * 64)
+
+
+def test_require_complete_symmetric_run_accepts_target_bound_accepted_set():
+    from crucible.symmetric import require_complete_symmetric_run
+
+    dag = _one_done_dag("a")
+    tgt = "t" * 64
+    bindings = {**_bindings("a", "d", "na"), "target_sha256": tgt}
+    events = _dep_events("a", findings=[_finding("dep:a", "F1")], bindings=bindings)
+    # No exception: the accepted dependency set binds the expected target.
+    require_complete_symmetric_run(events, dag, require_final=False, final_enabled=False,
+                                   expected_target_sha256=tgt)
+
+
+def test_require_complete_symmetric_run_no_target_check_when_expected_none():
+    # Deep-dive/build path: an omitted expected target means no target requirement (unchanged).
+    from crucible.symmetric import require_complete_symmetric_run
+
+    dag = _one_done_dag("a")
+    events = _dep_events("a", findings=[_finding("dep:a", "F1")], bindings=_bindings("a", "d", "na"))
+    require_complete_symmetric_run(events, dag, require_final=False, final_enabled=False)
 
 
 # --- F2: a symmetric PLAN gate never persists an accepted finding set -------------------------

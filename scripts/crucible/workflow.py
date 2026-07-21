@@ -41,6 +41,7 @@ from crucible.symmetric import (
     validate_final_finding_set,
     workflow_kind,
 )
+from crucible.target import target_event_issues, target_from_events, target_sha256
 
 if TYPE_CHECKING:  # annotation-only imports keep this module free of runtime import cycles
     from crucible.config import Config
@@ -51,6 +52,15 @@ if TYPE_CHECKING:  # annotation-only imports keep this module free of runtime im
 # ``gate_capped`` is a halt, never an acceptance.
 _ADVANCE_TERMINALS = ("gate_consensus", "gate_proceeded_with_flags")
 _TERMINAL_EVENTS = ("gate_consensus", "gate_proceeded_with_flags", "gate_capped")
+
+# The schema-v2 gate events that carry the full ``crucible bindings`` set (and thus, for a pr-review
+# run, the immutable ``target_sha256``). Each must bind the loaded review target. ``builder_output``/
+# ``critic_output`` (artifact only), ``plan_approved`` (artifact+DAG, bound transitively via the PLAN
+# terminal), and a plain/forced ``node_status_change`` are deliberately excluded.
+_TARGET_BOUND_GATE_EVENTS = frozenset({
+    "symmetric_verdict", "accepted_finding_set",
+    "gate_consensus", "gate_proceeded_with_flags", "gate_capped",
+})
 
 
 def _accepted_terminal_with_index(
@@ -265,6 +275,72 @@ def _node_completion_backed(events: list[dict[str, Any]], dag: DAG, node_id: str
     return False
 
 
+def _target_issues(
+    events: list[dict[str, Any]], dag: DAG, workflow: str, cfg: Config
+) -> list["WorkflowIssue"]:
+    """Target-identity problems for a run, classified for the report status (Task 2). Pure.
+
+    Two layers, both fail-closed:
+
+    - target-EVENT integrity (:func:`crucible.target.target_event_issues`) — a target recorded in a
+      non-pr-review run, or a duplicate/malformed/late target, or pr-review DAG/PLAN/review work with
+      no loaded target — is ``invalid``; an init-only pr-review run that has simply not loaded its
+      target yet is ``missing`` (merely in progress).
+    - target-BINDING integrity — for a pr-review run with a valid loaded target, every in-scope gate
+      decision (and any source snapshot) must bind that target's authoritative hash. A
+      missing/mismatched target on an in-scope ``symmetric_verdict``/``accepted_finding_set``/terminal
+      or a ``source_materialized`` is ``invalid`` (a decision bound to a substituted/absent target).
+    """
+    issues = [WorkflowIssue("invalid", msg) for msg in target_event_issues(events, workflow)]
+    if workflow != "pr-review":
+        return issues
+    try:
+        target = target_from_events(events)
+    except ValueError:
+        return issues  # duplicate/malformed already reported by target_event_issues above
+    if target is None:
+        # No target loaded. If protocol work happened, target_event_issues already flagged it invalid;
+        # otherwise this is an init-only pr-review run that is simply in progress.
+        if not issues:
+            issues.append(WorkflowIssue(
+                "missing", "pr-review target is not loaded yet (run load-target)", phase="target"))
+        return issues
+    issues.extend(_target_binding_issues(events, dag, cfg, target_sha256(target)))
+    return issues
+
+
+def _target_binding_issues(
+    events: list[dict[str, Any]], dag: DAG, cfg: Config, expected: str
+) -> list["WorkflowIssue"]:
+    """Every IN-SCOPE gate decision (and any source snapshot) must bind the loaded target's hash.
+
+    In scope are the ``plan`` gate, the current dependency gates, and — only when ``final_review`` —
+    the ``final`` gate; an out-of-scope/ghost gate is already rejected by the symmetric scope guards,
+    so it is not double-reported here. Internal binding consistency (verdict <-> accepted set <->
+    terminal <-> peers) is enforced by ``resolve_gate_acceptance``/``_peer_attestation_issues`` via the
+    shared ``event_bindings`` (which now includes ``target_sha256``); this adds the AUTHORITATIVE
+    anchor against the loaded target so a fully consistent trio bound to a substituted target still
+    fails closed.
+    """
+    in_scope = {"plan", *(f"dep:{nid}" for nid in dag.order)}
+    if cfg.final_review:
+        in_scope.add("final")
+    issues: list[WorkflowIssue] = []
+    for e in events:
+        event = e.get("event")
+        if event in _TARGET_BOUND_GATE_EVENTS and e.get("gate") in in_scope:
+            if e.get("target_sha256") != expected:
+                issues.append(WorkflowIssue(
+                    "invalid",
+                    f"symmetric gate {e.get('gate')!r} {event} is not bound to the loaded review "
+                    f"target (target hash missing or mismatched)"))
+        elif event == "source_materialized" and e.get("target_sha256") != expected:
+            issues.append(WorkflowIssue(
+                "invalid",
+                "source snapshot is bound to a different target than the loaded review target"))
+    return issues
+
+
 def workflow_issues(events: list[dict[str, Any]], dag: DAG, cfg: Config) -> list["WorkflowIssue"]:
     """Deterministic, structured list of configured-workflow problems for the report (Task 4).
 
@@ -294,11 +370,16 @@ def workflow_issues(events: list[dict[str, Any]], dag: DAG, cfg: Config) -> list
     # there is no trustworthy asymmetric/symmetric routing to validate. Read once through the single
     # `workflow_kind` path; ``symmetric`` below reuses the result.
     try:
-        symmetric = workflow_kind(events) in SYMMETRIC_WORKFLOWS
+        workflow = workflow_kind(events)
     except CorruptWorkflowError as exc:
         return [WorkflowIssue("invalid", f"the run's recorded workflow metadata is corrupt: {exc}")]
+    symmetric = workflow in SYMMETRIC_WORKFLOWS
 
     issues: list[WorkflowIssue] = []
+    # Target integrity is evaluated FIRST (and unconditionally) so it is present on every path,
+    # including the missing-PLAN early return below: a pr-review run must load exactly one valid
+    # target before any DAG/PLAN/review work, and every in-scope gate must bind that target.
+    issues.extend(_target_issues(events, dag, workflow, cfg))
 
     reproduce_terminal, reproduce_idx = _accepted_terminal_with_index(events, "reproduce")
     if cfg.reproduce_gate:

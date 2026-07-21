@@ -2522,6 +2522,51 @@ def test_review_result_rejects_unfinished_dag(tmp_path):
     assert "incomplete" in r.stderr.lower()
 
 
+# --- Task 2: pr-review result commands bind the loaded review target ------------------------------
+
+def _authoritative_target_sha(run_dir):
+    from crucible.target import target_from_events, target_sha256
+    return target_sha256(target_from_events(_events(run_dir)))
+
+
+def test_review_result_accepted_state_binds_the_loaded_target(tmp_path):
+    # Happy path: the CLI write path binds every dependency accepted set/terminal to the loaded
+    # target, and the Finish-time result publishes.
+    run_dir = _complete_one_node_symmetric(
+        tmp_path, "auth", findings=[_accepted_finding("dep:auth", "F1", "major")])
+    tgt = _authoritative_target_sha(run_dir)
+    accepted = [e for e in _events(run_dir)
+                if e.get("event") == "accepted_finding_set" and e.get("gate") == "dep:auth"]
+    assert accepted and all(e.get("target_sha256") == tgt for e in accepted)
+    assert _run(["accepted-findings", "--run", run_dir]).returncode == 0
+    assert _run(["review-result", "--run", run_dir]).returncode == 0
+
+
+def test_result_commands_reject_accepted_state_bound_to_other_target(tmp_path):
+    # A completed pr-review run whose dependency accepted state was rebound to a DIFFERENT target
+    # (a consistent forgery the CLI never writes) must fail both Finish-time result commands closed —
+    # a result can never be published from accepted state not bound to the loaded review target.
+    run_dir = _complete_one_node_symmetric(
+        tmp_path, "auth", findings=[_accepted_finding("dep:auth", "F1", "major")])
+
+    def _swap_target(records):
+        for e in records:
+            if e.get("gate") == "dep:auth" and "target_sha256" in e:
+                e["target_sha256"] = "9" * 64
+            peers = e.get("peers")
+            if isinstance(peers, dict):
+                for slot in peers.values():
+                    att = slot.get("attestation") if isinstance(slot, dict) else None
+                    if isinstance(att, dict) and "target_sha256" in att:
+                        att["target_sha256"] = "9" * 64
+                        slot["raw"] = json.dumps(att)
+
+    _rewrite_events(run_dir, _swap_target)
+    for command in ("accepted-findings", "review-result"):
+        r = _run([command, "--run", run_dir])
+        assert r.returncode != 0, command
+
+
 def test_result_commands_reject_orphan_accepted_set(tmp_path):
     run_dir = _complete_one_node_symmetric(tmp_path, "auth",
                                            findings=[_accepted_finding("dep:auth", "F1", "major")])

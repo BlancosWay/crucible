@@ -5,6 +5,33 @@ from crucible.dag import DAG
 from crucible.integrity import RUN_SCHEMA_VERSION, artifact_sha256, dag_sha256, node_sha256
 from crucible.runlog import RunLog, init_run
 from crucible.report import render_markdown
+from crucible.target import ReviewTarget, target_sha256
+
+
+# A minimal revision-unbound diff-file target — the smallest valid pr-review target, so a pr-review
+# report fixture binds its gates to a real loaded target identity.
+_TARGET_MANIFEST = {
+    "version": 1, "kind": "diff-file", "revision_bound": False, "repository": None,
+    "diff_sha256": "0" * 64, "changed_files": ["a.py"], "intent": {"title": "t", "body": "b"},
+}
+_TGT = target_sha256(ReviewTarget.from_dict(_TARGET_MANIFEST))
+
+
+def _load_target(run):
+    """Append the one immutable ``target_loaded`` event; return its authoritative hash."""
+    run.append("target_loaded", target=ReviewTarget.from_dict(_TARGET_MANIFEST).to_dict(),
+               target_sha256=_TGT)
+    return _TGT
+
+
+def _append_plan_consensus(run, dsha):
+    """Append a target-bound PLAN consensus trio for a pr-review report fixture."""
+    plan_art = artifact_sha256(b"plan")
+    plan_bind = {"artifact_sha256": plan_art, "dag_sha256": dsha, "target_sha256": _TGT}
+    run.append("builder_output", gate="plan", round=1, payload="plan", artifact_sha256=plan_art)
+    run.append("symmetric_verdict", gate="plan", round=1, outcome="CONSENSUS", objections=[],
+               peers=_sym_peers("plan", 1, plan_bind), **plan_bind)
+    run.append("gate_consensus", gate="plan", round=1, **plan_bind)
 
 
 def _build_run(tmp_path):
@@ -1111,6 +1138,8 @@ def _symmetric_dep_run(tmp_path, *, accepted="pre", workflow="pr-review",
     """
     cfg = Config.from_dict({"final_review": False})
     run = init_run("symmetric dependency", cfg, base_dir=tmp_path, workflow=workflow)
+    # Only a pr-review run binds a target; a deep-dive run must NOT record one.
+    tbind = {"target_sha256": _load_target(run)} if workflow == "pr-review" else {}
     dag = DAG.from_dict({
         "nodes": [{"id": "auth", "title": "Auth", "description": "d", "files": ["auth.py"],
                    "test_plan": "pytest", "status": "done"}],
@@ -1121,17 +1150,17 @@ def _symmetric_dep_run(tmp_path, *, accepted="pre", workflow="pr-review",
 
     plan_payload = "investigation plan"
     plan_art = artifact_sha256(plan_payload.encode("utf-8"))
+    plan_bind = {"artifact_sha256": plan_art, "dag_sha256": dsha, **tbind}
     run.append("builder_output", gate="plan", round=1, payload=plan_payload,
                artifact_sha256=plan_art)
     run.append("symmetric_verdict", gate="plan", round=1, outcome="CONSENSUS", objections=[],
-               peers=_sym_peers("plan", 1, {"artifact_sha256": plan_art, "dag_sha256": dsha}),
-               artifact_sha256=plan_art, dag_sha256=dsha)
-    run.append("gate_consensus", gate="plan", round=1, artifact_sha256=plan_art, dag_sha256=dsha)
+               peers=_sym_peers("plan", 1, plan_bind), **plan_bind)
+    run.append("gate_consensus", gate="plan", round=1, **plan_bind)
 
     candidate = _sym_candidate(severity=severity)
     cand_text = json.dumps(candidate)
     cand_art = artifact_sha256(cand_text.encode("utf-8"))
-    bindings = {"artifact_sha256": cand_art, "dag_sha256": dsha, "node_sha256": nsha}
+    bindings = {"artifact_sha256": cand_art, "dag_sha256": dsha, "node_sha256": nsha, **tbind}
     run.append("builder_output", gate="dep:auth", round=1, payload=cand_text,
                artifact_sha256=cand_art)
     run.append("symmetric_verdict", gate="dep:auth", round=1, outcome="CONSENSUS",
@@ -1156,6 +1185,7 @@ def _sym_final_run(tmp_path):
     the effective result spans two source gates (``dep:auth`` and ``final``)."""
     cfg = Config.from_dict({"final_review": True})
     run = init_run("symmetric final", cfg, base_dir=tmp_path, workflow="pr-review")
+    _load_target(run)
     dag = DAG.from_dict({
         "nodes": [{"id": "auth", "title": "Auth", "description": "d", "files": ["auth.py"],
                    "test_plan": "pytest", "status": "done"}],
@@ -1164,17 +1194,13 @@ def _sym_final_run(tmp_path):
     run.save_dag(dag.to_dict())
     dsha, nsha = dag_sha256(dag), node_sha256(dag, "auth")
 
-    plan_art = artifact_sha256(b"plan")
-    run.append("builder_output", gate="plan", round=1, payload="plan", artifact_sha256=plan_art)
-    run.append("symmetric_verdict", gate="plan", round=1, outcome="CONSENSUS", objections=[],
-               peers=_sym_peers("plan", 1, {"artifact_sha256": plan_art, "dag_sha256": dsha}),
-               artifact_sha256=plan_art, dag_sha256=dsha)
-    run.append("gate_consensus", gate="plan", round=1, artifact_sha256=plan_art, dag_sha256=dsha)
+    _append_plan_consensus(run, dsha)
 
     candidate = _sym_candidate()
     cand_text = json.dumps(candidate)
     cand_art = artifact_sha256(cand_text.encode("utf-8"))
-    bindings = {"artifact_sha256": cand_art, "dag_sha256": dsha, "node_sha256": nsha}
+    bindings = {"artifact_sha256": cand_art, "dag_sha256": dsha, "node_sha256": nsha,
+                "target_sha256": _TGT}
     run.append("builder_output", gate="dep:auth", round=1, payload=cand_text,
                artifact_sha256=cand_art)
     run.append("symmetric_verdict", gate="dep:auth", round=1, outcome="CONSENSUS", objections=[],
@@ -1188,7 +1214,7 @@ def _sym_final_run(tmp_path):
         "location": "src/auth.py:1", "claim": "Cross-cutting note.", "suggestion": "Consider it."}]}
     final_text = json.dumps(final_payload)
     final_art = artifact_sha256(final_text.encode("utf-8"))
-    fbind = {"artifact_sha256": final_art, "dag_sha256": dsha}
+    fbind = {"artifact_sha256": final_art, "dag_sha256": dsha, "target_sha256": _TGT}
     run.append("builder_output", gate="final", round=1, payload=final_text, artifact_sha256=final_art)
     run.append("symmetric_verdict", gate="final", round=1, outcome="CONSENSUS", objections=[],
                peers=_sym_peers("final", 1, fbind), candidate=final_payload, **fbind)
@@ -1203,6 +1229,7 @@ def _sym_flags_run(tmp_path):
     of accepted findings (result section) from peer objections (gate provenance)."""
     cfg = Config.from_dict({"final_review": False, "on_cap": "proceed_with_flags"})
     run = init_run("symmetric flags", cfg, base_dir=tmp_path, workflow="pr-review")
+    _load_target(run)
     dag = DAG.from_dict({
         "nodes": [{"id": "auth", "title": "Auth", "description": "d", "files": ["auth.py"],
                    "test_plan": "pytest", "status": "done"}],
@@ -1211,17 +1238,13 @@ def _sym_flags_run(tmp_path):
     run.save_dag(dag.to_dict())
     dsha, nsha = dag_sha256(dag), node_sha256(dag, "auth")
 
-    plan_art = artifact_sha256(b"plan")
-    run.append("builder_output", gate="plan", round=1, payload="plan", artifact_sha256=plan_art)
-    run.append("symmetric_verdict", gate="plan", round=1, outcome="CONSENSUS", objections=[],
-               peers=_sym_peers("plan", 1, {"artifact_sha256": plan_art, "dag_sha256": dsha}),
-               artifact_sha256=plan_art, dag_sha256=dsha)
-    run.append("gate_consensus", gate="plan", round=1, artifact_sha256=plan_art, dag_sha256=dsha)
+    _append_plan_consensus(run, dsha)
 
     candidate = _sym_candidate(severity="nit")
     cand_text = json.dumps(candidate)
     cand_art = artifact_sha256(cand_text.encode("utf-8"))
-    bindings = {"artifact_sha256": cand_art, "dag_sha256": dsha, "node_sha256": nsha}
+    bindings = {"artifact_sha256": cand_art, "dag_sha256": dsha, "node_sha256": nsha,
+                "target_sha256": _TGT}
     objections = [{"id": "A:OBJ1", "severity": "blocker", "location": "candidate:F1",
                    "claim": "Peer A disputes the finding set.", "suggestion": "Add the missing case."}]
     run.append("builder_output", gate="dep:auth", round=1, payload=cand_text,
@@ -1415,21 +1438,18 @@ def test_report_symmetric_clean_no_findings_recommends_approve(tmp_path):
     # recommendation line.
     run = init_run("clean approve", Config.from_dict({"final_review": False}),
                    base_dir=tmp_path, workflow="pr-review")
+    _load_target(run)
     dag = DAG.from_dict({"nodes": [{"id": "auth", "title": "Auth", "description": "d",
                                     "files": ["auth.py"], "test_plan": "pytest",
                                     "status": "done"}], "edges": []})
     run.save_dag(dag.to_dict())
     dsha, nsha = dag_sha256(dag), node_sha256(dag, "auth")
-    plan_art = artifact_sha256(b"plan")
-    run.append("builder_output", gate="plan", round=1, payload="plan", artifact_sha256=plan_art)
-    run.append("symmetric_verdict", gate="plan", round=1, outcome="CONSENSUS", objections=[],
-               peers=_sym_peers("plan", 1, {"artifact_sha256": plan_art, "dag_sha256": dsha}),
-               artifact_sha256=plan_art, dag_sha256=dsha)
-    run.append("gate_consensus", gate="plan", round=1, artifact_sha256=plan_art, dag_sha256=dsha)
+    _append_plan_consensus(run, dsha)
     empty = {"summary": "clean", "findings": []}
     cand_text = json.dumps(empty)
     cand_art = artifact_sha256(cand_text.encode("utf-8"))
-    bindings = {"artifact_sha256": cand_art, "dag_sha256": dsha, "node_sha256": nsha}
+    bindings = {"artifact_sha256": cand_art, "dag_sha256": dsha, "node_sha256": nsha,
+                "target_sha256": _TGT}
     run.append("builder_output", gate="dep:auth", round=1, payload=cand_text, artifact_sha256=cand_art)
     run.append("symmetric_verdict", gate="dep:auth", round=1, outcome="CONSENSUS", objections=[],
                peers=_sym_peers("dep:auth", 1, bindings), candidate=empty, **bindings)
@@ -1484,21 +1504,18 @@ def test_report_symmetric_incomplete_missing_final_is_partial_no_recommendation(
     # the explicit "no recommendation until complete" note and derives NO recommendation.
     run = init_run("symmetric missing final", Config.from_dict({"final_review": True}),
                    base_dir=tmp_path, workflow="pr-review")
+    _load_target(run)
     dag = DAG.from_dict({"nodes": [{"id": "auth", "title": "Auth", "description": "d",
                                     "files": ["auth.py"], "test_plan": "pytest",
                                     "status": "done"}], "edges": []})
     run.save_dag(dag.to_dict())
     dsha, nsha = dag_sha256(dag), node_sha256(dag, "auth")
-    plan_art = artifact_sha256(b"plan")
-    run.append("builder_output", gate="plan", round=1, payload="plan", artifact_sha256=plan_art)
-    run.append("symmetric_verdict", gate="plan", round=1, outcome="CONSENSUS", objections=[],
-               peers=_sym_peers("plan", 1, {"artifact_sha256": plan_art, "dag_sha256": dsha}),
-               artifact_sha256=plan_art, dag_sha256=dsha)
-    run.append("gate_consensus", gate="plan", round=1, artifact_sha256=plan_art, dag_sha256=dsha)
+    _append_plan_consensus(run, dsha)
     candidate = _sym_candidate()
     cand_text = json.dumps(candidate)
     cand_art = artifact_sha256(cand_text.encode("utf-8"))
-    bindings = {"artifact_sha256": cand_art, "dag_sha256": dsha, "node_sha256": nsha}
+    bindings = {"artifact_sha256": cand_art, "dag_sha256": dsha, "node_sha256": nsha,
+                "target_sha256": _TGT}
     run.append("builder_output", gate="dep:auth", round=1, payload=cand_text, artifact_sha256=cand_art)
     run.append("symmetric_verdict", gate="dep:auth", round=1, outcome="CONSENSUS", objections=[],
                peers=_sym_peers("dep:auth", 1, bindings), candidate=candidate, **bindings)
@@ -1519,21 +1536,18 @@ def test_report_symmetric_capped_gate_has_no_recommendation(tmp_path):
     # which fails such a run closed).
     run = init_run("symmetric capped", Config.from_dict({"final_review": False}),
                    base_dir=tmp_path, workflow="pr-review")
+    _load_target(run)
     dag = DAG.from_dict({"nodes": [{"id": "auth", "title": "Auth", "description": "d",
                                     "files": ["auth.py"], "test_plan": "pytest",
                                     "status": "in_review"}], "edges": []})
     run.save_dag(dag.to_dict())
     dsha, nsha = dag_sha256(dag), node_sha256(dag, "auth")
-    plan_art = artifact_sha256(b"plan")
-    run.append("builder_output", gate="plan", round=1, payload="plan", artifact_sha256=plan_art)
-    run.append("symmetric_verdict", gate="plan", round=1, outcome="CONSENSUS", objections=[],
-               peers=_sym_peers("plan", 1, {"artifact_sha256": plan_art, "dag_sha256": dsha}),
-               artifact_sha256=plan_art, dag_sha256=dsha)
-    run.append("gate_consensus", gate="plan", round=1, artifact_sha256=plan_art, dag_sha256=dsha)
+    _append_plan_consensus(run, dsha)
     candidate = _sym_candidate()
     cand_text = json.dumps(candidate)
     cand_art = artifact_sha256(cand_text.encode("utf-8"))
-    bindings = {"artifact_sha256": cand_art, "dag_sha256": dsha, "node_sha256": nsha}
+    bindings = {"artifact_sha256": cand_art, "dag_sha256": dsha, "node_sha256": nsha,
+                "target_sha256": _TGT}
     objections = [{"id": "A:OBJ1", "severity": "blocker", "location": "candidate:F1",
                    "claim": "Peer A disputes the finding set.", "suggestion": "Add the missing case."}]
     run.append("builder_output", gate="dep:auth", round=1, payload=cand_text, artifact_sha256=cand_art)
@@ -1566,3 +1580,139 @@ def test_report_symmetric_malformed_accepted_history_is_invalid_no_result(tmp_pa
     assert "CLEAN" not in md
     assert "**Review recommendation:**" not in md
     assert "## Review result" not in md
+
+
+# --- Task 2: the report renders the immutable review target identity -----------------------------
+
+def _load_target_manifest(run, manifest):
+    """Append a target_loaded event for an arbitrary target manifest; return its hash."""
+    target = ReviewTarget.from_dict(manifest)
+    sha = target_sha256(target)
+    run.append("target_loaded", target=target.to_dict(), target_sha256=sha)
+    return sha
+
+
+_GITHUB_TARGET = {
+    "version": 1, "kind": "github-pr", "revision_bound": True, "repository": "base/repo",
+    "pr_number": 7, "url": "https://github.com/base/repo/pull/7",
+    "base": {"repository": "base/repo", "ref": "main", "sha": "1" * 40},
+    "head": {"repository": "fork/repo", "ref": "feature", "sha": "2" * 40},
+    "is_cross_repository": True, "diff_sha256": "a" * 64, "changed_files": ["src/a.py"],
+    "intent": {"title": "Fix A", "body": "Details"},
+}
+_LOCAL_TARGET = {
+    "version": 1, "kind": "local-range", "revision_bound": True,
+    "repository": "https://github.com/owner/repo.git",
+    "base": {"ref": "main", "sha": "1" * 40}, "head": {"ref": "feature", "sha": "2" * 40},
+    "merge_base_sha": "3" * 40, "diff_sha256": "b" * 64, "changed_files": ["src/a.py"],
+    "intent": {"title": "Local range review", "body": "..."},
+}
+_DIFF_TARGET = {
+    "version": 1, "kind": "diff-file", "revision_bound": False, "repository": None,
+    "diff_sha256": "c" * 64, "changed_files": ["src/a.py"],
+    "intent": {"title": "Patch review", "body": "..."},
+}
+
+
+def _pr_review_with_target(tmp_path, manifest):
+    """A pr-review run whose only recorded work is the loaded target (enough to render the section)."""
+    run = init_run("target report", Config.from_dict({"final_review": False}),
+                   base_dir=tmp_path, workflow="pr-review")
+    sha = _load_target_manifest(run, manifest)
+    return run, sha
+
+
+def test_report_renders_github_target_identity(tmp_path):
+    run, sha = _pr_review_with_target(tmp_path, _GITHUB_TARGET)
+    md = render_markdown(run)
+    target = _section(md, "Review target")
+    assert "base/repo#7" in target
+    assert "1" * 40 in target
+    assert "fork/repo" in target
+    assert "2" * 40 in target
+    assert "cross-repository" in target
+    assert sha in target  # the authoritative target hash is rendered
+
+
+def test_report_renders_local_range_target(tmp_path):
+    run, _ = _pr_review_with_target(tmp_path, _LOCAL_TARGET)
+    target = _section(render_markdown(run), "Review target")
+    assert "owner/repo" in target
+    assert "1" * 40 in target and "2" * 40 in target
+    assert "3" * 40 in target  # merge base
+
+
+def test_report_diff_file_states_revision_unbound(tmp_path):
+    run, _ = _pr_review_with_target(tmp_path, _DIFF_TARGET)
+    assert "Revision:** unbound (patch identity only)" in render_markdown(run)
+
+
+def test_report_review_target_section_precedes_summary(tmp_path):
+    run, _ = _pr_review_with_target(tmp_path, _DIFF_TARGET)
+    md = render_markdown(run)
+    assert "## Review target" in md and "## Summary" in md
+    assert md.index("## Review target") < md.index("## Summary")
+
+
+def test_report_target_section_sanitizes_untrusted_fields(tmp_path):
+    manifest = dict(_DIFF_TARGET)
+    manifest["intent"] = {"title": "pwn <img src=x onerror=alert(1)>", "body": "b | c"}
+    manifest["changed_files"] = ["src/<script>.py"]
+    run, _ = _pr_review_with_target(tmp_path, manifest)
+    target = _section(render_markdown(run), "Review target")
+    assert "<img" not in target and "<script>" not in target
+    assert "&lt;img" in target or "&lt;script&gt;" in target
+
+
+def test_report_no_target_section_before_load(tmp_path):
+    # An init-only pr-review run has no target yet: no target section, and the Summary is IN PROGRESS.
+    run = init_run("no target", Config.from_dict({"final_review": False}),
+                   base_dir=tmp_path, workflow="pr-review")
+    md = render_markdown(run)
+    assert "## Review target" not in md
+    assert "**Status:** IN PROGRESS" in md
+
+
+def test_report_downstream_work_without_target_is_invalid(tmp_path):
+    # pr-review protocol work with no loaded target is INVALID and renders no target section.
+    run = init_run("no target work", Config.from_dict({"final_review": False}),
+                   base_dir=tmp_path, workflow="pr-review")
+    dag = DAG.from_dict({"nodes": [{"id": "auth", "title": "Auth", "description": "d",
+                                    "files": ["auth.py"], "test_plan": "pytest",
+                                    "status": "pending"}], "edges": []})
+    run.save_dag(dag.to_dict())
+    run.append("builder_output", gate="plan", round=1, payload="plan",
+               artifact_sha256=artifact_sha256(b"plan"))
+    run.append("gate_consensus", gate="plan", round=1,
+               artifact_sha256=artifact_sha256(b"plan"), dag_sha256=dag_sha256(dag))
+    md = render_markdown(run)
+    assert "## Review target" not in md
+    assert "**Status:** INVALID" in md
+
+
+def test_report_no_target_section_for_build(tmp_path):
+    run = _build_run(tmp_path)
+    assert "## Review target" not in render_markdown(run)
+
+
+def test_report_no_target_section_for_deep_dive(tmp_path):
+    run = _symmetric_dep_run(tmp_path, accepted="pre", workflow="deep-dive")
+    assert "## Review target" not in render_markdown(run)
+
+
+def test_report_renders_source_snapshot_when_materialized(tmp_path):
+    run, sha = _pr_review_with_target(tmp_path, _LOCAL_TARGET)
+    run.append("source_materialized", kind="local-range", target_sha256=sha,
+               archive_sha256="d" * 64)
+    target = _section(render_markdown(run), "Review target")
+    assert "materialized" in target.lower()
+
+
+def test_report_ignores_source_snapshot_bound_to_other_target(tmp_path):
+    # A source_materialized whose target hash does not match the loaded target is not a valid snapshot
+    # of THIS target, so its status is not rendered as if it were.
+    run, sha = _pr_review_with_target(tmp_path, _LOCAL_TARGET)
+    run.append("source_materialized", kind="local-range", target_sha256="9" * 64,
+               archive_sha256="d" * 64)
+    target = _section(render_markdown(run), "Review target")
+    assert "materialized" not in target.lower()

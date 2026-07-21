@@ -814,17 +814,17 @@ def _require_matching_peer_bindings(peer: PeerAttestation, expected: dict[str, s
     rejects before any append — a peer that reviewed a different artifact/DAG/node can never attest.
     """
     provided = {key: getattr(peer, key)
-                for key in ("artifact_sha256", "dag_sha256", "node_sha256")}
+                for key in ("artifact_sha256", "dag_sha256", "node_sha256", "target_sha256")}
     problems = [f"{key}: expected {want}, got {provided.get(key)!r}"
                 for key, want in expected.items() if provided.get(key) != want]
     problems += [f"unexpected {key} for this gate" for key in provided
                  if provided[key] is not None and key not in expected]
     if problems:
         raise SystemExit(
-            f"symmetric-verdict: peer {slot} bindings do not match the CLI-selected artifact/DAG/node "
-            f"for gate {gate!r} round {round_index} ({'; '.join(problems)}); each peer attestation "
-            f"must echo the exact `crucible bindings` output — refusing to record a decision bound to "
-            f"a different artifact."
+            f"symmetric-verdict: peer {slot} bindings do not match the CLI-selected "
+            f"artifact/DAG/node/target for gate {gate!r} round {round_index} "
+            f"({'; '.join(problems)}); each peer attestation must echo the exact `crucible bindings` "
+            f"output — refusing to record a decision bound to a different artifact."
         )
 
 
@@ -1018,6 +1018,16 @@ def _load_result_dag(run: RunLog) -> DAG:
         raise ValueError("incomplete symmetric workflow: no dependency tree is loaded")
 
 
+def _expected_result_target_sha256(events: list[dict]) -> str | None:
+    """The pr-review run's authoritative loaded-target hash to bind a Finish-time result to, or
+    ``None`` for build/deep-dive. The loaded-target guard (:func:`_require_pr_review_target`) has
+    already validated presence for pr-review, so the single ``target_loaded`` event parses here."""
+    if workflow_kind(events) != "pr-review":
+        return None
+    target = target_from_events(events)
+    return target_sha256(target) if target is not None else None
+
+
 def _reject_incomplete_result_history(events: list[dict], dag: DAG, cfg: Config, command: str,
                                       *, tolerate_missing_final: bool) -> None:
     """Fail a Finish-time result command closed when the recorded workflow history is INVALID against
@@ -1072,7 +1082,8 @@ def cmd_accepted_findings(args) -> int:
     dag = _load_result_dag(run)
     cfg = load_config(run.path / "config.json")
     require_complete_symmetric_run(events, dag, require_final=False,
-                                   final_enabled=cfg.final_review)
+                                   final_enabled=cfg.final_review,
+                                   expected_target_sha256=_expected_result_target_sha256(events))
     _reject_incomplete_result_history(events, dag, cfg, "accepted-findings",
                                       tolerate_missing_final=True)
     print(json.dumps(accepted_findings(events, dag).to_dict()))
@@ -1096,7 +1107,8 @@ def cmd_review_result(args) -> int:
     workflow = _require_symmetric_result_workflow(events, "review-result")
     dag = _load_result_dag(run)
     require_complete_symmetric_run(events, dag, require_final=cfg.final_review,
-                                   final_enabled=cfg.final_review)
+                                   final_enabled=cfg.final_review,
+                                   expected_target_sha256=_expected_result_target_sha256(events))
     _reject_incomplete_result_history(events, dag, cfg, "review-result",
                                       tolerate_missing_final=False)
     print(json.dumps(review_result(events, cfg, workflow, dag)))

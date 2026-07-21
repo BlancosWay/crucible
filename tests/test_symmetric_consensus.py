@@ -2,6 +2,7 @@ import json
 import os
 import subprocess
 import sys
+import hashlib
 from pathlib import Path
 
 from crucible.config import Config
@@ -9,9 +10,46 @@ from crucible.dag import DAG
 from crucible.integrity import artifact_sha256, dag_sha256, node_sha256
 from crucible.report import render_markdown
 from crucible.runlog import init_run
+from crucible.target import ReviewTarget, target_sha256
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+# A minimal revision-unbound diff-file target (empty patch) — the smallest valid pr-review target, so
+# a pr-review consensus fixture binds its gates to a real loaded target identity.
+_TARGET_MANIFEST = {
+    "version": 1, "kind": "diff-file", "revision_bound": False, "repository": None,
+    "diff_sha256": hashlib.sha256(b"").hexdigest(), "changed_files": [],
+    "intent": {"title": "t", "body": "b"},
+}
+_TGT = target_sha256(ReviewTarget.from_dict(_TARGET_MANIFEST))
+
+
+def _load_target(run):
+    """Append the one immutable ``target_loaded`` event directly; return its authoritative hash."""
+    run.append("target_loaded", target=ReviewTarget.from_dict(_TARGET_MANIFEST).to_dict(),
+               target_sha256=_TGT)
+    return _TGT
+
+
+def _load_target_cli(run_path, tmp_path):
+    """Load the minimal diff-file target through the CLI so a pr-review run passes the target guard."""
+    diff = Path(tmp_path) / "target.diff"
+    diff.write_bytes(b"")
+    manifest = Path(tmp_path) / "target.json"
+    manifest.write_text(json.dumps(_TARGET_MANIFEST))
+    r = _run(["load-target", "--run", run_path, "--file", str(manifest), "--diff", str(diff)])
+    assert r.returncode == 0, r.stderr
+
+
+def _append_plan_consensus(run, dsha, payload="investigation plan"):
+    """Append a target-bound PLAN consensus trio (Builder output + two-peer verdict + terminal)."""
+    plan_art = artifact_sha256(payload.encode("utf-8"))
+    plan_bind = {"artifact_sha256": plan_art, "dag_sha256": dsha, "target_sha256": _TGT}
+    run.append("builder_output", gate="plan", round=1, payload=payload, artifact_sha256=plan_art)
+    run.append("symmetric_verdict", gate="plan", round=1, outcome="CONSENSUS", objections=[],
+               peers=_peers("plan", 1, plan_bind), **plan_bind)
+    run.append("gate_consensus", gate="plan", round=1, **plan_bind)
 
 
 def _peers(gate, rnd, bindings, outer_objs=()):
@@ -55,6 +93,7 @@ def test_single_verdict_cannot_certify_symmetric_workflow(tmp_path):
     ])
     assert proc.returncode == 0, proc.stderr
     run_path = Path(proc.stdout.strip())
+    _load_target_cli(str(run_path), tmp_path)  # a pr-review run must load its target before any gate
     dag_file = tmp_path / "dag.json"
     dag_file.write_text(json.dumps({
         "nodes": [{
@@ -112,16 +151,10 @@ def test_review_result_derives_request_changes_from_accepted_blocker(tmp_path):
         "edges": [],
     })
     run.save_dag(dag.to_dict())
+    _load_target(run)
     dsha, nsha = dag_sha256(dag), node_sha256(dag, "auth")
 
-    plan_payload = "investigation plan"
-    plan_art = artifact_sha256(plan_payload.encode("utf-8"))
-    run.append("builder_output", gate="plan", round=1, payload=plan_payload,
-               artifact_sha256=plan_art)
-    run.append("symmetric_verdict", gate="plan", round=1, outcome="CONSENSUS", objections=[],
-               peers=_peers("plan", 1, {"artifact_sha256": plan_art, "dag_sha256": dsha}),
-               artifact_sha256=plan_art, dag_sha256=dsha)
-    run.append("gate_consensus", gate="plan", round=1, artifact_sha256=plan_art, dag_sha256=dsha)
+    _append_plan_consensus(run, dsha)
 
     candidate = {
         "summary": "accepted findings",
@@ -136,7 +169,8 @@ def test_review_result_derives_request_changes_from_accepted_blocker(tmp_path):
     }
     cand_text = json.dumps(candidate)
     cand_art = artifact_sha256(cand_text.encode("utf-8"))
-    bindings = {"artifact_sha256": cand_art, "dag_sha256": dsha, "node_sha256": nsha}
+    bindings = {"artifact_sha256": cand_art, "dag_sha256": dsha, "node_sha256": nsha,
+                "target_sha256": _TGT}
     run.append("builder_output", gate="dep:auth", round=1, payload=cand_text,
                artifact_sha256=cand_art)
     run.append("symmetric_verdict", gate="dep:auth", round=1, outcome="CONSENSUS", objections=[],
@@ -167,16 +201,10 @@ def test_review_result_rejects_forged_final_when_final_review_disabled(tmp_path)
         "edges": [],
     })
     run.save_dag(dag.to_dict())
+    _load_target(run)
     dsha, nsha = dag_sha256(dag), node_sha256(dag, "auth")
 
-    plan_payload = "investigation plan"
-    plan_art = artifact_sha256(plan_payload.encode("utf-8"))
-    run.append("builder_output", gate="plan", round=1, payload=plan_payload,
-               artifact_sha256=plan_art)
-    run.append("symmetric_verdict", gate="plan", round=1, outcome="CONSENSUS", objections=[],
-               peers=_peers("plan", 1, {"artifact_sha256": plan_art, "dag_sha256": dsha}),
-               artifact_sha256=plan_art, dag_sha256=dsha)
-    run.append("gate_consensus", gate="plan", round=1, artifact_sha256=plan_art, dag_sha256=dsha)
+    _append_plan_consensus(run, dsha)
 
     candidate = {
         "summary": "accepted findings",
@@ -187,7 +215,8 @@ def test_review_result_rejects_forged_final_when_final_review_disabled(tmp_path)
     }
     cand_text = json.dumps(candidate)
     cand_art = artifact_sha256(cand_text.encode("utf-8"))
-    bindings = {"artifact_sha256": cand_art, "dag_sha256": dsha, "node_sha256": nsha}
+    bindings = {"artifact_sha256": cand_art, "dag_sha256": dsha, "node_sha256": nsha,
+                "target_sha256": _TGT}
     run.append("builder_output", gate="dep:auth", round=1, payload=cand_text,
                artifact_sha256=cand_art)
     run.append("symmetric_verdict", gate="dep:auth", round=1, outcome="CONSENSUS", objections=[],
@@ -202,7 +231,7 @@ def test_review_result_rejects_forged_final_when_final_review_disabled(tmp_path)
         "location": "src/auth.py:1", "claim": "Injected blocker.", "suggestion": "n/a",
     }]}
     fbind = {"artifact_sha256": artifact_sha256(json.dumps(final_payload).encode("utf-8")),
-             "dag_sha256": dsha}
+             "dag_sha256": dsha, "target_sha256": _TGT}
     run.append("symmetric_verdict", gate="final", round=1, outcome="CONSENSUS", objections=[],
                peers=_peers("final", 1, fbind), candidate=final_payload, **fbind)
     run.append("accepted_finding_set", gate="final", round=1, payload=final_payload, **fbind)
@@ -226,16 +255,10 @@ def test_report_recommendation_matches_review_result_cli(tmp_path):
         "edges": [],
     })
     run.save_dag(dag.to_dict())
+    _load_target(run)
     dsha, nsha = dag_sha256(dag), node_sha256(dag, "auth")
 
-    plan_payload = "investigation plan"
-    plan_art = artifact_sha256(plan_payload.encode("utf-8"))
-    run.append("builder_output", gate="plan", round=1, payload=plan_payload,
-               artifact_sha256=plan_art)
-    run.append("symmetric_verdict", gate="plan", round=1, outcome="CONSENSUS", objections=[],
-               peers=_peers("plan", 1, {"artifact_sha256": plan_art, "dag_sha256": dsha}),
-               artifact_sha256=plan_art, dag_sha256=dsha)
-    run.append("gate_consensus", gate="plan", round=1, artifact_sha256=plan_art, dag_sha256=dsha)
+    _append_plan_consensus(run, dsha)
 
     candidate = {
         "summary": "accepted findings",
@@ -247,7 +270,8 @@ def test_report_recommendation_matches_review_result_cli(tmp_path):
     }
     cand_text = json.dumps(candidate)
     cand_art = artifact_sha256(cand_text.encode("utf-8"))
-    bindings = {"artifact_sha256": cand_art, "dag_sha256": dsha, "node_sha256": nsha}
+    bindings = {"artifact_sha256": cand_art, "dag_sha256": dsha, "node_sha256": nsha,
+                "target_sha256": _TGT}
     run.append("builder_output", gate="dep:auth", round=1, payload=cand_text,
                artifact_sha256=cand_art)
     run.append("symmetric_verdict", gate="dep:auth", round=1, outcome="CONSENSUS", objections=[],
@@ -281,16 +305,10 @@ def test_report_flagged_recommendation_matches_review_result_cli(tmp_path):
         "edges": [],
     })
     run.save_dag(dag.to_dict())
+    _load_target(run)
     dsha, nsha = dag_sha256(dag), node_sha256(dag, "auth")
 
-    plan_payload = "investigation plan"
-    plan_art = artifact_sha256(plan_payload.encode("utf-8"))
-    run.append("builder_output", gate="plan", round=1, payload=plan_payload,
-               artifact_sha256=plan_art)
-    run.append("symmetric_verdict", gate="plan", round=1, outcome="CONSENSUS", objections=[],
-               peers=_peers("plan", 1, {"artifact_sha256": plan_art, "dag_sha256": dsha}),
-               artifact_sha256=plan_art, dag_sha256=dsha)
-    run.append("gate_consensus", gate="plan", round=1, artifact_sha256=plan_art, dag_sha256=dsha)
+    _append_plan_consensus(run, dsha)
 
     candidate = {
         "summary": "accepted findings",
@@ -301,7 +319,8 @@ def test_report_flagged_recommendation_matches_review_result_cli(tmp_path):
     }
     cand_text = json.dumps(candidate)
     cand_art = artifact_sha256(cand_text.encode("utf-8"))
-    bindings = {"artifact_sha256": cand_art, "dag_sha256": dsha, "node_sha256": nsha}
+    bindings = {"artifact_sha256": cand_art, "dag_sha256": dsha, "node_sha256": nsha,
+                "target_sha256": _TGT}
     objections = [{"id": "A:OBJ1", "severity": "blocker", "location": "candidate:F1",
                    "claim": "Peer A disputes the finding set.",
                    "suggestion": "Add the missing case."}]

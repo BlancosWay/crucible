@@ -19,6 +19,7 @@ from crucible.symmetric import (
     review_result,
     workflow_kind,
 )
+from crucible.target import target_from_events, target_sha256
 from crucible.workflow import WorkflowIssue, workflow_issues
 
 
@@ -525,6 +526,67 @@ def _symmetric_result_lines(
     return lines
 
 
+def _source_snapshot_line(events: list[dict[str, Any]], target_hash: str) -> str | None:
+    """Render the source-snapshot status ONLY from a ``source_materialized`` event bound to the same
+    target (its ``target_sha256`` equals the loaded target's hash). A snapshot recorded against any
+    other target is not a snapshot of THIS review target, so its status is never shown here."""
+    bound = [e for e in events if e.get("event") == "source_materialized"
+             and e.get("target_sha256") == target_hash]
+    if not bound:
+        return None
+    archive = str(bound[-1].get("archive_sha256", ""))
+    return f"**Source snapshot:** materialized (archive `{_san(archive[:12])}…`)"
+
+
+def _review_target_lines(events: list[dict[str, Any]], workflow: str | None) -> list[str]:
+    """The ``## Review target`` section (pr-review only), rendered from the authoritative
+    ``target_loaded`` event with sanitized labels/paths and full hashes.
+
+    Fails closed rather than fabricate: a build/deep-dive run (no target), a pr-review run whose
+    target is not yet loaded (in progress), or a duplicate/malformed/invalid target (the Summary
+    renders it INVALID) yields NO section — the reader never sees a half-formed identity.
+    """
+    if workflow != "pr-review":
+        return []
+    try:
+        target = target_from_events(events)
+    except ValueError:
+        return []  # duplicate/malformed/mismatched target: the Summary renders the run INVALID
+    if target is None:
+        return []  # not loaded yet: the Summary renders the run IN PROGRESS
+    sha = target_sha256(target)
+    lines = ["## Review target", ""]
+    if target.kind == "github-pr":
+        lines.append(f"**Pull request:** {_san(target.repository)}#{target.pr_number}")
+        lines.append(f"**URL:** {_san(target.url)}")
+        lines.append(f"**Base:** {_san(target.base.repository)}@{_san(target.base.ref)} "
+                     f"`{_san(target.base.sha)}`")
+        lines.append(f"**Head:** {_san(target.head.repository)}@{_san(target.head.ref)} "
+                     f"`{_san(target.head.sha)}`")
+        lines.append(
+            f"**Scope:** {'cross-repository' if target.is_cross_repository else 'same-repository'}")
+        lines.append("**Revision:** bound")
+    elif target.kind == "local-range":
+        lines.append(f"**Local range:** {_san(target.repository)}")
+        lines.append(f"**Base:** {_san(target.base.ref)} `{_san(target.base.sha)}`")
+        lines.append(f"**Head:** {_san(target.head.ref)} `{_san(target.head.sha)}`")
+        lines.append(f"**Merge base:** `{_san(target.merge_base_sha)}`")
+        lines.append("**Revision:** bound")
+    else:  # diff-file
+        lines.append("**Kind:** diff-file")
+        lines.append("**Revision:** unbound (patch identity only)")
+    lines.append(f"**Intent:** {_san(target.intent_title)} \u2014 {_san(target.intent_body)}")
+    files = target.changed_files
+    listed = ", ".join(_san(f) for f in files) if files else "(none)"
+    lines.append(f"**Changed files ({len(files)}):** {listed}")
+    lines.append(f"**Patch hash:** `{_san(target.diff_sha256)}`")
+    lines.append(f"**Target hash:** `{_san(sha)}`")
+    snapshot = _source_snapshot_line(events, sha)
+    if snapshot is not None:
+        lines.append(snapshot)
+    lines.append("")
+    return lines
+
 
 def render_markdown(run: RunLog) -> str:
     events = run.read_events()
@@ -592,6 +654,10 @@ def render_markdown(run: RunLog) -> str:
         if not isinstance(dag, dict):
             dag = {"nodes": []}
             dag_load_error = True
+
+    # The immutable review target identity (pr-review only), rendered BEFORE the Summary so a reader
+    # sees WHAT was reviewed before the status. Read from the authoritative ``target_loaded`` event.
+    lines.extend(_review_target_lines(events, workflow))
 
     lines.extend(_run_summary_lines(
         events, dag, config=config, schema_version=schema_version,
