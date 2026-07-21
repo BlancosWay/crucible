@@ -65,9 +65,12 @@ boundary. A GitHub-generated archive provides the needed source snapshot without
 
 ## Target manifest
 
-The orchestrator writes `RUN/target.json` and `RUN/target.diff`, then calls:
+The orchestrator prepares `RUN/target.json` and `RUN/target.diff` through the deterministic CLI,
+then loads them:
 
 ```bash
+PYTHONPATH=scripts python3 -m crucible normalize-target ... \
+  --output "$RUN/target.json" --diff-output "$RUN/target.diff"
 PYTHONPATH=scripts python3 -m crucible load-target \
   --run "$RUN" --file "$RUN/target.json" --diff "$RUN/target.diff"
 ```
@@ -203,9 +206,25 @@ Add `scripts/crucible/target.py` as the single owner of:
 Add:
 
 ```bash
+crucible normalize-target github --metadata PR.json --diff PR.diff \
+  --output TARGET.json --diff-output TARGET.diff
+crucible normalize-target local --repo REPO --base BASE --head HEAD --intent INTENT.json \
+  --output TARGET.json --diff-output TARGET.diff
+crucible normalize-target diff --diff PATCH --intent INTENT.json \
+  --output TARGET.json --diff-output TARGET.diff
 crucible load-target --run RUN --file TARGET.json --diff TARGET.diff
 crucible materialize-target --run RUN --archive SOURCE.tar.gz
 ```
+
+`normalize-target` does not mutate a run:
+
+- `github` consumes the exact JSON emitted by the documented `gh pr view --json ...` command plus
+  the exact `gh pr diff` bytes;
+- `local` resolves refs and merge base with argument-vector `git` subprocesses (never `shell=True`)
+  and emits the merge-base-to-head patch;
+- `diff` hashes the supplied patch and marks it revision-unbound.
+
+This command makes normalization behavior executable and directly testable rather than prose-only.
 
 The command is valid only for schema-v2 `pr-review` runs and rejects:
 
@@ -219,7 +238,8 @@ loaded target. Read-only report/status commands remain usable and render the run
 `IN PROGRESS` rather than crashing.
 
 `materialize-target` uses a confined Python archive reader. It rejects absolute paths, `..` path
-escapes, symlinks, hard links, devices, FIFOs, and any member that would resolve outside
+escapes, symlinks, hard links, devices, FIFOs, duplicate normalized paths, more than 100,000 members,
+more than 1 GiB of declared regular-file data, and any member that would resolve outside
 `RUN/source`; it extracts regular files/directories only. It never invokes repository code or
 archive-provided helpers. An unsafe archive leaves the review patch-only with source context marked
 unavailable.
