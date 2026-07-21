@@ -2,9 +2,19 @@
 
 **Status:** implemented. **Design spec:** [`../specs/2026-07-17-pr-review-skill-design.md`](../specs/2026-07-17-pr-review-skill-design.md).
 
+> **Amendment (2026-07-20) — superseded consensus mechanism.** This plan's single serialized **union
+> verdict** and "reusing the **unmodified** `crucible` CLI" description are **historical**. Symmetric
+> gates are now settled by **two peer attestation files** (`peer-a.json` / `peer-b.json`) via `crucible
+> symmetric-verdict --peer-a --peer-b`; the recommendation is derived by `crucible review-result` and
+> FINAL is assembled from `accepted-findings` (the CLI gained those symmetric commands; still **no
+> config-schema change**). See
+> [`../specs/2026-07-20-symmetric-consensus-design.md`](../specs/2026-07-20-symmetric-consensus-design.md)
+> and its plan [`2026-07-20-symmetric-consensus.md`](2026-07-20-symmetric-consensus.md).
+
 Adds `pr-review`, Crucible's third skill — a two-model **symmetric** adversarial PR review, structurally
-parallel to `deep-dive`, reusing the **unmodified** `crucible` CLI (no `scripts/crucible/` or
-`config.defaults.json` change). Built via Crucible itself (Builder/Peer-A + Critic/Peer-B), one gate
+parallel to `deep-dive`, reusing the `crucible` CLI (no `config.defaults.json` change; the 2026-07-20
+migration later added the symmetric `symmetric-verdict` / `accepted-findings` / `review-result`
+commands — see the banner). Built via Crucible itself (Builder/Peer-A + Critic/Peer-B), one gate
 per node.
 
 ## Dependency tree (build order)

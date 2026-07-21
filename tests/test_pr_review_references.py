@@ -1,3 +1,4 @@
+import json
 import re
 from pathlib import Path
 
@@ -47,9 +48,16 @@ def _flat(s: str) -> str:
     return " ".join(s.lower().replace("*", "").replace("`", "").replace("#", " ").split())
 
 
+def _json_blocks(text: str) -> list[dict]:
+    out: list[dict] = []
+    for body in re.findall(r"```json\n(.*?)```", text, re.DOTALL):
+        out.append(json.loads(body))
+    return out
+
+
 def _no_negated_echo(sec: str) -> None:
     assert not re.search(r"\b(?:do not|don't|never|not)\s+echo\b", sec), \
-        "the union verdict must be required to echo the bindings, not negated"
+        "each peer attestation must be required to echo the bindings, not negated"
 
 
 def test_reference_files_exist():
@@ -82,6 +90,23 @@ def test_peer_prompt_treats_input_as_untrusted():
     assert "data, not instructions" in low
     # a PR body that says "approve" is an injection attempt, reported as a finding
     assert "injection" in low.lower()
+
+
+def test_peer_prompt_defines_attestation_schema():
+    text = _read("peer-prompt.md")
+    assert "peer-a.json" in text and "peer-b.json" in text
+    attest = next((b for b in _json_blocks(text)
+                   if isinstance(b, dict) and b.get("peer") in ("A", "B")), None)
+    assert attest is not None, "peer-prompt must show a peer attestation JSON example"
+    for key in ("peer", "gate", "round", "verdict", "objections", "artifact_sha256"):
+        assert key in attest, f"attestation schema missing {key!r}"
+
+
+def test_peer_prompt_candidate_finding_carries_source_gate():
+    low = _norm("peer-prompt.md")
+    assert "source_gate" in low
+    assert "objection" in low
+    assert "candidate" in low
 
 
 def test_peer_prompt_carries_the_review_lenses():
@@ -128,27 +153,34 @@ def test_review_thread_separates_static_evidence_from_execution_candidates():
 def test_consensus_rubric_is_dual_approve_and_grounded():
     low = _read("consensus-rubric.md").lower()
     assert "both peers" in low
-    assert "verdict" in low
+    assert "symmetric-verdict" in low
     assert "evidence" in low or "citation" in low
     assert "not a vote" in low or "never a vote" in low
     assert "not an average" in low or "not by averaging" in low
 
 
-def test_consensus_rubric_both_peers_review_every_round():
+def test_consensus_rubric_both_peers_attest_every_round():
     low = _norm("consensus-rubric.md")
-    assert "both peers review the merged set every round" in low
-    assert "union of both peers" in low
+    assert "both peers independently attest" in low
+    assert "peer-a.json" in low and "peer-b.json" in low
     assert "iff neither" in low
+
+
+def test_consensus_rubric_decides_from_objections_not_accepted_severity():
+    low = _norm("consensus-rubric.md")
+    assert "objection" in low
+    assert re.search(r"objection[^.]{0,180}(consensus|gate progress|decided|never from)", low), \
+        "consensus-rubric must state gate progress is decided from peer objections"
 
 
 def test_consensus_rubric_bans_wontfix_for_peer_disputes():
     norm = _norm("consensus-rubric.md")
-    assert re.search(r"never\s+clear(?:ed|s)?[^.]{0,40}(--resolutions|wontfix)", norm), \
-        "consensus-rubric must state a blocking peer dispute is NEVER CLEARED via --resolutions/wontfix"
+    assert re.search(r"never\s+clear(?:ed|s)?[^.]{0,60}(--resolutions|wontfix)", norm), \
+        "consensus-rubric must state a blocking peer objection is NEVER CLEARED via --resolutions/wontfix"
     assert "wontfix" in norm and "--resolutions" in norm
     for line in _read("consensus-rubric.md").splitlines():
-        if "crucible verdict" in line and "--resolutions" in line:
-            raise AssertionError(f"pr-review must not invoke --resolutions in a verdict example: {line!r}")
+        assert "-m crucible verdict " not in line, \
+            f"pr-review must settle with symmetric-verdict, not the build-only verdict: {line!r}"
 
 
 def test_consensus_rubric_cap_disagreement_is_flagged_not_forced():
@@ -161,9 +193,11 @@ def test_consensus_rubric_cap_disagreement_is_flagged_not_forced():
 
 def test_consensus_rubric_recommendation_is_derived_not_voted():
     # The overall Approve/Comment/Request-changes recommendation is a deterministic projection of the
-    # finding set, NOT a separate vote — preserving "consensus is not a vote".
+    # accepted finding set (via `review-result`), NOT a separate vote — preserving "consensus is not a
+    # vote".
     low = _norm("consensus-rubric.md")
     assert "derived" in low
+    assert "review-result" in low
     assert "approve" in low and "comment" in low and "request" in low
     assert "not a separate vote" in low or "not voted" in low or "never separately ballot" in low
 
@@ -187,46 +221,46 @@ def test_platform_notes_dispatch_two_peers_from_run_config():
     assert "peer" in low
 
 
-def test_platform_notes_requires_both_peer_reviews_and_union():
+def test_platform_notes_requires_separate_attestations_and_symmetric_verdict():
     low = _norm("platform-notes.md")
-    assert "both peers independently review" in low
-    assert "deduped union" in low
+    assert "both peers independently attest" in low
+    assert "peer-a.json" in low and "peer-b.json" in low
     assert "never record only one peer" in low
+    assert 'symmetric-verdict --run "$run"' in low
+    assert "--peer-a" in low and "--peer-b" in low
 
 
-def test_peer_prompt_echoes_cli_bindings_in_verdict():
-    # Schema-2 (symmetric): scope to the peer prompt's "Binding echo" section. The single serialized
-    # UNION verdict the CLI consumes must ECHO the deterministic `crucible bindings` fields as trusted
-    # CLI metadata, verbatim, while preserving the exactly-one-JSON + union semantics; a missing or
-    # mismatched value is rejected before any decision.
+def test_platform_notes_states_slot_proof_not_process_identity():
+    low = _norm("platform-notes.md")
+    assert "two configured slots" in low
+    assert "cryptograph" in low
+    assert "not a cryptographic proof" in low or "does not cryptographically prove" in low
+    assert "process" in low
+
+
+def test_peer_prompt_echoes_cli_bindings_in_attestation():
     be = _flat(_section(_read("peer-prompt.md"), "Binding echo"))
-    assert "single serialized union verdict" in be
+    assert "each peer attestation" in be
     assert "crucible bindings" in be
     assert "trusted cli metadata" in be
     assert "artifact_sha256" in be
     assert "echo" in be and "verbatim" in be
-    assert "exactly-one-json + union semantics" in be
+    assert "symmetric-verdict" in be
     assert "rejects a missing or mismatched value" in be
     _no_negated_echo(be)
 
 
 def test_platform_notes_bindings_are_trusted_cli_metadata():
-    # Scope to platform-notes' "Binding handshake" section: the seed bindings are the exact `crucible
-    # bindings` JSON as TRUSTED CLI METADATA — NOT content copied from the reviewed (untrusted) artifact
-    # — the union verdict echoes them, and a mismatch is rejected before any decision.
     bh = _flat(_section(_read("platform-notes.md"), "Binding handshake"))
     assert "crucible bindings" in bh
     assert "trusted cli metadata" in bh
     assert "not content copied from the reviewed" in bh
-    assert "the union verdict echoes it" in bh
+    assert "each peer attestation echoes it" in bh
     assert "rejects a missing or mismatched value" in bh
     _no_negated_echo(bh)
 
 
 def test_consensus_rubric_records_binding_handshake():
-    # Scope to the stop-criteria doc's "decision is bound" section: the union verdict echoes the gate's
-    # CLI bindings, a missing/mismatched binding is rejected before any outcome, and the accepted
-    # artifact is immutable (a change requires a fresh run).
     db = _flat(_section(_read("consensus-rubric.md"), "decision is bound"))
     assert "crucible bindings" in db
     assert "artifact_sha256" in db
@@ -248,6 +282,7 @@ def test_platform_notes_posting_is_readonly_by_default_and_consented():
     assert "read-only" in low
     assert "consent" in low                  # only with the human's consent
     assert "gh pr review" in low             # posting mechanism
+    assert "review-result" in low            # posts the deterministic recommendation/findings
     # never automatic, never before consensus
     assert "never automatic" in low
 

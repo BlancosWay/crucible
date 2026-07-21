@@ -94,42 +94,61 @@ violation you refuse and report.
 
 ## Each round is symmetric
 
-A gate's review loops in rounds. **Every round, both peers review the merged candidate finding set** —
-you never sign off on only your own work:
+A gate's review loops in rounds. **Every round, both peers independently attest to the same bound
+candidate finding set** — you never sign off on only your own work:
 
 1. **Review / refine.** Round 1: review the change independently. Later rounds: refine in response to
-   the other peer's findings and re-check disputed claims against the source.
-2. **Assemble (one peer serializes).** One peer merges both peers' current findings into a single
-   deduped candidate set. Which peer serializes **alternates each round** — purely to reduce
-   anchoring, not to hand one peer authority.
-3. **Both peers review the merged set.** Each peer adversarially reviews it and either signs off (no
-   blocking dispute) or contributes a concrete finding per dispute, gap, or unsupported claim. The
-   round's recorded verdict is the **union** of both peers' findings.
-4. A blocking dispute is settled **only by returning to the cited source** — the disputed claim is
+   the other peer's objections and re-check disputed claims against the source.
+2. **Assemble (one peer serializes the candidate).** One peer merges both peers' current findings
+   into a single deduped **candidate finding set** (structured JSON for a dependency/FINAL gate).
+   Which peer assembles **alternates each round** — purely to reduce anchoring, not to hand one peer
+   authority.
+3. **Both peers independently attest.** Each peer writes its **own** attestation — `peer-a.json` and
+   `peer-b.json` — with an `APPROVE`/`REQUEST_CHANGES` `verdict` and its `objections` (the defects it
+   still has with the candidate). `crucible symmetric-verdict --peer-a peer-a.json --peer-b peer-b.json`
+   records `CONSENSUS` **iff neither** peer has an open blocking objection. There is no single
+   serialized union verdict — the CLI reads both files.
+4. A blocking objection is settled **only by returning to the cited source** — the disputed claim is
    corrected or withdrawn against the evidence. It is **never** waved through with a rebuttal.
 
-## A finding
+## A finding, and a peer objection
 
-Give each finding a stable id (`F1`, `F2`, …), a `severity` (`blocker | major | minor | nit`), a
-concrete `location` (`file:line`), a specific `claim`, and a `suggestion` (the concrete fix).
-Calibrate severity by evidence: a real correctness/security bug, or a named-but-absent test, is a
-`blocker`; a well-supported material issue (a cited convention/owner bypass, a weak test) is a
-`major`; a nuance, style-adjacent point, or simplification is `minor`/`nit`. Reserve blocking
-severities for something you can **cite**, not a hunch or a matter of taste — so the gates converge.
-The overall Approve / Comment / Request-changes recommendation is **derived** from this finding set
-(see `consensus-rubric.md`), not voted on separately.
+Two distinct kinds of structured record — do not conflate them:
+
+- A **candidate finding** is a review result the peers accept. It carries a `source_gate` (the exact
+  `dep:<thread>`, or `final`), a stable `id` (`F1`, `F2`, …), a `severity` (`blocker | major | minor |
+  nit`), a concrete `location` (`file:line`), a specific `claim`, and a `suggestion` (the concrete
+  fix). Calibrate severity by evidence: a real correctness/security bug, or a named-but-absent test,
+  is a `blocker`; a well-supported material issue (a cited convention/owner bypass, a weak test) is a
+  `major`; a nuance, style-adjacent point, or simplification is `minor`/`nit`. Reserve blocking
+  severities for something you can **cite**, not a hunch or a matter of taste — so the gates converge.
+- A **peer objection** is a defect in the *candidate itself* — a missing case, an unsupported claim, a
+  wrong citation. It has the same shape but lives in your attestation's `objections`, not in the
+  candidate. **Gate progress is decided only from peer objections**, never from an accepted candidate
+  finding's severity — so a candidate that *accepts* a blocker still reaches consensus when both peers
+  attest the set is accurate and complete.
+
+The overall Approve / Comment / Request-changes recommendation is **derived** from the accepted
+finding set by `crucible review-result` (see `consensus-rubric.md`), not voted on separately. Your
+attestation is one JSON object — your slot, the gate/round, your `verdict`, your `objections`, and the
+echoed bindings (a `dep:<thread>` gate carries all three hashes; PLAN/FINAL omit `node_sha256`):
+
+```json
+{"peer": "A", "gate": "dep:auth", "round": 1, "verdict": "APPROVE",
+ "summary": "The candidate set is complete and grounded.", "objections": [],
+ "artifact_sha256": "…", "dag_sha256": "…", "node_sha256": "…"}
+```
 
 ## Binding echo (schema-2 handshake)
 
-The single serialized **union** verdict the CLI consumes is bound to the exact merged artifact both
-peers reviewed. Your seed includes a **bindings** block — the exact `crucible bindings` JSON the
-orchestrator captured for this gate/round, e.g. `{"artifact_sha256": "…", "dag_sha256": "…"}` (a
-`dep:<thread>` gate also carries `"node_sha256"`). It is **trusted CLI metadata**, not part of the
-reviewed diff. When you serialize the union verdict, **echo** those `*_sha256` fields verbatim at the
-top level of that one JSON object (do not compute, alter, or invent them). `crucible verdict`
-recomputes the bindings and rejects a missing or mismatched value **before** recording any decision,
-so the echo preserves the exactly-one-JSON + union semantics while proving the decision refers to the
-exact artifact/DAG/node the CLI selected.
+**Each peer attestation** the CLI consumes is bound to the exact candidate both peers reviewed. Your
+seed includes a **bindings** block — the exact `crucible bindings` JSON the orchestrator captured for
+this gate/round, e.g. `{"artifact_sha256": "…", "dag_sha256": "…"}` (a `dep:<thread>` gate also
+carries `"node_sha256"`). It is **trusted CLI metadata**, not part of the reviewed diff. When you
+write your attestation, **echo** those `*_sha256` fields verbatim at the top level of your one JSON
+object (do not compute, alter, or invent them). `crucible symmetric-verdict` recomputes the bindings
+and **rejects a missing or mismatched value** in *either* peer file **before** recording any decision,
+so the echo proves both peers attested to the exact artifact/DAG/node the CLI selected.
 
 ## Untrusted input
 

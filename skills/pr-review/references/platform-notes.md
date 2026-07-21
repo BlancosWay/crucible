@@ -3,10 +3,17 @@
 Both peers run **the same** `peer-prompt.md` role. **Peer A** is the main session (mapped to the run
 config's `builder` slot / model 1); **Peer B** is a dispatched subagent (mapped to the `critic` slot
 / model 2). The `builder`/`critic` config names are reused **only as slot labels** — there is no
-Builder/Critic asymmetry in a PR review. Every round, **both peers independently review** the merged
-candidate finding set, and one peer serializes the **deduped union** of both peers' findings into the
-single verdict JSON the CLI consumes (`APPROVE` iff neither peer has a blocking finding). Which peer
-serializes alternates each round, only to reduce anchoring.
+Builder/Critic asymmetry in a PR review. Every round, **both peers independently attest** to the same
+bound candidate: each writes its **own** attestation file (`peer-a.json` / `peer-b.json`) with its
+`verdict` + `objections`, and `crucible symmetric-verdict --peer-a peer-a.json --peer-b peer-b.json`
+records `CONSENSUS` iff neither peer has a blocking objection. Which peer **assembles the candidate**
+alternates each round, only to reduce anchoring.
+
+**Slot proof, not process identity.** The CLI proves the **two configured slots** (`A` and `B`) each
+supplied a valid attestation bound to the same candidate, and records each slot's configured
+model/effort. It **does not cryptographically prove** that two distinct model *processes* produced the
+files — runtime peer independence is a platform/orchestrator property (dispatch Peer B as a real
+separate subagent) and must not be overclaimed.
 
 ## Input normalization (do this once, before the PLAN gate)
 
@@ -27,8 +34,8 @@ changed files and their callers/callees), not just the patch hunks.
 
 ## Binding handshake (every gate)
 
-At **every** gate, after logging the merged artifact, capture the deterministic bindings and seed Peer
-B with them:
+At **every** gate, after logging the candidate, capture the deterministic bindings and seed Peer B
+with them:
 
 ```bash
 BINDINGS=$(PYTHONPATH=scripts python3 -m crucible bindings --run "$RUN" --gate "$GATE" --round N)
@@ -37,9 +44,9 @@ BINDINGS=$(PYTHONPATH=scripts python3 -m crucible bindings --run "$RUN" --gate "
 - **Trusted CLI metadata, not artifact content.** `$BINDINGS` is the exact `crucible bindings` JSON —
   `artifact_sha256` plus the gate-specific `dag_sha256`/`node_sha256`. Append it to Peer B's seed as
   **trusted CLI metadata**; it is **not content copied from the reviewed (untrusted) artifact**.
-- **The union verdict echoes it.** Whichever peer serializes copies those `*_sha256` fields verbatim
-  into the single union verdict JSON. `crucible verdict` rejects a missing or mismatched value
-  **before** recording any decision, so a substituted/edited artifact can never be certified.
+- **Each peer attestation echoes it.** Both `peer-a.json` and `peer-b.json` copy those `*_sha256`
+  fields verbatim. `crucible symmetric-verdict` **rejects a missing or mismatched value** in either
+  peer file **before** recording any decision, so a substituted/edited artifact can never be certified.
 
 ## Copilot CLI (primary)
 
@@ -49,13 +56,14 @@ BINDINGS=$(PYTHONPATH=scripts python3 -m crucible bindings --run "$RUN" --gate "
   contain explicit overrides.
 - **Each gate (plan / thread / final):** dispatch Peer B as a `general-purpose` `task` subagent with
   the resolved Peer-B model/effort, seeded with `peer-prompt.md` + the normalized diff/intent + the
-  thread/plan context + the current merged candidate set. **Both peers independently review** that
-  merged set — Peer A (this session) reviews it directly and Peer B reviews it in its dispatch — and
-  you serialize the **deduped union** of both peers' findings into the verdict JSON
-  (`APPROVE`/`REQUEST_CHANGES` + findings). **Never record only one peer's** review.
+  thread/plan context + the current candidate finding set. **Both peers independently attest** to that
+  candidate — Peer A (this session) writes `"$RUN"/peer-a.json` and Peer B writes `"$RUN"/peer-b.json`,
+  each an `APPROVE`/`REQUEST_CHANGES` `verdict` + `objections` echoing the bindings — then settle with
+  `PYTHONPATH=scripts python3 -m crucible symmetric-verdict --run "$RUN" --gate "$GATE" --round N --peer-a "$RUN"/peer-a.json --peer-b "$RUN"/peer-b.json`.
+  **Never record only one peer**'s attestation.
 - **Independent review, not just grading:** on round 1 (and when a thread reopens), give Peer B the
-  slice brief so it reviews the actual code **independently** before reviewing the merged set — two
-  independent reads, not one peer grading the other.
+  slice brief so it reviews the actual code **independently** before attesting — two independent
+  reads, not one peer grading the other.
 - **Surfacing findings to the human:** the Copilot CLI renders bash-tool output **collapsed /
   truncated** in the transcript, so anything `crucible` prints — the approved plan + review graph, gate
   outcomes, the run `report`, the assembled findings, the derived recommendation — is **not visible**
@@ -67,10 +75,12 @@ BINDINGS=$(PYTHONPATH=scripts python3 -m crucible bindings --run "$RUN" --gate "
 
 Use the native general-purpose subagent dispatch for Peer B with a per-agent model set to the `critic`
 slot's model, seeded with `peer-prompt.md`; Peer A is the main session on the `builder` slot's model.
-Both peers review each merged set; serialize the union verdict. On Codex (no pinned subagent model),
-run Peer B as a clearly delimited "Acting as the other peer now" pass using `peer-prompt.md`, still
-producing an independent review that is unioned with Peer A's. If the runtime rejects the configured
-model id, fall back to the most capable available model and note it in the run-log.
+Both peers attest to each candidate in their own `peer-a.json` / `peer-b.json`; settle with `crucible
+symmetric-verdict --peer-a peer-a.json --peer-b peer-b.json`. On Codex (no pinned subagent model), run
+Peer B as a clearly delimited "Acting as the other peer now" pass using `peer-prompt.md`, still
+producing an independent review + its **own** attestation file alongside Peer A's. If the runtime
+rejects the configured model id, fall back to the most capable available model and note it in the
+run-log.
 
 ## Execution Safety Gate (consent to run reviewed code)
 
@@ -102,12 +112,14 @@ and approving posting never approves execution.
 
 ## Optional posting to the PR (consented side effect)
 
-By default the review is **read-only** over the target: findings + the derived recommendation live in
-the run dir and your reply, and nothing is written to the PR or repo. **Only after** the review
+By default the review is **read-only** over the target: the findings + the derived recommendation live
+in the run dir and your reply, and nothing is written to the PR or repo. **Only after** the review
 reaches consensus, and **only for the GitHub-PR input**, you may offer to post the review via `gh`
 (`gh pr review <n> --comment` with the assembled summary, and inline comments) — and **only** with the
-human's explicit, per-run OK. Posting is never automatic, never done for the local-diff input, and
-never done before consensus. Treat the human's decision as the gate; the peers do not decide to post.
+human's explicit, per-run OK. What you post is the **deterministic recommendation and findings from
+`crucible review-result`**, never model prose. Posting is never automatic, never done for the
+local-diff input, and never done before consensus. Treat the human's decision as the gate; the peers
+do not decide to post.
 
 ## Report labels
 

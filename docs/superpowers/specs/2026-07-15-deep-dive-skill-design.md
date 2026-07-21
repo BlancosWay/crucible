@@ -3,6 +3,14 @@
 **Status:** implemented. **Type:** engineering tool (an independent second skill in the Crucible
 repo). **Companion plan:** [`docs/superpowers/plans/2026-07-15-deep-dive-skill.md`](../plans/2026-07-15-deep-dive-skill.md).
 
+> **Amendment (2026-07-20) — superseded consensus mechanism.** The single serialized **union verdict**
+> and the "reuses the *unmodified* CLI" claim in this document are **historical**. Symmetric gates are
+> now settled by **two separately produced peer attestation files** (`peer-a.json` / `peer-b.json`) via
+> `crucible symmetric-verdict --peer-a --peer-b`, with structured accepted finding sets and the
+> `accepted-findings` / `review-result` deliverables. The CLI **gained** those symmetric commands
+> (still **no config-schema change**). See the implemented design:
+> [`2026-07-20-symmetric-consensus-design.md`](2026-07-20-symmetric-consensus-design.md).
+
 ## Problem
 
 Crucible's `crucible` skill is a two-model **construction** workflow: an asymmetric **Builder →
@@ -17,19 +25,23 @@ set — the deliverable being the findings, not a code change.
 ## Goal
 
 A new, **independent** skill `skills/deep-dive/` that runs a two-model **symmetric** adversarial deep
-dive, **without any change** to the existing `crucible` skill, the `scripts/crucible/` CLI, its
-config schema, or its tests. It reuses the *unmodified* deterministic CLI for all bookkeeping.
+dive, **without any change** to the existing `crucible` skill or its config schema. It reuses the
+deterministic CLI for all bookkeeping. (Amendment 2026-07-20: the two-peer migration later added the
+symmetric `symmetric-verdict` / `accepted-findings` / `review-result` commands — still no
+config-schema change; see the banner above.)
 
 ## Symmetric model
 
 - **Two equal peers**, not Builder/Critic. Peer A = the main session (config `builder` slot / model
   1); Peer B = a dispatched subagent (config `critic` slot / model 2). The slot names are labels
   only.
-- **Both peers review the merged candidate finding set every round.** One peer serializes the deduped
-  **union** of both peers' findings into the single verdict JSON the CLI expects; which peer
-  serializes **alternates** each round (to reduce anchoring). The union is `APPROVE` iff **neither**
-  peer has an open blocking finding — so consensus can never occur until **both** peers reviewed,
-  even in a one-round thread.
+- **Both peers independently attest to the candidate finding set every round.** One peer assembles the
+  deduped **candidate finding set**; then each peer writes its **own** attestation file (`peer-a.json`
+  / `peer-b.json`) and `crucible symmetric-verdict --peer-a --peer-b` records `CONSENSUS` **iff
+  neither** peer has an open blocking objection — so consensus can never occur until **both** peers
+  attested, even in a one-round thread. (Originally specified as one serialized *union verdict*;
+  superseded 2026-07-20 — see the banner.) Which peer assembles **alternates** each round (to reduce
+  anchoring).
 - **Evidence-grounded consensus — not a vote/average.** A finding survives only with a citation
   (`file:line` / precise data locator) either peer can independently **re-verify**; a dispute is
   settled by **returning to the source**, never by out-voting or averaging.

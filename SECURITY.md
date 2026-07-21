@@ -29,6 +29,14 @@ agent behavior:
   to an operator who can rewrite arbitrary files or run-log bytes** (there is no signing key and no
   sandbox; that adversary is out of scope). A pre-schema-2 **legacy** run is read-only and reported
   `LEGACY / UNVERIFIED`, never `CLEAN`.
+- **Symmetric peer proof is slot attestation, not process identity.** For the `deep-dive` and
+  `pr-review` skills a gate is settled by **two configured slots** (`A` and `B`) that each supply a
+  valid attestation bound to the same candidate, and the CLI records each slot's configured
+  model/effort. This proves two slots signed off — it **does not cryptographically prove** that two
+  distinct model *processes* produced the files (there is no signing key; runtime peer independence is
+  a platform/orchestrator property, out of scope for the CLI). The peer attestations are external
+  content, mapped into the decision the same way the Critic verdict is; they never change orchestrator
+  behavior or bypass a gate.
 - **Untrusted Critic output is data, not instructions.** The Critic's verdict/summary/findings
   are external content. They are mapped into the verdict JSON; they must never be allowed to
   change Builder behavior, reveal system prompts, or bypass a gate. The Markdown report escapes

@@ -1,7 +1,8 @@
 # Deterministic Symmetric Consensus and Review Results — Design
 
-**Status:** proposed. **Type:** deterministic CLI/run-log capability for the `deep-dive` and
-`pr-review` companion skills.
+**Status:** implemented. **Type:** deterministic CLI/run-log capability for the `deep-dive` and
+`pr-review` companion skills. **Companion plan:**
+[`docs/superpowers/plans/2026-07-20-symmetric-consensus.md`](../plans/2026-07-20-symmetric-consensus.md).
 
 ## Problem
 

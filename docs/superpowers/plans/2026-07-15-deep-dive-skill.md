@@ -3,24 +3,30 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development to
 > implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Amendment (2026-07-20) — superseded consensus mechanism.** This plan's single serialized **union
+> verdict** and "reuses the *existing, unmodified* CLI" description are **historical**. Symmetric gates
+> are now settled by **two peer attestation files** (`peer-a.json` / `peer-b.json`) via `crucible
+> symmetric-verdict --peer-a --peer-b`, with structured accepted finding sets and the
+> `accepted-findings` / `review-result` deliverables (the CLI gained those symmetric commands; still
+> **no config-schema change**). See
+> [`../specs/2026-07-20-symmetric-consensus-design.md`](../specs/2026-07-20-symmetric-consensus-design.md)
+> and its plan [`2026-07-20-symmetric-consensus.md`](2026-07-20-symmetric-consensus.md).
+
 **Goal:** Add a new, **independent** Crucible skill (`skills/deep-dive/`) that runs a two-model
 **symmetric adversarial deep dive** against real code or data — two equal peers investigate
 independently, cross-examine each other's findings, and converge on an evidence-grounded consensus
-finding set — **without any change to the existing `crucible` skill, the `scripts/crucible/` CLI,
-its config schema, or its tests.**
+finding set — **without any change to the existing `crucible` skill or its config schema.**
 
-**Architecture:** The new skill reuses the *existing, unmodified* deterministic `crucible` CLI for
-all bookkeeping (run init, DAG walk, round counting, consensus decision, provenance, report). The
-Builder/Critic asymmetry of crucible is replaced, in the deep-dive skill's own prose, by two **equal
-peers** (model 1 = this session; model 2 = a dispatched subagent). Symmetry is realized by having
-**both peers independently review the merged candidate-finding set every round**: each round both
-peers investigate/refine, one peer merely **serializes** the deduped **union** of both peers' findings
-into the single `critic_verdict` the CLI expects (which peer serializes **alternates** each round,
-only to reduce anchoring), and that union verdict is `APPROVE` **iff neither** peer has an open
-blocking finding. The deterministic `crucible verdict` then decides CONSENSUS / CHANGES / CAPPED
-exactly as today. Because the CLI is agnostic to *which model* authored the single verdict JSON and
-the union preserves the APPROVE⇔no-blocking-finding invariant it validates, this needs **zero CLI or
-config change**, and no consensus can occur until **both** peers have reviewed.
+**Architecture:** The new skill reuses the deterministic `crucible` CLI for all bookkeeping (run init,
+DAG walk, round counting, consensus decision, provenance, report). The Builder/Critic asymmetry of
+crucible is replaced, in the deep-dive skill's own prose, by two **equal peers** (model 1 = this
+session; model 2 = a dispatched subagent). Symmetry is realized by having **both peers independently
+attest to the candidate finding set every round**: each round both peers investigate/refine, one peer
+**assembles** the deduped candidate, then each peer writes its **own** attestation (`peer-a.json` /
+`peer-b.json`) and `crucible symmetric-verdict --peer-a --peer-b` records `CONSENSUS` **iff neither**
+peer has an open blocking objection. (This plan originally serialized one *union verdict*; superseded
+2026-07-20 — see the banner. The 2026-07-20 migration added the symmetric CLI commands with **no
+config-schema change**.) No consensus can occur until **both** peers have attested.
 
 **Tech Stack:** Markdown skill + reference docs (the operational spec the models follow); the
 existing Python `crucible` CLI (`PYTHONPATH=scripts python3 -m crucible …`), reused verbatim; stdlib

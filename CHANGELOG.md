@@ -8,6 +8,23 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
 ## [Unreleased]
 
 ### Added
+- **Symmetric two-peer consensus for the `deep-dive` / `pr-review` skills.** The symmetric skills now
+  settle every gate from **two separately produced peer attestation files** via a new
+  `symmetric-verdict --peer-a --peer-b` command, instead of one serialized union `verdict`. `init-run`
+  gains an immutable `--workflow build|deep-dive|pr-review` kind; dependency/FINAL candidates are
+  structured **finding sets** (`source_gate`/`id`/`severity`/`location`/`claim`/`suggestion`) kept
+  distinct from **peer objections** (gate progress is decided from objections, so a candidate that
+  *accepts* a blocker can still reach consensus); `accepted-findings` emits the deterministic accepted
+  dependency union and `review-result` is the Finish-time deliverable (the finding set, plus a derived
+  `APPROVE`/`COMMENT`/`REQUEST_CHANGES` recommendation for `pr-review` — `deep-dive` omits it). The
+  report renders **Peer A** / **Peer B** and a `Review recommendation:` line kept **separate** from the
+  workflow `CLEAN`/`FLAGGED` status. The build `crucible` skill and `verdict` semantics are unchanged.
+  The proof is that **two configured slots** attested to the same candidate — **not** cryptographic
+  model-process identity. Both symmetric skills, their references, commands, README, `docs/cli.md`, and
+  SECURITY were migrated to the two-peer protocol. Design:
+  `docs/superpowers/specs/2026-07-20-symmetric-consensus-design.md`; plan:
+  `docs/superpowers/plans/2026-07-20-symmetric-consensus.md`. Guarded by `tests/test_symmetric.py`,
+  the CLI/report/workflow suites, and the skill/reference/docs guards.
 - **Workflow integrity: every gate decision is bound to the exact reviewed artifact (schema v2).**
   New runs record `schema_version: 2` and bind each gate to canonical SHA-256 **content bindings** —
   `artifact_sha256` over the exact Builder-artifact bytes (CRLF-preserving) and `dag_sha256` /
