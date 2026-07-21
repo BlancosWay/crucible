@@ -116,6 +116,19 @@ def test_skill_reuses_crucible_cli_for_decisions():
         assert cmd in text, f"SKILL.md should reference `crucible {cmd}`"
 
 
+def test_skill_intro_states_cli_extended_not_unmodified():
+    # The intro must not call the CLI "unmodified": the symmetric flow adds the `--workflow` run
+    # metadata + the `symmetric-verdict`/`accepted-findings`/`review-result` commands (a CLI change),
+    # even though the config SCHEMA is unchanged. Require that accurate positive wording (scoped to the
+    # "for all bookkeeping" intro paragraph), not just a phrase ban, so the intro does not contradict
+    # the command protocol the rest of the skill teaches.
+    para = _flat(_para(SKILL.read_text(), "for all bookkeeping"))
+    assert "unmodified" not in para
+    assert "no config-schema change" in para
+    assert "--workflow" in para
+    assert "symmetric-verdict" in para
+
+
 def test_skill_settles_gates_with_symmetric_verdict_never_plain_verdict():
     text = SKILL.read_text()
     assert "symmetric-verdict" in text

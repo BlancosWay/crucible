@@ -219,6 +219,24 @@ def test_peer_prompt_echoes_cli_bindings_in_attestation():
     _no_negated_echo(be)
 
 
+def test_platform_notes_report_labels_are_symmetric_peer_headers():
+    # The run report renders `Peer A` / `Peer B` HEADERS for the symmetric workflow (not Builder/Critic
+    # labels), sourced from the builder/critic config slots for model/effort provenance. Running the
+    # symmetric flow requires the `--workflow` run metadata + the symmetric commands (a CLI change),
+    # even though the config SCHEMA is unchanged. Scope to the "Report labels" section so this fails on
+    # the stale "Builder/Critic labels ... no CLI or config change is needed" wording.
+    rl = _flat(_section(_read("platform-notes.md"), "Report labels"))
+    assert "peer a" in rl and "peer b" in rl
+    assert "header" in rl                       # renders Peer A/Peer B headers, not Builder/Critic labels
+    assert "builder" in rl and "critic" in rl and "slot" in rl   # sourced from the builder/critic slots
+    assert "model" in rl and "effort" in rl     # model/effort provenance
+    assert "no config-schema change" in rl
+    assert "--workflow" in rl
+    assert "symmetric-verdict" in rl or "symmetric commands" in rl
+    # the false "no CLI or config change is needed" claim must be gone
+    assert "no cli or config change" not in rl
+
+
 def test_platform_notes_bindings_are_trusted_cli_metadata():
     # Scope to platform-notes' "Binding handshake" section: the seed bindings are the exact `crucible
     # bindings` JSON as TRUSTED CLI METADATA — NOT content copied from the reviewed (untrusted)

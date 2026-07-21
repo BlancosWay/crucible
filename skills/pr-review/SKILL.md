@@ -15,9 +15,12 @@ recommendation, not a code change; the review is read-only over the target by de
 **Announce at start:** "I'm using the pr-review skill to run a two-model symmetric adversarial PR
 review."
 
-This skill reuses the *unmodified* deterministic `crucible` CLI for all bookkeeping (run init, DAG
-walk, round counting, consensus, provenance, report). All deterministic decisions are made by the CLI
-— **never eyeball them**. The only non-deterministic part is model reasoning.
+This skill reuses the deterministic `crucible` CLI for all bookkeeping (run init, DAG walk, round
+counting, consensus, provenance, report) with **no config-schema change** — the symmetric flow is
+selected by the `--workflow pr-review` run metadata and settled by the symmetric commands
+(`symmetric-verdict` / `accepted-findings` / `review-result`), not the build-only `verdict`. All
+deterministic decisions are made by the CLI — **never eyeball them**. The only non-deterministic part
+is model reasoning.
 
 ## Setup
 

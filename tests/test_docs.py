@@ -311,6 +311,26 @@ def test_changelog_records_symmetric_two_peer():
     assert "accepted-findings" in unreleased and "review-result" in unreleased
 
 
+def test_changelog_pr_review_entry_states_cli_extended_not_unmodified():
+    # Scope to the [Unreleased] pr-review skill bullet: it must NOT claim the CLI was "unmodified" /
+    # that there was "no CLI change" — the symmetric skills added the `symmetric-verdict` /
+    # `accepted-findings` / `review-result` commands and the `--workflow` run metadata. It must state
+    # the accurate scope (no CONFIG-SCHEMA change, but the CLI gained that workflow metadata + those
+    # commands), positively, not merely ban a phrase. The historical release entries are out of scope.
+    unreleased = _section((ROOT / "CHANGELOG.md").read_text(), "[Unreleased]")
+    bullet = _flat(_bullet(unreleased, "New independent `pr-review` skill"))
+    # accurate positive wording (implemented reality)
+    assert "no config-schema change" in bullet
+    assert "symmetric-verdict" in bullet
+    assert "accepted-findings" in bullet
+    assert "review-result" in bullet
+    assert "workflow metadata" in bullet or "--workflow" in bullet
+    # the false "unmodified CLI / no CLI change" claim must be gone from this live entry
+    assert "unmodified" not in bullet
+    assert "no cli/config-schema change" not in bullet
+    assert "no cli change" not in bullet
+
+
 def test_symmetric_design_marked_implemented_and_links_plan():
     design = (ROOT / "docs" / "superpowers" / "specs"
               / "2026-07-20-symmetric-consensus-design.md").read_text()

@@ -14,9 +14,12 @@ dispatched subagent. The deliverable is the **findings the user asked for**, not
 **Announce at start:** "I'm using the deep-dive skill to run a two-model symmetric adversarial
 investigation."
 
-This skill reuses the *unmodified* deterministic `crucible` CLI for all bookkeeping (run init, DAG
-walk, round counting, consensus, provenance, report). All deterministic decisions are made by the
-CLI — **never eyeball them**. The only non-deterministic part is model reasoning.
+This skill reuses the deterministic `crucible` CLI for all bookkeeping (run init, DAG walk, round
+counting, consensus, provenance, report) with **no config-schema change** — the symmetric flow is
+selected by the `--workflow deep-dive` run metadata and settled by the symmetric commands
+(`symmetric-verdict` / `accepted-findings` / `review-result`), not the build-only `verdict`. All
+deterministic decisions are made by the CLI — **never eyeball them**. The only non-deterministic part
+is model reasoning.
 
 ## Setup
 

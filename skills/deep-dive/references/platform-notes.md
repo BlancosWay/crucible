@@ -68,5 +68,8 @@ available model and note it in the run-log.
 
 ## Report labels
 
-The Crucible run report's `Builder` / `Critic` labels correspond to **Peer A / Peer B** — cosmetic
-only, from the config slots. No CLI or config change is needed to run the symmetric deep dive.
+The Crucible run report renders **Peer A** / **Peer B** headers for the symmetric workflow (not
+Builder/Critic labels), sourced from the `builder` / `critic` config slots — Peer A from the
+`builder` slot, Peer B from the `critic` slot — purely for **model / effort** provenance. No
+config-schema change is needed, but running the symmetric deep dive **does** require the `--workflow`
+run metadata and the symmetric commands (`symmetric-verdict` / `accepted-findings` / `review-result`).

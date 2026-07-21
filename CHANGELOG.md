@@ -53,8 +53,10 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
   **derived** Approve/Comment/Request-changes recommendation. Review lenses (correctness,
   error-handling/silent-failures, tests, type design, comments, guideline compliance, reuse/ownership,
   load-bearing-claim audit, PR-intent) are harvested from Anthropic's `pr-review-toolkit` and
-  crucible's own critic prompt. It **reuses the unmodified `crucible` CLI** (no CLI/config-schema
-  change), mirroring how `deep-dive` was added, and is **read-only** over the target by default —
+  crucible's own critic prompt. It **reuses the `crucible` CLI with no config-schema change** — but,
+  mirroring how `deep-dive` was added, the CLI itself gained the `--workflow` run metadata and the
+  symmetric `symmetric-verdict` / `accepted-findings` / `review-result` commands — and is
+  **read-only** over the target by default —
   posting the review to the PR happens only for a GitHub PR, only after consensus, and only with the
   human's explicit per-run consent. New `skills/pr-review/` (SKILL + 4 references), `commands/pr-review.md`,
   `tests/test_pr_review_references.py` + `tests/test_pr_review_skill.py`, registered additively in
