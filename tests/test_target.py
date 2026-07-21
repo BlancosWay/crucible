@@ -227,6 +227,91 @@ def test_diff_target_rejects_invalid_shape(mutation):
 
 
 # --------------------------------------------------------------------------------------
+# repository identity is canonical + credential-free (schema-level, shared validator)
+# --------------------------------------------------------------------------------------
+
+# Exactly the identities the normalizers actually emit (see normalized_repository_identity and
+# normalize_github_target): owner/repo, a sanitized host/path or scheme://host[:port]/path URL, and
+# local:<64 lowercase hex>. Each must load verbatim so target_sha256 stays stable.
+_CANONICAL_REPO_IDENTITIES = [
+    "owner/repo",
+    "github.com/owner/repo.git",
+    "https://github.com/owner/repo.git",
+    "ssh://github.com/owner/repo",
+    "git://github.com/owner/repo.git",
+    "https://github.com:443/owner/repo",
+    "local:" + "a" * 64,
+]
+
+# Non-empty but non-canonical strings a hand-written manifest could smuggle past a bare "non-empty
+# string" check: URL credentials, query/fragment, filesystem paths, backslashes, unsanitized scp,
+# malformed local fingerprints, whitespace/control, and single-segment junk.
+_NONCANONICAL_REPO_IDENTITIES = [
+    "https://user:pass@github.com/owner/repo.git",   # userinfo/credentials
+    "https://token@github.com/owner/repo.git",       # token in userinfo
+    "https://github.com/owner/repo.git?token=abc",   # query
+    "https://github.com/owner/repo.git#frag",        # fragment
+    "file:///home/user/repo",                        # file URL (no host)
+    "/home/user/secret/repo",                        # absolute path
+    "./repo",                                         # relative path
+    "../repo",                                        # parent-relative path
+    "owner/../repo",                                  # traversal
+    "C:\\Users\\me\\repo",                            # windows path / backslash
+    "owner\\repo",                                    # backslash
+    "github.com:owner/repo",                          # scp-style, not sanitized
+    "local:not-a-real-fingerprint",                  # malformed local
+    "local:" + "a" * 63,                             # local too short
+    "local:" + "A" * 64,                             # local uppercase hex
+    "local:" + "a" * 64 + "0",                       # local too long
+    "owner repo",                                     # embedded whitespace
+    "owner/repo\n",                                   # trailing control character
+    "repo",                                           # single segment
+]
+
+
+@pytest.mark.parametrize("identity", _CANONICAL_REPO_IDENTITIES)
+def test_top_level_repository_accepts_canonical_identities(identity):
+    data = local_target()
+    data["repository"] = identity
+    target = ReviewTarget.from_dict(data)
+    # Loaded verbatim — never silently sanitized, so target_sha256 stays stable.
+    assert target.repository == identity
+    assert target.to_dict()["repository"] == identity
+
+
+@pytest.mark.parametrize("identity", _NONCANONICAL_REPO_IDENTITIES)
+def test_top_level_repository_rejects_noncanonical(identity):
+    data = local_target()
+    data["repository"] = identity
+    with pytest.raises(ValueError, match="repository"):
+        ReviewTarget.from_dict(data)
+
+
+@pytest.mark.parametrize("identity", _NONCANONICAL_REPO_IDENTITIES)
+def test_nested_head_repository_rejects_noncanonical(identity):
+    data = github_target()
+    data["head"]["repository"] = identity  # fork/head slot; top-level stays canonical
+    with pytest.raises(ValueError, match="repository"):
+        ReviewTarget.from_dict(data)
+
+
+@pytest.mark.parametrize("identity", _NONCANONICAL_REPO_IDENTITIES)
+def test_nested_base_repository_rejects_noncanonical(identity):
+    data = github_target()
+    data["base"]["repository"] = identity  # base slot; validated before the base==top-level check
+    with pytest.raises(ValueError, match="repository"):
+        ReviewTarget.from_dict(data)
+
+
+def test_github_head_repository_accepts_canonical_fork_slug():
+    data = github_target()
+    data["head"]["repository"] = "another-fork/repo"
+    target = ReviewTarget.from_dict(data)
+    assert target.head.repository == "another-fork/repo"
+    assert target.to_dict()["head"]["repository"] == "another-fork/repo"
+
+
+# --------------------------------------------------------------------------------------
 # changed_files path safety (shared)
 # --------------------------------------------------------------------------------------
 

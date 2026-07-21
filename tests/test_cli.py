@@ -3307,6 +3307,84 @@ def test_load_target_late_rejects(tmp_path):
     assert "target_loaded" not in [e["event"] for e in _events(run_dir)]
 
 
+def _write_manifest(tmp_path, name, obj):
+    p = Path(tmp_path) / name
+    p.write_text(json.dumps(obj))
+    return p
+
+
+def _local_range_manifest(repository, diff_bytes):
+    return {
+        "version": 1, "kind": "local-range", "revision_bound": True,
+        "repository": repository,
+        "base": {"ref": "main", "sha": "1" * 40},
+        "head": {"ref": "feature", "sha": "2" * 40},
+        "merge_base_sha": "3" * 40,
+        "diff_sha256": hashlib.sha256(diff_bytes).hexdigest(),
+        "changed_files": ["src/a.py"],
+        "intent": {"title": "t", "body": "b"},
+    }
+
+
+def _github_pr_manifest(head_repository, diff_bytes):
+    return {
+        "version": 1, "kind": "github-pr", "revision_bound": True,
+        "repository": "base/repo",
+        "pr_number": 7, "url": "https://github.com/base/repo/pull/7",
+        "base": {"repository": "base/repo", "ref": "main", "sha": "1" * 40},
+        "head": {"repository": head_repository, "ref": "feature", "sha": "2" * 40},
+        "is_cross_repository": True,
+        "diff_sha256": hashlib.sha256(diff_bytes).hexdigest(),
+        "changed_files": ["src/a.py"],
+        "intent": {"title": "t", "body": "b"},
+    }
+
+
+@pytest.mark.parametrize("bad_repo", [
+    "https://user:pass@github.com/owner/repo.git",   # credentialed HTTPS
+    "https://github.com/owner/repo.git?token=abc",   # query
+    "https://github.com/owner/repo.git#frag",        # fragment
+    "/home/user/secret/repo",                        # absolute filesystem path
+    "local:not-a-real-fingerprint",                  # malformed local identity
+])
+def test_load_target_rejects_noncanonical_repository(tmp_path, bad_repo):
+    run_dir = _init_pr_review(tmp_path)
+    diff_bytes = b"patch-body"
+    dpath = tmp_path / "t.diff"; dpath.write_bytes(diff_bytes)
+    mpath = _write_manifest(tmp_path, "t.json", _local_range_manifest(bad_repo, diff_bytes))
+    r = _run(["load-target", "--run", run_dir, "--file", str(mpath), "--diff", str(dpath)])
+    assert r.returncode != 0
+    assert "repository" in r.stderr
+    assert "target_loaded" not in [e["event"] for e in _events(run_dir)]
+    # Rejected, not silently sanitized: no authoritative event and no scratch manifest written.
+    assert not (Path(run_dir) / "target.json").exists()
+
+
+def test_load_target_rejects_credentialed_nested_head_repository(tmp_path):
+    run_dir = _init_pr_review(tmp_path)
+    diff_bytes = b"patch-body"
+    dpath = tmp_path / "g.diff"; dpath.write_bytes(diff_bytes)
+    mpath = _write_manifest(tmp_path, "g.json",
+                            _github_pr_manifest("https://x:y@github.com/fork/repo", diff_bytes))
+    r = _run(["load-target", "--run", run_dir, "--file", str(mpath), "--diff", str(dpath)])
+    assert r.returncode != 0
+    assert "repository" in r.stderr
+    assert "target_loaded" not in [e["event"] for e in _events(run_dir)]
+
+
+def test_load_target_accepts_canonical_local_fingerprint(tmp_path):
+    run_dir = _init_pr_review(tmp_path)
+    diff_bytes = b"patch-body"
+    dpath = tmp_path / "ok.diff"; dpath.write_bytes(diff_bytes)
+    identity = "local:" + "a" * 64
+    mpath = _write_manifest(tmp_path, "ok.json", _local_range_manifest(identity, diff_bytes))
+    r = _run(["load-target", "--run", run_dir, "--file", str(mpath), "--diff", str(dpath)])
+    assert r.returncode == 0, r.stderr
+    loaded = [e for e in _events(run_dir) if e["event"] == "target_loaded"]
+    assert len(loaded) == 1
+    assert loaded[0]["target"]["repository"] == identity
+
+
 # --- show-target -------------------------------------------------------------
 
 def test_show_target_emits_authoritative_event_not_scratch_file(tmp_path):

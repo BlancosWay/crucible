@@ -2,6 +2,7 @@
 subprocess, which leaves cli.py at 0% in-process coverage). These exercise ``main`` and the
 small private helpers so a regression in a ``cmd_*`` error branch is caught fast, in-process."""
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -391,6 +392,27 @@ def test_symmetric_verdict_rejects_build_inprocess(tmp_path):
     with pytest.raises(SystemExit, match="build"):
         main(["symmetric-verdict", "--run", run, "--gate", "plan", "--round", "1",
               "--peer-a", a, "--peer-b", b])
+
+
+def test_load_target_rejects_credentialed_repository_inprocess(tmp_path, capsys):
+    run = _init_workflow(tmp_path, "pr-review")
+    diff = Path(tmp_path) / "t.diff"
+    diff.write_bytes(b"patch-body")
+    manifest = _write(tmp_path, "t.json", {
+        "version": 1, "kind": "local-range", "revision_bound": True,
+        "repository": "https://user:pass@github.com/owner/repo.git",
+        "base": {"ref": "main", "sha": "1" * 40},
+        "head": {"ref": "feature", "sha": "2" * 40},
+        "merge_base_sha": "3" * 40,
+        "diff_sha256": hashlib.sha256(b"patch-body").hexdigest(),
+        "changed_files": ["src/a.py"],
+        "intent": {"title": "t", "body": "b"},
+    })
+    rc = main(["load-target", "--run", run, "--file", manifest, "--diff", str(diff)])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "repository" in err
+    assert not any(e["event"] == "target_loaded" for e in RunLog(run).read_events())
 
 
 def test_symmetric_verdict_plan_consensus_inprocess(tmp_path, capsys):

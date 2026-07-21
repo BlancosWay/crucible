@@ -48,6 +48,15 @@ MAX_ARCHIVE_BYTES = 1 << 30
 SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
+# Canonical, credential-free repository identity grammar (see ``_is_canonical_repository_identity``).
+# ``LOCAL_IDENTITY_RE`` is the exact ``normalized_repository_identity`` fallback fingerprint; a slug
+# segment is a GitHub ``owner``/``repo`` or a sanitized-remote path component (no ``.``/``..``, no
+# separators, no ``:`` port/scp marker); ``_CONTROL_OR_SPACE_RE`` catches ASCII whitespace/control.
+LOCAL_IDENTITY_RE = re.compile(r"^local:[0-9a-f]{64}$")
+_SLUG_SEGMENT_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+_CONTROL_OR_SPACE_RE = re.compile(r"[\x00-\x20\x7f]")
+
+
 # The common fields every target kind carries, plus the kind-specific field set. A target manifest
 # must contain EXACTLY ``_COMMON_FIELDS | _VARIANT_FIELDS[kind]`` — no missing and no extra keys.
 _COMMON_FIELDS = frozenset({
@@ -130,19 +139,63 @@ def _required_url(data: dict[str, Any], key: str) -> str:
     return value
 
 
+def _is_canonical_slug(value: str) -> bool:
+    """A sanitized ``host/path`` or GitHub ``owner/repo`` slug: two or more ``/``-separated segments,
+    each a non-empty ``[A-Za-z0-9._-]`` component that is neither ``.`` nor ``..``. Rejects absolute/
+    relative paths (empty or dot segments), ``:`` (unsanitized scp/port), and anything else."""
+    segments = value.split("/")
+    if len(segments) < 2:
+        return False
+    return all(s not in (".", "..") and _SLUG_SEGMENT_RE.match(s) for s in segments)
+
+
+def _is_canonical_repository_identity(value: str) -> bool:
+    """Whether ``value`` is a repository identity in exactly the canonical, credential-free form the
+    normalizers emit — the single source of truth reused for both the top-level ``repository`` and a
+    nested ``Revision.repository``.
+
+    Accepts only: ``local:<64 lowercase hex>`` (the ``normalized_repository_identity`` fingerprint), a
+    sanitized ``scheme://host[:port]/path`` URL that is byte-identical to its own re-sanitization (so
+    userinfo/query/fragment can never survive), or an ``owner/repo``-style slug (sanitized host/path
+    or GitHub ``nameWithOwner``). Rejects absolute/relative filesystem paths, backslashes, credential-
+    bearing/query/fragment URLs, malformed local fingerprints, whitespace/control, and any value that
+    would normalize differently from its stored form.
+    """
+    if _CONTROL_OR_SPACE_RE.search(value) or "\\" in value:
+        return False
+    if LOCAL_IDENTITY_RE.match(value):
+        return True
+    if value.startswith("local:"):
+        # A malformed local fingerprint is never a valid URL or slug — reject rather than reinterpret.
+        return False
+    if "://" in value:
+        return _sanitize_remote_url(value) == value
+    return _is_canonical_slug(value)
+
+
 def _optional_repository(value: Any) -> str | None:
-    """The top-level ``repository`` field: ``None`` (diff-file) or a non-empty string."""
+    """The top-level ``repository`` field: ``None`` (diff-file) or a canonical, credential-free
+    repository identity (``owner/repo``, a sanitized host/path URL, or ``local:<64 hex>``)."""
     if value is None:
         return None
     if not isinstance(value, str) or not value.strip():
         raise ValueError("repository must be null or a non-empty string")
+    if not _is_canonical_repository_identity(value):
+        raise ValueError(
+            "repository must be a canonical credential-free identity (owner/repo, a sanitized "
+            f"host/path URL, or local:<64 hex>), got {value!r}")
     return value
 
 
 def _repository_name(value: Any) -> str:
-    """A revision's ``owner/name`` repository identity (github-pr base/head)."""
+    """A revision's repository identity (github-pr base/head), validated against the same canonical,
+    credential-free grammar as the top-level ``repository``."""
     if not isinstance(value, str) or not value.strip():
         raise ValueError("revision.repository must be a non-empty string")
+    if not _is_canonical_repository_identity(value):
+        raise ValueError(
+            "revision.repository must be a canonical credential-free identity (owner/repo, a "
+            f"sanitized host/path URL, or local:<64 hex>), got {value!r}")
     return value
 
 
