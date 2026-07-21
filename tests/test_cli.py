@@ -3346,6 +3346,23 @@ def _head_archive(tmp_path, repo, name="src.tar"):
     return archive
 
 
+def _single_dir_repo(tmp_path, name="repo_singledir"):
+    """A repo whose entire tree lives under ONE directory (``src/``). Its ``git archive`` output has
+    a single top-level component, which the codeload-wrapper heuristic would wrongly strip (F1)."""
+    repo = Path(tmp_path) / name
+    (repo / "src").mkdir(parents=True, exist_ok=True)
+    _git_t(repo, "init", "-q", "-b", "main")
+    _git_t(repo, "config", "user.email", "t@example.com")
+    _git_t(repo, "config", "user.name", "Tester")
+    _git_t(repo, "config", "commit.gpgsign", "false")
+    (repo / "src" / "a.py").write_text("base\n")
+    _git_t(repo, "add", "src/a.py"); _git_t(repo, "commit", "-q", "-m", "base")
+    _git_t(repo, "checkout", "-q", "-b", "feature")
+    (repo / "src" / "a.py").write_text("feature\n")
+    _git_t(repo, "add", "src/a.py"); _git_t(repo, "commit", "-q", "-m", "feature")
+    return repo
+
+
 def test_materialize_target_happy_path_records_event(tmp_path):
     run_dir = _init_pr_review(tmp_path)
     repo = _diverged_repo(tmp_path)
@@ -3359,6 +3376,21 @@ def test_materialize_target_happy_path_records_event(tmp_path):
     assert events[0]["kind"] == "local-range"
     assert len(events[0]["target_sha256"]) == 64
     assert len(events[0]["archive_sha256"]) == 64
+
+
+def test_materialize_target_local_range_preserves_single_directory(tmp_path):
+    # F1: a local-range archive whose files all live under one directory must materialize with that
+    # directory intact. The wrapper-stripping decision is bound to the immutable target kind
+    # (github-pr strips its one codeload wrapper; local-range preserves paths), never to the path
+    # shape or a caller flag — so `src/a.py` must NOT collapse to a root-level `a.py`.
+    run_dir = _init_pr_review(tmp_path)
+    repo = _single_dir_repo(tmp_path)
+    _load_local_target(run_dir, tmp_path, repo)
+    archive = _head_archive(tmp_path, repo)
+    r = _run(["materialize-target", "--run", run_dir, "--archive", str(archive)])
+    assert r.returncode == 0, r.stderr
+    assert (Path(run_dir) / "source" / "src" / "a.py").read_text() == "feature\n"
+    assert not (Path(run_dir) / "source" / "a.py").exists()
 
 
 def test_materialize_target_rejects_diff_file(tmp_path):

@@ -670,11 +670,12 @@ def _reject_unsafe_name(name: str) -> None:
 
 
 def _common_top_level(members: list[tarfile.TarInfo]) -> str | None:
-    """The single wrapper directory GitHub archives prefix every path with, or ``None``.
+    """The single wrapper directory GitHub codeload archives prefix every path with, or ``None``.
 
     Only returned when every member shares one first path component AND at least one member is nested
     beneath it (so a flat ``git archive`` tree — files already at the repository root — is never
-    mis-stripped).
+    mis-stripped). This heuristic is only consulted when the caller has decided, from the target
+    *kind*, that a codeload wrapper is expected (``strip_wrapper=True``); it is never used to guess.
     """
     names = [m.name.strip("/") for m in members if m.name.strip("/")]
     if not names:
@@ -697,13 +698,20 @@ def _strip_top(name: str, top: str | None) -> str:
     return n[len(prefix):] if n.startswith(prefix) else n
 
 
-def _validated_members(tar: tarfile.TarFile) -> list[tuple[tarfile.TarInfo, str]]:
+def _validated_members(
+    tar: tarfile.TarFile, strip_wrapper: bool
+) -> list[tuple[tarfile.TarInfo, str]]:
     """Validate EVERY member before any filesystem write and return ``(member, relative_path)``.
 
     Rejects (in one pass, so a later invalid member is caught before extraction begins): more than
     ``MAX_ARCHIVE_MEMBERS`` members; symlinks/hardlinks/devices/FIFOs; absolute/``..``/backslash
     names; duplicate normalized paths; and more than ``MAX_ARCHIVE_BYTES`` of declared regular-file
     data. Never follows a link.
+
+    ``strip_wrapper`` is an explicit per-kind decision made by the caller: ``True`` (a github-pr
+    codeload tarball) removes the single ``owner-repo-<sha>/`` wrapper directory; ``False`` (a
+    local-range ``git archive``) preserves the archive's repository-root-relative paths verbatim, so
+    a repo whose whole tree lives under one directory is never mistaken for a wrapper and flattened.
     """
     # Read headers lazily and stop as soon as the member cap is exceeded, so a pathological archive
     # with an enormous member count is rejected without materializing every TarInfo first.
@@ -713,7 +721,7 @@ def _validated_members(tar: tarfile.TarFile) -> list[tuple[tarfile.TarInfo, str]
         if len(members) > MAX_ARCHIVE_MEMBERS:
             raise ValueError(
                 f"archive has more than the {MAX_ARCHIVE_MEMBERS}-member limit (too many members)")
-    top = _common_top_level(members)
+    top = _common_top_level(members) if strip_wrapper else None
     total_bytes = 0
     seen: set[str] = set()
     validated: list[tuple[tarfile.TarInfo, str]] = []
@@ -753,7 +761,9 @@ def _ensure_within(base: Path, path: Path) -> None:
         raise ValueError(f"archive member would escape the destination: {path}")
 
 
-def safe_extract_source_archive(archive: str | Path, destination: str | Path) -> None:
+def safe_extract_source_archive(
+    archive: str | Path, destination: str | Path, *, strip_wrapper: bool
+) -> None:
     """Extract a source archive into an ABSENT ``destination`` atomically and confined.
 
     Validates every member first (see ``_validated_members``), then extracts regular files and
@@ -761,6 +771,11 @@ def safe_extract_source_archive(archive: str | Path, destination: str | Path) ->
     absent final path. ``TarFile.extract`` is never used (its link/device handling is unsafe); file
     bytes are streamed with ``extractfile``. A crash or a failed rename leaves no visible source and
     removes the staging directory, so ``destination`` is only ever the complete, validated tree.
+
+    ``strip_wrapper`` is a required, explicit decision the caller derives from the immutable target
+    *kind* (never from a caller flag or the archive's path shape): a github-pr codeload tarball nests
+    the whole tree under one ``owner-repo-<sha>/`` wrapper that is stripped (``True``); a local-range
+    ``git archive`` emits repository-root-relative paths that are preserved verbatim (``False``).
     """
     archive = Path(archive)
     destination = Path(destination)
@@ -768,7 +783,7 @@ def safe_extract_source_archive(archive: str | Path, destination: str | Path) ->
         raise ValueError(f"source destination already exists: {destination}")
     staging = destination.with_name(destination.name + ".staging")
     with tarfile.open(archive, "r:*") as tar:
-        members = _validated_members(tar)  # full validation BEFORE creating staging
+        members = _validated_members(tar, strip_wrapper)  # full validation BEFORE creating staging
         shutil.rmtree(staging, ignore_errors=True)
         try:
             staging.mkdir(parents=True)

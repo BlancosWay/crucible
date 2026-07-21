@@ -607,7 +607,7 @@ def _github_style_archive(path):
 def test_extract_github_style_strips_top_level(tmp_path):
     archive = _github_style_archive(tmp_path / "src.tar")
     dest = tmp_path / "source"
-    safe_extract_source_archive(archive, dest)
+    safe_extract_source_archive(archive, dest, strip_wrapper=True)
     assert (dest / "README.md").read_text() == "# readme\n"
     assert (dest / "src" / "a.py").read_text() == "print('a')\n"
     # the wrapper directory is stripped, not materialized
@@ -623,7 +623,7 @@ def test_extract_flat_archive_without_wrapper(tmp_path):
         _add_file(tar, "src/a.py", b"a\n")
     archive = _write_tar(tmp_path / "flat.tar", build)
     dest = tmp_path / "source"
-    safe_extract_source_archive(archive, dest)
+    safe_extract_source_archive(archive, dest, strip_wrapper=True)
     assert (dest / "README.md").read_text() == "r\n"
     assert (dest / "src" / "a.py").read_text() == "a\n"
 
@@ -633,7 +633,7 @@ def test_extract_rejects_existing_destination(tmp_path):
     dest = tmp_path / "source"
     dest.mkdir()
     with pytest.raises(ValueError, match="already exists"):
-        safe_extract_source_archive(archive, dest)
+        safe_extract_source_archive(archive, dest, strip_wrapper=True)
 
 
 def test_extract_rejects_parent_escape(tmp_path):
@@ -642,7 +642,7 @@ def test_extract_rejects_parent_escape(tmp_path):
     archive = _write_tar(tmp_path / "bad.tar", build)
     dest = tmp_path / "source"
     with pytest.raises(ValueError, match=r"\.\."):
-        safe_extract_source_archive(archive, dest)
+        safe_extract_source_archive(archive, dest, strip_wrapper=True)
     assert not dest.exists()
     assert not (tmp_path / "source.staging").exists()
 
@@ -653,7 +653,7 @@ def test_extract_rejects_absolute_path(tmp_path):
     archive = _write_tar(tmp_path / "bad.tar", build)
     dest = tmp_path / "source"
     with pytest.raises(ValueError, match="absolute"):
-        safe_extract_source_archive(archive, dest)
+        safe_extract_source_archive(archive, dest, strip_wrapper=True)
     assert not dest.exists()
 
 
@@ -664,7 +664,7 @@ def test_extract_rejects_symlink_member(tmp_path):
     archive = _write_tar(tmp_path / "bad.tar", build)
     dest = tmp_path / "source"
     with pytest.raises(ValueError, match="symlink|regular file"):
-        safe_extract_source_archive(archive, dest)
+        safe_extract_source_archive(archive, dest, strip_wrapper=True)
     assert not dest.exists()
     assert not (tmp_path / "source.staging").exists()
 
@@ -675,7 +675,7 @@ def test_extract_rejects_hardlink_member(tmp_path):
         _add_special(tar, "top/hard", tarfile.LNKTYPE, linkname="top/a.py")
     archive = _write_tar(tmp_path / "bad.tar", build)
     with pytest.raises(ValueError, match="hardlink|regular file"):
-        safe_extract_source_archive(archive, tmp_path / "source")
+        safe_extract_source_archive(archive, tmp_path / "source", strip_wrapper=True)
     assert not (tmp_path / "source").exists()
 
 
@@ -686,7 +686,7 @@ def test_extract_rejects_special_files(tmp_path, typeflag):
         _add_special(tar, "top/dev", typeflag)
     archive = _write_tar(tmp_path / "bad.tar", build)
     with pytest.raises(ValueError, match="regular file"):
-        safe_extract_source_archive(archive, tmp_path / "source")
+        safe_extract_source_archive(archive, tmp_path / "source", strip_wrapper=True)
     assert not (tmp_path / "source").exists()
 
 
@@ -699,7 +699,7 @@ def test_extract_rejects_duplicate_after_strip(tmp_path):
         _add_file(tar, "top/./a.py", b"2")  # normalizes to the same relative path
     archive = _write_tar(tmp_path / "dup.tar", build)
     with pytest.raises(ValueError, match="duplicate"):
-        safe_extract_source_archive(archive, tmp_path / "source")
+        safe_extract_source_archive(archive, tmp_path / "source", strip_wrapper=True)
     assert not (tmp_path / "source").exists()
 
 
@@ -711,7 +711,7 @@ def test_extract_rejects_too_many_members(tmp_path, monkeypatch):
         _add_file(tar, "top/c.py", b"c")
     archive = _write_tar(tmp_path / "many.tar", build)
     with pytest.raises(ValueError, match="members"):
-        safe_extract_source_archive(archive, tmp_path / "source")
+        safe_extract_source_archive(archive, tmp_path / "source", strip_wrapper=True)
     assert not (tmp_path / "source").exists()
 
 
@@ -722,7 +722,7 @@ def test_extract_rejects_too_many_declared_bytes(tmp_path, monkeypatch):
         _add_file(tar, "top/b.py", b"y" * 5)  # cumulative 10 > 8
     archive = _write_tar(tmp_path / "big.tar", build)
     with pytest.raises(ValueError, match="bytes"):
-        safe_extract_source_archive(archive, tmp_path / "source")
+        safe_extract_source_archive(archive, tmp_path / "source", strip_wrapper=True)
     assert not (tmp_path / "source").exists()
 
 
@@ -735,7 +735,7 @@ def test_extract_no_partial_when_later_member_invalid(tmp_path):
         _add_special(tar, "top/evil", tarfile.SYMTYPE, linkname="x")
     archive = _write_tar(tmp_path / "mixed.tar", build)
     with pytest.raises(ValueError):
-        safe_extract_source_archive(archive, tmp_path / "source")
+        safe_extract_source_archive(archive, tmp_path / "source", strip_wrapper=True)
     assert not (tmp_path / "source").exists()
     assert not (tmp_path / "source.staging").exists()
 
@@ -749,6 +749,92 @@ def test_extract_atomic_replace_failure_leaves_no_source(tmp_path, monkeypatch):
 
     monkeypatch.setattr(target_mod.os, "replace", boom)
     with pytest.raises(OSError, match="simulated rename failure"):
-        safe_extract_source_archive(archive, dest)
+        safe_extract_source_archive(archive, dest, strip_wrapper=True)
     assert not dest.exists()
     assert not (tmp_path / "source.staging").exists()
+
+
+# --------------------------------------------------------------------------------------
+# Wrapper stripping is an EXPLICIT per-kind decision (F1): a github-pr codeload tarball
+# nests everything under one wrapper dir that must be stripped; a local-range `git archive`
+# emits repository-root-relative paths that must be preserved verbatim.
+# --------------------------------------------------------------------------------------
+
+def _single_directory_local_archive(path):
+    """A local ``git archive`` whose entire tree lives under one real directory (``src/``).
+
+    This is the F1 regression fixture: with unconditional top-level stripping the sole real
+    directory looks like a codeload wrapper and the snapshot collapses ``src/a.py`` to ``a.py``.
+    """
+    def build(tar):
+        _add_dir(tar, "src/")
+        _add_file(tar, "src/a.py", b"print('a')\n")
+        _add_file(tar, "src/b.py", b"print('b')\n")
+    return _write_tar(path, build)
+
+
+def test_extract_local_range_preserves_single_directory_layout(tmp_path):
+    # F1: a local-range archive whose files all live under one directory must keep that directory.
+    archive = _single_directory_local_archive(tmp_path / "local.tar")
+    dest = tmp_path / "source"
+    safe_extract_source_archive(archive, dest, strip_wrapper=False)
+    assert (dest / "src" / "a.py").read_text() == "print('a')\n"
+    assert (dest / "src" / "b.py").read_text() == "print('b')\n"
+    # the directory is NOT mistaken for a wrapper and stripped away
+    assert not (dest / "a.py").exists()
+    assert not (tmp_path / "source.staging").exists()
+
+
+def test_extract_local_range_preserves_wrapper_named_paths(tmp_path):
+    # Even a local tree that happens to share one top component with a codeload-looking name is
+    # preserved verbatim when stripping is off — the decision is the kind, never the path shape.
+    def build(tar):
+        _add_dir(tar, "owner-repo-abc123/")
+        _add_file(tar, "owner-repo-abc123/a.py", b"a\n")
+    archive = _write_tar(tmp_path / "localish.tar", build)
+    dest = tmp_path / "source"
+    safe_extract_source_archive(archive, dest, strip_wrapper=False)
+    assert (dest / "owner-repo-abc123" / "a.py").read_text() == "a\n"
+
+
+def test_extract_github_pr_strips_exactly_one_codeload_wrapper(tmp_path):
+    # github-pr: strip exactly the one `owner-repo-<sha>/` wrapper and preserve the real tree —
+    # including a nested directory — beneath it (only ONE level is removed).
+    def build(tar):
+        _add_dir(tar, "owner-repo-abc123/")
+        _add_dir(tar, "owner-repo-abc123/src/")
+        _add_file(tar, "owner-repo-abc123/src/a.py", b"print('a')\n")
+        _add_file(tar, "owner-repo-abc123/README.md", b"# r\n")
+    archive = _write_tar(tmp_path / "gh.tar", build)
+    dest = tmp_path / "source"
+    safe_extract_source_archive(archive, dest, strip_wrapper=True)
+    assert (dest / "src" / "a.py").read_text() == "print('a')\n"
+    assert (dest / "README.md").read_text() == "# r\n"
+    # the wrapper is gone but the inner directory (one level down) survives
+    assert not (dest / "owner-repo-abc123").exists()
+    assert (dest / "src").is_dir()
+
+
+@pytest.mark.parametrize("strip_wrapper", [True, False])
+def test_extract_rejects_parent_escape_in_both_modes(tmp_path, strip_wrapper):
+    # Traversal defense is independent of the stripping decision.
+    def build(tar):
+        _add_file(tar, "../../escape.py", b"x")
+    archive = _write_tar(tmp_path / "bad.tar", build)
+    with pytest.raises(ValueError, match=r"\.\."):
+        safe_extract_source_archive(archive, tmp_path / "source", strip_wrapper=strip_wrapper)
+    assert not (tmp_path / "source").exists()
+    assert not (tmp_path / "source.staging").exists()
+
+
+@pytest.mark.parametrize("strip_wrapper", [True, False])
+def test_extract_rejects_duplicate_after_normalization_in_both_modes(tmp_path, strip_wrapper):
+    # Duplicate detection (post-normpath) holds whether or not a wrapper is stripped.
+    def build(tar):
+        _add_dir(tar, "top/")
+        _add_file(tar, "top/a.py", b"1")
+        _add_file(tar, "top/./a.py", b"2")  # normalizes to the same relative path
+    archive = _write_tar(tmp_path / "dup.tar", build)
+    with pytest.raises(ValueError, match="duplicate"):
+        safe_extract_source_archive(archive, tmp_path / "source", strip_wrapper=strip_wrapper)
+    assert not (tmp_path / "source").exists()

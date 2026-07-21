@@ -360,6 +360,22 @@ def _peer(tmp_path, slot, gate, round_index, binding, name, verdict="APPROVE", o
     })
 
 
+def _load_diff_target_inprocess(run, tmp_path):
+    """Load a minimal valid revision-unbound diff-file target through the REAL CLI so a pr-review
+    run satisfies the Task 1 loaded-target guard — no monkeypatching of the guard. Uses
+    ``normalize-target diff`` + ``load-target`` (the actual user path); the guard only needs a valid
+    loaded target, not a particular kind."""
+    diff = Path(tmp_path) / "target.in.diff"
+    diff.write_bytes(b"diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-o\n+n\n")
+    intent = _write(tmp_path, "target.intent.json", {"title": "t", "body": "b"})
+    manifest = Path(tmp_path) / "target.json"
+    diff_out = Path(tmp_path) / "target.diff"
+    assert main(["normalize-target", "diff", "--diff", str(diff), "--intent", intent,
+                 "--output", str(manifest), "--diff-output", str(diff_out)]) == 0
+    assert main(["load-target", "--run", run, "--file", str(manifest),
+                 "--diff", str(diff_out)]) == 0
+
+
 def test_verdict_rejects_symmetric_run_inprocess(tmp_path):
     run = _init_workflow(tmp_path, "deep-dive")
     vfile = _write(tmp_path, "v.json", {"gate": "plan", "round": 1, "verdict": "APPROVE",
@@ -379,6 +395,10 @@ def test_symmetric_verdict_rejects_build_inprocess(tmp_path):
 
 def test_symmetric_verdict_plan_consensus_inprocess(tmp_path, capsys):
     run = _init_workflow(tmp_path, "pr-review")
+    # A pr-review command is guarded by the Task 1 loaded-target guard; load a minimal valid
+    # diff-file target through the REAL CLI first (no monkeypatching of the guard), before any
+    # DAG/PLAN event so load-target's "target must precede protocol work" ordering rule holds.
+    _load_diff_target_inprocess(run, tmp_path)
     r = RunLog(run)
     r.save_dag(DAG.from_dict({"nodes": [{"id": "a", "title": "A", "description": "",
                "files": [], "test_plan": "", "status": "pending"}], "edges": []}).to_dict())

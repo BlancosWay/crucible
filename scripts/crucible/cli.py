@@ -1403,9 +1403,11 @@ def cmd_materialize_target(args) -> int:
     ``target_loaded`` and before any DAG/PLAN/review or prior materialization event. Extraction is
     confined (see ``crucible.target.safe_extract_source_archive``): it rejects path escapes, links,
     devices/FIFOs, duplicate normalized paths, and archives over the member/byte caps, and atomically
-    replaces the ABSENT ``RUN/source``. Records a ``source_materialized`` event with the target and
-    archive hashes ONLY after a successful extract — a rejection never creates ``RUN/source`` or
-    appends an event.
+    replaces the ABSENT ``RUN/source``. Wrapper stripping is derived from the immutable target *kind*
+    (github-pr strips its one codeload wrapper; local-range preserves archive paths) — never from a
+    caller flag — so an attacker cannot flatten a local snapshot by choosing the archive layout.
+    Records a ``source_materialized`` event with the target and archive hashes ONLY after a
+    successful extract — a rejection never creates ``RUN/source`` or appends an event.
     """
     run = RunLog(args.run)
     _require_run_integrity(run)
@@ -1434,7 +1436,13 @@ def cmd_materialize_target(args) -> int:
     destination = run.path / "source"
     if destination.exists():
         raise SystemExit(f"crucible: source already materialized at {destination}")
-    safe_extract_source_archive(args.archive, destination)
+    # Wrapper stripping is bound to the immutable target KIND, never a caller flag or the archive's
+    # path shape: a github-pr codeload tarball nests the whole tree under one `owner-repo-<sha>/`
+    # wrapper that must be stripped, whereas a local-range `git archive` emits repository-root-
+    # relative paths that must be preserved verbatim (stripping a single-directory repo such as
+    # `src/a.py` down to `a.py` would corrupt the snapshot).
+    strip_wrapper = target.kind == "github-pr"
+    safe_extract_source_archive(args.archive, destination, strip_wrapper=strip_wrapper)
     run.append("source_materialized", kind=target.kind,
                target_sha256=target_sha256(target), archive_sha256=_sha256_file(args.archive))
     print(f"materialized {target.kind} source at {destination}")
