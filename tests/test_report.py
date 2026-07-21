@@ -1388,7 +1388,98 @@ def test_report_symmetric_peer_objections_separate_from_accepted_findings(tmp_pa
     assert "A:OBJ1" in gates  # objection lives in gate provenance
     assert "A:OBJ1" not in result  # never surfaced as an accepted finding
     assert "F1" in result  # the accepted finding is in the result section
-    # A settled-with-flags run is not CLEAN, so no final recommendation is fabricated.
+    # A settled proceed-with-flags run is a COMPLETE result (review-result semantics): Summary is
+    # FLAGGED and the recommendation is still derived from the unresolved blocking objection.
+    assert "**Status:** FLAGGED" in md
+    assert "**Review recommendation:** REQUEST_CHANGES" in md
+
+
+def test_report_symmetric_complete_flagged_renders_recommendation(tmp_path):
+    # A pr-review run settled via gate_proceeded_with_flags is FLAGGED (not CLEAN) yet COMPLETE under
+    # the review-result command semantics (every node done and backed). The report must render Summary
+    # FLAGGED AND the separate, deterministic recommendation derived from the unresolved blocking
+    # objection — never suppress it as a partial result. The rendered recommendation must equal the
+    # projection's review_result output for the same run.
+    from crucible.symmetric import review_result, workflow_kind
+    run = _sym_flags_run(tmp_path)
+    events = run.read_events()
+    cfg = Config.from_dict(json.loads((run.path / "config.json").read_text()))
+    expected = review_result(events, cfg, workflow_kind(events),
+                             DAG.from_dict(run.load_dag()))["recommendation"]
+    assert expected == "REQUEST_CHANGES"
+    md = render_markdown(run)
+    assert "**Status:** FLAGGED" in md
+    assert f"**Review recommendation:** {expected}" in md
+    # A complete result is never labelled partial.
+    assert "_Partial result" not in _section(md, "Review result")
+
+
+def test_report_symmetric_incomplete_missing_final_is_partial_no_recommendation(tmp_path):
+    # A run whose only node is done + backed but whose configured FINAL gate has not been reached is
+    # INCOMPLETE (a missing configured prerequisite): the report shows the partial accepted union with
+    # the explicit "no recommendation until complete" note and derives NO recommendation.
+    run = init_run("symmetric missing final", Config.from_dict({"final_review": True}),
+                   base_dir=tmp_path, workflow="pr-review")
+    dag = DAG.from_dict({"nodes": [{"id": "auth", "title": "Auth", "description": "d",
+                                    "files": ["auth.py"], "test_plan": "pytest",
+                                    "status": "done"}], "edges": []})
+    run.save_dag(dag.to_dict())
+    dsha, nsha = dag_sha256(dag), node_sha256(dag, "auth")
+    plan_art = artifact_sha256(b"plan")
+    run.append("builder_output", gate="plan", round=1, payload="plan", artifact_sha256=plan_art)
+    run.append("symmetric_verdict", gate="plan", round=1, outcome="CONSENSUS", objections=[],
+               peers=_sym_peers("plan", 1, {"artifact_sha256": plan_art, "dag_sha256": dsha}),
+               artifact_sha256=plan_art, dag_sha256=dsha)
+    run.append("gate_consensus", gate="plan", round=1, artifact_sha256=plan_art, dag_sha256=dsha)
+    candidate = _sym_candidate()
+    cand_text = json.dumps(candidate)
+    cand_art = artifact_sha256(cand_text.encode("utf-8"))
+    bindings = {"artifact_sha256": cand_art, "dag_sha256": dsha, "node_sha256": nsha}
+    run.append("builder_output", gate="dep:auth", round=1, payload=cand_text, artifact_sha256=cand_art)
+    run.append("symmetric_verdict", gate="dep:auth", round=1, outcome="CONSENSUS", objections=[],
+               peers=_sym_peers("dep:auth", 1, bindings), candidate=candidate, **bindings)
+    run.append("accepted_finding_set", gate="dep:auth", round=1, payload=candidate, **bindings)
+    run.append("gate_consensus", gate="dep:auth", round=1, **bindings)
+    run.append("node_status_change", node="auth", status="done")
+    md = render_markdown(run)
+    assert "**Status:** IN PROGRESS" in md
+    result = _section(md, "Review result")
+    assert "F1" in result  # the accepted dependency union so far is shown ...
+    assert "_Partial result" in result  # ... explicitly marked partial ...
+    assert "**Review recommendation:**" not in md  # ... with no recommendation until complete
+
+
+def test_report_symmetric_capped_gate_has_no_recommendation(tmp_path):
+    # A capped (halt) dependency gate persists NO accepted set and does not advance its node, so the
+    # run is incomplete: the report shows BLOCKED and derives no recommendation (matching review-result,
+    # which fails such a run closed).
+    run = init_run("symmetric capped", Config.from_dict({"final_review": False}),
+                   base_dir=tmp_path, workflow="pr-review")
+    dag = DAG.from_dict({"nodes": [{"id": "auth", "title": "Auth", "description": "d",
+                                    "files": ["auth.py"], "test_plan": "pytest",
+                                    "status": "in_review"}], "edges": []})
+    run.save_dag(dag.to_dict())
+    dsha, nsha = dag_sha256(dag), node_sha256(dag, "auth")
+    plan_art = artifact_sha256(b"plan")
+    run.append("builder_output", gate="plan", round=1, payload="plan", artifact_sha256=plan_art)
+    run.append("symmetric_verdict", gate="plan", round=1, outcome="CONSENSUS", objections=[],
+               peers=_sym_peers("plan", 1, {"artifact_sha256": plan_art, "dag_sha256": dsha}),
+               artifact_sha256=plan_art, dag_sha256=dsha)
+    run.append("gate_consensus", gate="plan", round=1, artifact_sha256=plan_art, dag_sha256=dsha)
+    candidate = _sym_candidate()
+    cand_text = json.dumps(candidate)
+    cand_art = artifact_sha256(cand_text.encode("utf-8"))
+    bindings = {"artifact_sha256": cand_art, "dag_sha256": dsha, "node_sha256": nsha}
+    objections = [{"id": "A:OBJ1", "severity": "blocker", "location": "candidate:F1",
+                   "claim": "Peer A disputes the finding set.", "suggestion": "Add the missing case."}]
+    run.append("builder_output", gate="dep:auth", round=1, payload=cand_text, artifact_sha256=cand_art)
+    run.append("symmetric_verdict", gate="dep:auth", round=1, outcome="CAPPED",
+               objections=objections, peers=_sym_peers("dep:auth", 1, bindings, objections),
+               candidate=candidate, **bindings)
+    run.append("gate_capped", gate="dep:auth", round=1, open_findings=["A:OBJ1"], **bindings)
+    md = render_markdown(run)
+    assert "**Status:** BLOCKED" in md
+    assert "## Review result" not in md
     assert "**Review recommendation:**" not in md
 
 

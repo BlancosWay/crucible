@@ -264,3 +264,63 @@ def test_report_recommendation_matches_review_result_cli(tmp_path):
     md = render_markdown(run)
     assert "**Status:** CLEAN" in md  # workflow integrity is CLEAN ...
     assert f"**Review recommendation:** {recommendation}" in md  # ... yet recommends REQUEST_CHANGES
+
+
+def test_report_flagged_recommendation_matches_review_result_cli(tmp_path):
+    # A COMPLETE pr-review run settled via gate_proceeded_with_flags (on_cap: proceed_with_flags) is
+    # FLAGGED, not CLEAN — yet it is a complete result under the review-result command semantics (every
+    # node done and backed). The deterministic `review-result` CLI derives REQUEST_CHANGES from the
+    # unresolved blocking objection, and the rendered report must AGREE: Summary FLAGGED with the same
+    # separate recommendation, never suppressed as partial.
+    run = init_run("flagged matches cli",
+                   Config.from_dict({"final_review": False, "on_cap": "proceed_with_flags"}),
+                   base_dir=tmp_path, workflow="pr-review")
+    dag = DAG.from_dict({
+        "nodes": [{"id": "auth", "title": "Auth", "description": "d", "files": ["auth.py"],
+                   "test_plan": "pytest", "status": "done"}],
+        "edges": [],
+    })
+    run.save_dag(dag.to_dict())
+    dsha, nsha = dag_sha256(dag), node_sha256(dag, "auth")
+
+    plan_payload = "investigation plan"
+    plan_art = artifact_sha256(plan_payload.encode("utf-8"))
+    run.append("builder_output", gate="plan", round=1, payload=plan_payload,
+               artifact_sha256=plan_art)
+    run.append("symmetric_verdict", gate="plan", round=1, outcome="CONSENSUS", objections=[],
+               peers=_peers("plan", 1, {"artifact_sha256": plan_art, "dag_sha256": dsha}),
+               artifact_sha256=plan_art, dag_sha256=dsha)
+    run.append("gate_consensus", gate="plan", round=1, artifact_sha256=plan_art, dag_sha256=dsha)
+
+    candidate = {
+        "summary": "accepted findings",
+        "findings": [{
+            "source_gate": "dep:auth", "id": "F1", "severity": "nit",
+            "location": "src/auth.py:42", "claim": "A nit.", "suggestion": "Tidy it.",
+        }],
+    }
+    cand_text = json.dumps(candidate)
+    cand_art = artifact_sha256(cand_text.encode("utf-8"))
+    bindings = {"artifact_sha256": cand_art, "dag_sha256": dsha, "node_sha256": nsha}
+    objections = [{"id": "A:OBJ1", "severity": "blocker", "location": "candidate:F1",
+                   "claim": "Peer A disputes the finding set.",
+                   "suggestion": "Add the missing case."}]
+    run.append("builder_output", gate="dep:auth", round=1, payload=cand_text,
+               artifact_sha256=cand_art)
+    run.append("symmetric_verdict", gate="dep:auth", round=1, outcome="PROCEED_WITH_FLAGS",
+               objections=objections, peers=_peers("dep:auth", 1, bindings, objections),
+               candidate=candidate, **bindings)
+    run.append("accepted_finding_set", gate="dep:auth", round=1, payload=candidate,
+               accepted_with_flags=True, open_objections=["A:OBJ1"], **bindings)
+    run.append("gate_proceeded_with_flags", gate="dep:auth", round=1,
+               open_findings=["A:OBJ1"], **bindings)
+    run.append("node_status_change", node="auth", status="done")
+
+    cli = _run(["review-result", "--run", str(run.path)])
+    assert cli.returncode == 0, cli.stderr
+    recommendation = json.loads(cli.stdout)["recommendation"]
+    assert recommendation == "REQUEST_CHANGES"
+
+    md = render_markdown(run)
+    assert "**Status:** FLAGGED" in md  # proceeded with flags, not CLEAN ...
+    assert f"**Review recommendation:** {recommendation}" in md  # ... yet still recommends REQUEST_CHANGES

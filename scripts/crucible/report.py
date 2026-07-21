@@ -14,6 +14,7 @@ from crucible.symmetric import (
     PEER_SLOT_ROLES,
     SYMMETRIC_WORKFLOWS,
     accepted_findings,
+    require_complete_symmetric_run,
     review_result,
     workflow_kind,
 )
@@ -375,6 +376,39 @@ def _run_summary_lines(
     return lines
 
 
+def _symmetric_run_is_complete(
+    events: list[dict[str, Any]],
+    dag_obj: DAG,
+    issues: list[WorkflowIssue],
+    cfg: Config,
+) -> bool:
+    """Whether a symmetric run is a Finish-time-COMPLETE result, by the SAME engine semantics as the
+    ``review-result`` CLI command — never the ``## Summary`` string status.
+
+    A ``gate_proceeded_with_flags`` run is ``FLAGGED`` (not ``CLEAN``) yet still complete: every node
+    is ``done`` and backed by an accepted set, so a deterministic recommendation exists (derived from
+    the unresolved blocking objections). Completeness therefore mirrors ``cmd_review_result`` exactly:
+    no configured prerequisite is ``missing`` or ``invalid`` (the shared ``workflow_issues`` the caller
+    already computed into ``issues`` — the same owner ``_reject_incomplete_result_history`` consults; the
+    caller also bails on ``invalid`` before calling this) AND :func:`require_complete_symmetric_run`
+    accepts the recorded history against the current tree (``require_final``/``final_enabled`` both mirror
+    ``cfg.final_review``, as in the CLI). A capped/halted or in-progress run leaves a node unbacked or a
+    prerequisite missing, so it is NOT complete (the caller renders partial findings, no recommendation).
+
+    The ``ValueError`` catch is narrow and deliberate: that is exactly how the shared guard signals
+    "incomplete symmetric workflow", the sole reason to treat the run as partial rather than certify a
+    result — never a broad swallow (a well-formed no-invalid run's config/tree already parse).
+    """
+    if any(i.kind in ("invalid", "missing") for i in issues):
+        return False
+    try:
+        require_complete_symmetric_run(
+            events, dag_obj, require_final=cfg.final_review, final_enabled=cfg.final_review)
+    except ValueError:
+        return False
+    return True
+
+
 def _symmetric_result_lines(
     events: list[dict[str, Any]],
     dag: dict[str, Any],
@@ -388,19 +422,25 @@ def _symmetric_result_lines(
 
     Renders the accepted finding set (grouped by ``source_gate``) and — for a COMPLETE, valid
     pr-review run only — the separate, exact ``**Review recommendation:** APPROVE|COMMENT|
-    REQUEST_CHANGES`` line. Deliberately SEPARATE from the workflow ``## Summary`` status: a CLEAN
-    workflow can still recommend REQUEST_CHANGES (the recommendation is derived from the accepted
-    findings, never from workflow integrity). Peer objections are NOT part of this set — they stay in
-    the ``## Gates`` provenance, visually separate from the accepted findings.
+    REQUEST_CHANGES`` line. Deliberately SEPARATE from the workflow ``## Summary`` status: the
+    recommendation is derived from the accepted findings and unresolved blocking objections, never from
+    workflow integrity — so a CLEAN workflow can recommend REQUEST_CHANGES, and a FLAGGED
+    (proceeded-with-flags) workflow is still a COMPLETE result that carries one. Peer objections are NOT
+    part of the accepted set — they stay in the ``## Gates`` provenance, visually separate from the
+    accepted findings.
 
     Fails closed rather than fabricate: a run that is not a certifiable schema-v2 run with a present,
     loadable tree, or whose accepted history records ANY integrity violation (the Summary renders it
-    ``INVALID``), yields NO result section. A recommendation is derived ONLY once the configured
-    workflow is CLEAN (complete and valid); an in-progress/flagged/capped run shows the partial
-    accepted findings so far with no recommendation. The projection helpers (``accepted_findings`` /
-    ``review_result``) own the finding/recommendation logic; this only renders their output. Gating on
-    "no invalid issue" also keeps those helpers off history that would raise (a malformed/forged
-    accepted set is an ``invalid`` issue, so the partial ``accepted_findings`` union here is total).
+    ``INVALID``), yields NO result section. COMPLETENESS is decided by the SAME engine semantics as the
+    ``review-result`` CLI (:func:`_symmetric_run_is_complete`), never the ``## Summary`` string status:
+    a recommendation is derived once every configured prerequisite is present, valid, and bound and
+    :func:`require_complete_symmetric_run` accepts the history — which a ``gate_proceeded_with_flags``
+    run satisfies. A truly incomplete or capped/halted run (a missing prerequisite or an unbacked node)
+    shows the partial accepted findings so far with no recommendation. The projection helpers
+    (``accepted_findings`` / ``review_result``) own the finding/recommendation logic; this only renders
+    their output. Gating on "no invalid issue" also keeps those helpers off history that would raise (a
+    malformed/forged accepted set is an ``invalid`` issue, so the partial ``accepted_findings`` union
+    here is total).
     """
     workflow = workflow_kind(events)
     if workflow not in SYMMETRIC_WORKFLOWS:
@@ -412,19 +452,22 @@ def _symmetric_result_lines(
     if any(i.kind == "invalid" for i in issues):
         return []
 
-    nodes = dag.get("nodes", [])
-    dag_done = bool(nodes) and all(n.get("status") == "done" for n in nodes)
-    consensus, flagged, capped, undecided, _ = _gate_tally(_events_by_gate(events))
-    complete = _overall_status(
-        schema_current, issues, (consensus, flagged, capped, undecided), dag_done).startswith("CLEAN")
+    # A present, loadable schema-v2 tree with no `invalid` issue (bailed above) means both artifacts
+    # parsed inside `_config_aware_issues`, so `Config.from_dict`/`DAG.from_dict` never raise here.
+    cfg = Config.from_dict(config)
+    dag_obj = DAG.from_dict(dag)
+    # Completeness follows the SAME engine semantics as the `review-result` CLI, NOT the `## Summary`
+    # string status: a `gate_proceeded_with_flags` run is FLAGGED yet a complete result whose
+    # recommendation is derived from unresolved blocking objections.
+    complete = _symmetric_run_is_complete(events, dag_obj, issues, cfg)
 
     recommendation: str | None = None
     if complete:
-        # A valid CLEAN run has a complete resolved config (else `_config_aware_issues` would have
-        # returned an `invalid` issue and we would have bailed), so this never raises. `review_result`
-        # promotes the accepted FINAL set when FINAL is configured, else the dependency union.
-        cfg = Config.from_dict(config)
-        result = review_result(events, cfg, workflow)
+        # Pass the current DAG so `review_result` scopes the accepted union AND the unresolved
+        # objections to the configured workflow and FAILS CLOSED on any out-of-scope dependency/FINAL
+        # gate — the same fail-closed projection the CLI result command uses. `review_result` promotes
+        # the accepted FINAL set when FINAL is configured, else the dependency union.
+        result = review_result(events, cfg, workflow, dag_obj)
         finding_dicts = result["findings"]
         recommendation = result.get("recommendation")
     else:
@@ -537,9 +580,12 @@ def render_markdown(run: RunLog) -> str:
 
     # The symmetric (deep-dive/pr-review) review deliverable: accepted findings grouped by source
     # gate and — only for a COMPLETE, valid pr-review run — the separate PR recommendation. Empty for
-    # build runs and for any run the Summary cannot certify, so the workflow status and the review
-    # recommendation stay strictly separate. Rendered before the gate provenance so the peers'
-    # objections (in `## Gates`) remain visually separate from the accepted findings.
+    # build runs and for any run whose recorded history is not a valid schema-v2 result (legacy,
+    # absent/malformed tree, or a recorded integrity violation), so the workflow status and the review
+    # recommendation stay strictly separate. Completeness follows the `review-result` CLI semantics,
+    # not the `## Summary` status, so a FLAGGED proceed-with-flags run still carries its recommendation.
+    # Rendered before the gate provenance so the peers' objections (in `## Gates`) remain visually
+    # separate from the accepted findings.
     lines.extend(_symmetric_result_lines(
         events, dag, config, schema_version=schema_version,
         dag_present=dag_present, dag_load_error=dag_load_error,
