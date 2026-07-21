@@ -13,6 +13,7 @@ from crucible.runlog import RunLog
 from crucible.symmetric import (
     PEER_SLOT_ROLES,
     SYMMETRIC_WORKFLOWS,
+    CorruptWorkflowError,
     accepted_findings,
     require_complete_symmetric_run,
     review_result,
@@ -181,6 +182,15 @@ def _schema_v2_issues(
     schema_current = schema_version is not None and schema_version >= RUN_SCHEMA_VERSION
     if not schema_current:
         return []
+    # Corrupt run metadata fails a schema-v2 run closed regardless of tree state: a present
+    # null/non-string/unrecognized workflow value can only come from tampering. Detected here (via the
+    # single `workflow_kind` read path) BEFORE the tree checks, so it renders INVALID even when no
+    # tree is loaded and it never routes a corrupt run down the config-aware validator.
+    try:
+        workflow_kind(events)
+    except CorruptWorkflowError as exc:
+        return [WorkflowIssue(
+            "invalid", f"the run's recorded workflow metadata is corrupt: {exc}")]
     if dag_load_error:
         return [WorkflowIssue(
             "invalid",
@@ -442,7 +452,10 @@ def _symmetric_result_lines(
     malformed/forged accepted set is an ``invalid`` issue, so the partial ``accepted_findings`` union
     here is total).
     """
-    workflow = workflow_kind(events)
+    try:
+        workflow = workflow_kind(events)
+    except CorruptWorkflowError:
+        return []  # corrupt run metadata: never fabricate a symmetric result (Summary renders INVALID)
     if workflow not in SYMMETRIC_WORKFLOWS:
         return []
     schema_current = schema_version is not None and schema_version >= RUN_SCHEMA_VERSION
@@ -523,7 +536,14 @@ def render_markdown(run: RunLog) -> str:
     config = start.get("config")
     if not isinstance(config, dict):
         config = {}
-    workflow = workflow_kind(events)
+    # Read the workflow through the single validation path. Corrupt run metadata (a present
+    # null/non-string/unrecognized value) must NOT crash the report or render a symmetric header —
+    # degrade the header to the asymmetric Builder/Critic layout; the schema-aware Summary renders the
+    # run INVALID with a clear workflow-metadata issue (see `_schema_v2_issues`).
+    try:
+        workflow = workflow_kind(events)
+    except CorruptWorkflowError:
+        workflow = None
     schema_version = run_schema_version(events)
 
     lines: list[str] = []

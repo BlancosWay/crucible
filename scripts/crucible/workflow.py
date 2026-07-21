@@ -27,11 +27,13 @@ from typing import TYPE_CHECKING, Any
 from crucible.integrity import artifact_sha256, dag_sha256, node_sha256
 from crucible.symmetric import (
     SYMMETRIC_WORKFLOWS,
+    CorruptWorkflowError,
     FindingSet,
     accepted_finding_set_for_gate,
     accepted_findings,
     gate_post_terminal_protocol_indices,
     out_of_scope_protocol_gates,
+    plan_accepted_finding_set_indices,
     resolve_gate_acceptance,
     symmetric_candidate_handoff_issues,
     symmetric_decision_issues,
@@ -287,6 +289,15 @@ def workflow_issues(events: list[dict[str, Any]], dag: DAG, cfg: Config) -> list
     PLAN and FINAL terminals must additionally bind the CURRENT dependency tree (``dag_sha256``). An
     empty list means every configured phase is present, ordered, accepted, and currently bound.
     """
+    # Corrupt run metadata fails the whole run closed with a single clear issue (and never crashes
+    # this pure validator): a present null/non-string/unrecognized workflow can only be tampering, so
+    # there is no trustworthy asymmetric/symmetric routing to validate. Read once through the single
+    # `workflow_kind` path; ``symmetric`` below reuses the result.
+    try:
+        symmetric = workflow_kind(events) in SYMMETRIC_WORKFLOWS
+    except CorruptWorkflowError as exc:
+        return [WorkflowIssue("invalid", f"the run's recorded workflow metadata is corrupt: {exc}")]
+
     issues: list[WorkflowIssue] = []
 
     reproduce_terminal, reproduce_idx = _accepted_terminal_with_index(events, "reproduce")
@@ -308,7 +319,6 @@ def workflow_issues(events: list[dict[str, Any]], dag: DAG, cfg: Config) -> list
             "(configured-forbidden phase)"))
 
     plan_terminal, plan_idx = _accepted_terminal_with_index(events, "plan")
-    symmetric = workflow_kind(events) in SYMMETRIC_WORKFLOWS
     if plan_terminal is None:
         issues.append(WorkflowIssue("missing", "PLAN gate never reached an accepted terminal"))
         # round-8 F2: an accepted PLAN gates DOWNSTREAM TRUST (node completion, approval order, FINAL
@@ -436,6 +446,17 @@ def _symmetric_accepted_set_issues(
     finding_gates = [f"dep:{nid}" for nid in dag.order]
     if cfg.final_review:
         finding_gates.append("final")
+    # F2: a symmetric PLAN gate carries a text artifact + DAG and NEVER an accepted finding set. Any
+    # `accepted_finding_set` on the plan gate — before/between/after its decision & terminal, or
+    # orphaned — is forged/corrupt history. The plan gate is excluded from the trio resolver below (it
+    # is not a finding gate), and a PLAN set placed between the decision and terminal forms an
+    # otherwise-valid-looking trio the PLAN attestation check would accept — so flag every occurrence
+    # here directly, ensuring a forged set can never make the PLAN attestation appear valid.
+    for _idx in plan_accepted_finding_set_indices(events):
+        issues.append(WorkflowIssue(
+            "invalid",
+            "symmetric PLAN gate records an accepted finding set; a PLAN artifact is text + a DAG "
+            "and never carries an accepted finding set (forged/corrupt history)"))
     # round-8 F3: a symmetric PLAN advancing terminal must be backed by a terminal-bound two-peer
     # symmetric_verdict (never a bare terminal, a build-style critic_verdict, or a mismatched verdict)
     # with a consistent decision. PLAN carries a text artifact and no accepted finding set, so it is

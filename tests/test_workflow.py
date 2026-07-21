@@ -827,6 +827,90 @@ def test_workflow_issues_clean_for_valid_symmetric_plan(tmp_path):
     assert workflow_issues(run.read_events(), dag, cfg) == []
 
 
+# --- F2: a symmetric PLAN gate never persists an accepted finding set ----------------------------
+
+def _plan_bindings_w(events):
+    sv = next(e for e in events
+              if e.get("event") == "symmetric_verdict" and e.get("gate") == "plan")
+    return {k: sv[k] for k in ("artifact_sha256", "dag_sha256", "node_sha256") if k in sv}
+
+
+def _inject_plan_accepted_set(events, placement):
+    """Return a copy of a valid symmetric run's events with a forged PLAN accepted_finding_set added at
+    ``placement``: ``"before"`` (before the plan decision), ``"between"`` (between the plan decision
+    and its terminal — an otherwise-valid trio), or ``"after"`` (after the plan terminal)."""
+    events = [dict(e) for e in events]
+    acc = {"event": "accepted_finding_set", "gate": "plan", "round": 1,
+           "payload": {"summary": "", "findings": []}, **_plan_bindings_w(events)}
+    sv_idx = next(i for i, e in enumerate(events)
+                  if e.get("event") == "symmetric_verdict" and e.get("gate") == "plan")
+    term_idx = next(i for i, e in enumerate(events)
+                    if e.get("event") == "gate_consensus" and e.get("gate") == "plan")
+    if placement == "before":
+        events.insert(sv_idx, acc)
+    elif placement == "between":
+        events.insert(term_idx, acc)
+    else:  # after
+        events.insert(term_idx + 1, acc)
+    return events
+
+
+@pytest.mark.parametrize("placement", ["before", "between", "after"])
+def test_workflow_issues_flags_plan_accepted_finding_set(tmp_path, placement):
+    # A symmetric PLAN advances on a two-peer decision and NEVER persists an accepted finding set. Any
+    # PLAN accepted set (any placement) is forged history workflow_issues must flag invalid — and the
+    # forged set must not make the PLAN attestation appear valid.
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid", plan="valid")
+    events = _inject_plan_accepted_set(run.read_events(), placement)
+    issues = workflow_issues(events, dag, cfg)
+    assert any(i.kind == "invalid" and "plan" in i.message.lower()
+               and "accepted finding set" in i.message.lower() for i in issues), \
+        [(i.kind, i.message) for i in issues]
+
+
+def test_workflow_issues_flags_orphan_plan_accepted_finding_set(tmp_path):
+    # A PLAN accepted set with no PLAN terminal at all (orphan) is also forged history — flagged even
+    # though the run's PLAN is otherwise "missing" (in progress).
+    run, dag, cfg = _symmetric_no_plan(tmp_path)
+    run.append("accepted_finding_set", gate="plan", round=1,
+               payload={"summary": "", "findings": []},
+               artifact_sha256="a" * 64, dag_sha256=dag_sha256(dag))
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "invalid" and "plan" in i.message.lower()
+               and "accepted finding set" in i.message.lower() for i in issues)
+
+
+# --- F1: corrupt run workflow metadata fails workflow_issues closed without crashing -------------
+
+@pytest.mark.parametrize("bad", [None, 123, "bogus"])
+def test_workflow_issues_flags_corrupt_workflow_metadata(tmp_path, bad):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    events = run.read_events()
+    for e in events:
+        if e.get("event") == "run_start":
+            e["workflow"] = bad  # present but null/non-string/unrecognized => corrupt
+    issues = workflow_issues(events, dag, cfg)  # must not raise
+    assert issues
+    assert all(i.kind == "invalid" for i in issues)
+    assert any("workflow" in i.message.lower() and "corrupt" in i.message.lower() for i in issues)
+
+
+def test_workflow_issues_absent_workflow_reads_as_build(tmp_path):
+    # Regression guard: an ABSENT workflow key stays build (legacy readability) and is NOT treated as
+    # corrupt — a build run with a clean PLAN + dep stays CLEAN.
+    cfg = Config.from_dict({"final_review": False})
+    run = init_run("g", cfg, base_dir=tmp_path)  # default build workflow
+    dag = _dag(status="done")
+    _bind_plan(run, dag)
+    _bind_dep_a(run, dag)
+    run.append("node_status_change", node="a", status="done")
+    events = [dict(e) for e in run.read_events()]
+    for e in events:
+        if e.get("event") == "run_start":
+            e.pop("workflow", None)  # legacy schema-v2 metadata: the field predates the run
+    assert workflow_issues(events, dag, cfg) == []
+
+
 def test_workflow_issues_build_plan_critic_verdict_unchanged(tmp_path):
     # F3 must not touch the asymmetric build workflow: a build run's PLAN is a critic_verdict +
     # terminal and stays CLEAN (the symmetric attestation rule is symmetric-only).

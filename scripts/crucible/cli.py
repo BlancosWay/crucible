@@ -25,6 +25,7 @@ from crucible.runlog import RunLog, RunLogCorruptError, init_run
 from crucible.symmetric import (
     SYMMETRIC_WORKFLOWS,
     VALID_WORKFLOWS,
+    CorruptWorkflowError,
     FindingSet,
     PeerAttestation,
     accepted_findings,
@@ -58,6 +59,30 @@ def _read_payload(path):
     if not path:
         return None
     return Path(path).read_text(encoding="utf-8")
+
+
+def _require_run_integrity(run: RunLog) -> None:
+    """Shared run-integrity guard for every schema-v2 mutation/certification command.
+
+    Called before any read/mutation/append at the start of a current-schema command, it fails the run
+    closed (``SystemExit`` — a clean message, no traceback) on either integrity fault:
+
+    - a LEGACY run whose ``run_start`` predates the current schema, so its provenance is unverified
+      (:func:`crucible.integrity.require_current_schema`); or
+    - a run whose recorded ``workflow`` metadata is CORRUPT — a present null/non-string/unrecognized
+      value. Reading it through the single :func:`workflow_kind` path raises
+      :class:`CorruptWorkflowError`, which this converts to ``SystemExit`` so a tampered run can never
+      be routed as ``build`` (the asymmetric path) or appended to.
+
+    An ABSENT workflow key stays ``build`` (legacy readability is preserved). Intentional readable /
+    cleanup commands (``report``, ``status``, ``next``, ``clean``, ``critic-lenses``) deliberately do
+    NOT call this, so they keep rendering or removing even a corrupt run.
+    """
+    require_current_schema(run)
+    try:
+        workflow_kind(run.read_events())
+    except CorruptWorkflowError as exc:
+        raise SystemExit(f"crucible: {exc}")
 
 
 def _print_dependency_tree(dag, stream=None) -> None:
@@ -290,7 +315,7 @@ def cmd_init_run(args) -> int:
 
 def cmd_load_dag(args) -> int:
     run = RunLog(args.run)
-    require_current_schema(run)
+    _require_run_integrity(run)
     # Artifact immutability: once the PLAN gate concludes (any terminal outcome), the accepted
     # dependency tree is frozen. Refuse to replace it — even with --force — because a Critic already
     # reviewed and the run bound its decision to this exact tree. A changed plan/DAG needs a fresh
@@ -378,7 +403,7 @@ def cmd_set_status(args) -> int:
     run = RunLog(args.run)
     # set-status is a mutating command: a legacy run's provenance is unverified, so refuse to
     # transition (or forcibly complete) its nodes — start a fresh run instead.
-    require_current_schema(run)
+    _require_run_integrity(run)
     dag = DAG.from_dict(run.load_dag())
     if args.node not in dag.nodes:
         raise ValueError(f"unknown node: {args.node}")
@@ -473,7 +498,7 @@ def cmd_log(args) -> int:
     if args.round < 1:
         raise SystemExit("log --round must be >= 1 (rounds are 1-based)")
     run = RunLog(args.run)
-    require_current_schema(run)
+    _require_run_integrity(run)
     _require_dep_node_in_dag(run, args.gate)
     # Stage/phase prerequisites (Task 3): a Builder artifact may only be logged when the gate is
     # legitimately reachable — REPRODUCE consensus before PLAN when configured; an accepted+bound
@@ -568,7 +593,7 @@ def cmd_verdict(args) -> int:
     run = RunLog(args.run)
     # Schema guard: a legacy run's provenance is unverified, so a verdict must never append to it —
     # checked before any read/mutation so `verdict` can never certify unbindable history.
-    require_current_schema(run)
+    _require_run_integrity(run)
     cfg = load_config(run.path / "config.json")
     # Routing guard: `verdict` records ONE asymmetric Builder/Critic sign-off. A symmetric
     # (deep-dive/pr-review) run requires two separately produced peer attestations, so it must never
@@ -765,7 +790,7 @@ def cmd_symmetric_verdict(args) -> int:
     _validate_gate(args.gate)
     run = RunLog(args.run)
     # Schema guard first: a legacy run's provenance is unverified, so never certify it.
-    require_current_schema(run)
+    _require_run_integrity(run)
     cfg = load_config(run.path / "config.json")
     # Routing guard: symmetric-verdict is only for the two-peer workflows. A build run uses the
     # asymmetric `verdict` command — reject before any read/append.
@@ -965,7 +990,7 @@ def cmd_accepted_findings(args) -> int:
     precedes it).
     """
     run = RunLog(args.run)
-    require_current_schema(run)
+    _require_run_integrity(run)
     events = run.read_events()
     _require_symmetric_result_workflow(events, "accepted-findings")
     dag = _load_result_dag(run)
@@ -988,7 +1013,7 @@ def cmd_review_result(args) -> int:
     the accepted finding set (never from workflow status).
     """
     run = RunLog(args.run)
-    require_current_schema(run)
+    _require_run_integrity(run)
     events = run.read_events()
     cfg = load_config(run.path / "config.json")
     workflow = _require_symmetric_result_workflow(events, "review-result")
@@ -1012,7 +1037,7 @@ def cmd_bindings(args) -> int:
         raise SystemExit("--round must be >= 1 (rounds are 1-based)")
     _validate_gate(args.gate)
     run = RunLog(args.run)
-    require_current_schema(run)
+    _require_run_integrity(run)
     _require_dep_node_in_dag(run, args.gate)
     # Bindings are only meaningful for a legitimately reachable gate (the same stage/phase order the
     # `log`/`verdict` handshake enforces), so validate the stage prerequisites before emitting them.
@@ -1071,7 +1096,7 @@ def cmd_approve_plan(args) -> int:
     approval. Skills call it only after the human explicitly approves.
     """
     run = RunLog(args.run)
-    require_current_schema(run)
+    _require_run_integrity(run)
     cfg = load_config(run.path / "config.json")
     if not cfg.human_approval:
         raise SystemExit(
@@ -1119,7 +1144,7 @@ def cmd_show_plan(args) -> int:
     refused, so the operator can only ever see exactly what was reviewed.
     """
     run = RunLog(args.run)
-    require_current_schema(run)
+    _require_run_integrity(run)
     events = run.read_events()
     terminal = _plan_advance_terminal(events)
     if terminal is None:

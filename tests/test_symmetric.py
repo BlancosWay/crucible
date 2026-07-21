@@ -6,11 +6,13 @@ from crucible.symmetric import (
     SYMMETRIC_WORKFLOWS,
     VALID_WORKFLOWS,
     AcceptedFinding,
+    CorruptWorkflowError,
     FindingSet,
     PeerAttestation,
     SymmetricDecision,
     accepted_findings,
     decide_symmetric,
+    plan_accepted_finding_set_indices,
     review_result,
     symmetric_decision_issues,
     validate_final_finding_set,
@@ -85,11 +87,31 @@ def test_workflow_kind_reads_first_run_start():
     assert workflow_kind(events) == "deep-dive"
 
 
-def test_workflow_kind_defaults_malformed_metadata_to_build():
-    # A non-string or unrecognized value can only arise from tampering (init_run validates the
-    # value it writes); the reader still returns a valid workflow rather than propagate garbage.
-    assert workflow_kind([{"event": "run_start", "workflow": 123}]) == "build"
-    assert workflow_kind([{"event": "run_start", "workflow": "bogus"}]) == "build"
+def test_workflow_kind_defaults_absent_metadata_to_build():
+    # An ABSENT workflow key (legacy schema-v2 metadata, or a run with no run_start at all) reads as
+    # build — legacy readability is preserved.
+    assert workflow_kind([{"event": "run_start"}]) == "build"
+    assert workflow_kind([]) == "build"
+    assert workflow_kind([{"event": "builder_output"}]) == "build"
+
+
+@pytest.mark.parametrize("bad", [None, 123, True, 1.5, "bogus", ["deep-dive"], {"x": 1}, ""])
+def test_workflow_kind_rejects_present_corrupt_workflow(bad):
+    # A PRESENT but null/non-string/unrecognized value can only arise from tampering (init_run
+    # validates the value it writes). The single read path fails closed rather than silently route a
+    # corrupt run as build.
+    with pytest.raises(CorruptWorkflowError):
+        workflow_kind([{"event": "run_start", "workflow": bad}])
+
+
+def test_workflow_kind_corrupt_is_read_from_first_run_start_only():
+    # First run_start wins: a corrupt first run_start fails closed even if a later one is valid.
+    events = [
+        {"event": "run_start", "workflow": "bogus"},
+        {"event": "run_start", "workflow": "pr-review"},
+    ]
+    with pytest.raises(CorruptWorkflowError):
+        workflow_kind(events)
 
 
 # --- accepted finding --------------------------------------------------------
@@ -713,6 +735,38 @@ def test_require_complete_symmetric_run_accepts_in_scope_final_when_enabled():
     )
     # When FINAL is configured, the in-scope FINAL set does not trip the out-of-scope guard.
     require_complete_symmetric_run(events, dag, require_final=True, final_enabled=True)
+
+
+# --- F2: a symmetric PLAN gate never persists an accepted finding set -------------------------
+
+def test_plan_accepted_finding_set_indices_finds_only_plan_sets():
+    # The helper isolates PLAN accepted_finding_set events; a dependency accepted set is not a PLAN
+    # set even though both are accepted_finding_set events.
+    events = (_gate_events("plan", findings=[])
+              + _dep_events("a", findings=[_finding("dep:a", "F1")], bindings=_bindings("a", "d", "na")))
+    idxs = plan_accepted_finding_set_indices(events)
+    assert len(idxs) == 1
+    assert events[idxs[0]]["event"] == "accepted_finding_set"
+    assert events[idxs[0]]["gate"] == "plan"
+    # A clean run with no PLAN accepted set yields nothing.
+    clean = _dep_events("a", findings=[_finding("dep:a", "F1")], bindings=_bindings("a", "d", "na"))
+    assert plan_accepted_finding_set_indices(clean) == []
+
+
+def test_require_complete_symmetric_run_rejects_plan_accepted_finding_set():
+    from crucible.symmetric import require_complete_symmetric_run
+
+    dag = _one_done_dag("a")
+    # A complete run (node 'a' done and backed) plus a forged PLAN accepted finding set forming an
+    # otherwise-valid plan trio (symmetric_verdict -> accepted_finding_set -> gate_consensus). A
+    # symmetric PLAN advances on a two-peer decision and NEVER persists an accepted set, so the
+    # Finish-time completeness guard must independently fail closed on it.
+    events = (
+        _gate_events("plan", findings=[])
+        + _dep_events("a", findings=[_finding("dep:a", "F1")], bindings=_bindings("a", "d", "na"))
+    )
+    with pytest.raises(ValueError, match="incomplete symmetric workflow"):
+        require_complete_symmetric_run(events, dag, require_final=False, final_enabled=False)
 
 
 # --- round-4: shared protocol-wide scope guard over objection-bearing gates -------------------

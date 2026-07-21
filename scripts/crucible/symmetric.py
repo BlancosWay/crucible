@@ -42,6 +42,17 @@ VALID_PEERS = ("A", "B")
 PEER_SLOT_ROLES = {"A": "builder", "B": "critic"}
 
 
+class CorruptWorkflowError(ValueError):
+    """The run's first ``run_start`` records a PRESENT but null/non-string/unrecognized ``workflow``.
+
+    Distinct from an ABSENT ``workflow`` key — legacy schema-v2 metadata that predates the field and
+    reads as ``build``. A *present* invalid value can only come from tampering (``init_run`` writes
+    only a member of :data:`VALID_WORKFLOWS`), so it is corrupt run metadata that must fail closed
+    rather than be silently routed as the asymmetric ``build`` workflow. Subclasses ``ValueError`` so
+    the CLI's top-level handler renders it as a clean ``crucible: ...`` message with no traceback.
+    """
+
+
 def peer_slot_provenance(cfg: Config) -> dict[str, dict[str, str]]:
     """Configured ``model``/``effort`` for each peer slot, read from the run configuration.
 
@@ -60,16 +71,33 @@ def peer_slot_provenance(cfg: Config) -> dict[str, dict[str, str]]:
 def workflow_kind(events: list[dict[str, Any]]) -> str:
     """Return the immutable workflow recorded on the run's first ``run_start`` event.
 
-    Missing metadata means ``build``: an existing schema-v2 run predates the field, so it is the
-    asymmetric Builder/Critic workflow. ``init_run`` validates the value it writes, so a present but
-    non-string/unrecognized value can only arise from tampering; rather than propagate garbage into
-    the symmetric/asymmetric routing, this reader still returns a member of :data:`VALID_WORKFLOWS`
-    (defaulting to ``build``). Mirrors ``integrity.run_schema_version``: the first ``run_start`` wins.
+    This is the single pure read/validation path for the recorded workflow: every caller (the report,
+    the workflow-issue validator, CLI routing, and the run-integrity guard) reads through it, so the
+    ``VALID_WORKFLOWS`` check lives in exactly one place and is never re-spelled per caller.
+
+    An ABSENT ``workflow`` key — including a run with no ``run_start`` at all — means ``build``: such a
+    run predates the field (legacy schema-v2 metadata), so it is the asymmetric Builder/Critic
+    workflow. Legacy readability is preserved.
+
+    A PRESENT but null/non-string/unrecognized value is corrupt: ``init_run`` only ever writes a
+    member of :data:`VALID_WORKFLOWS`, so it can only come from tampering. Rather than silently
+    default corrupt metadata to ``build`` (and route a tampered run as the asymmetric workflow), this
+    raises :class:`CorruptWorkflowError` so the run fails closed. Mirrors
+    ``integrity.run_schema_version``: the first ``run_start`` wins (a later ``run_start`` cannot
+    launder a corrupt first one).
     """
     for event in events:
         if event.get("event") == "run_start":
-            workflow = event.get("workflow")
-            return workflow if workflow in VALID_WORKFLOWS else "build"
+            if "workflow" not in event:
+                return "build"  # legacy schema-v2 metadata: absent key predates the field
+            workflow = event["workflow"]
+            if workflow not in VALID_WORKFLOWS:
+                raise CorruptWorkflowError(
+                    f"run_start records an invalid workflow value {workflow!r}; a recorded workflow "
+                    f"must be one of {VALID_WORKFLOWS} — a present null/non-string/unrecognized value "
+                    f"is corrupt run metadata (an absent workflow key is legacy and reads as 'build')"
+                )
+            return workflow
     return "build"
 
 
@@ -774,6 +802,22 @@ def _gates_with_accepted_sets(events: list[dict[str, Any]]) -> list[str]:
     return gates
 
 
+def plan_accepted_finding_set_indices(events: list[dict[str, Any]]) -> list[int]:
+    """Indices of every ``accepted_finding_set`` event recorded for the PLAN gate — always forbidden.
+
+    A symmetric PLAN artifact is plain text + a dependency tree; the PLAN gate advances on a two-peer
+    ``symmetric_verdict`` and NEVER persists an accepted finding set (only ``dep:<id>`` and ``final``
+    gates do). So ANY ``accepted_finding_set`` on the ``plan`` gate — before its decision, between the
+    decision and the terminal (an otherwise well-formed trio the dependency/FINAL resolver never scans
+    for PLAN), after the terminal, or orphaned with no terminal — is forged/corrupt history. Owned
+    here so both :func:`crucible.workflow.workflow_issues` and :func:`require_complete_symmetric_run`
+    fail closed on it identically, and a forged PLAN accepted set can never make the PLAN attestation
+    look like a valid dependency-style trio. Pure; never raises.
+    """
+    return [i for i, e in enumerate(events)
+            if e.get("event") == "accepted_finding_set" and e.get("gate") == "plan"]
+
+
 def _gates_in_protocol_events(events: list[dict[str, Any]]) -> list[str]:
     """Every distinct gate carrying ANY symmetric protocol event (``symmetric_verdict``,
     ``accepted_finding_set``, or a terminal), in first-appearance order.
@@ -1169,6 +1213,16 @@ def require_complete_symmetric_run(
         raise ValueError(
             f"incomplete symmetric workflow: {len(orphans)} accepted finding set event(s) are "
             f"orphan/pre-terminal/post-terminal and are not accepted state"
+        )
+    # A symmetric PLAN gate never persists an accepted finding set (its artifact is text + a DAG). A
+    # forged PLAN accepted set can form an otherwise-valid trio the dependency resolver never scans
+    # for PLAN, so it evades the orphan/post-terminal checks above — fail closed here independently.
+    plan_sets = plan_accepted_finding_set_indices(events)
+    if plan_sets:
+        raise ValueError(
+            f"incomplete symmetric workflow: the PLAN gate records {len(plan_sets)} accepted finding "
+            f"set event(s); a symmetric PLAN advances on a two-peer decision and never persists an "
+            f"accepted finding set (forged/corrupt history)"
         )
     residue_gates = ["plan", *[f"dep:{nid}" for nid in dag.order]]
     if final_enabled:

@@ -1284,6 +1284,70 @@ def test_report_symmetric_post_terminal_accepted_set_is_invalid(tmp_path):
     assert "CLEAN" not in md
 
 
+# --- F1/F2: corrupt run metadata fails the report closed (INVALID, no result, no crash) -----------
+
+def _rewrite_run_events(run, mutate):
+    """Rewrite a run's append-only log after applying ``mutate`` to the parsed records in place — used
+    to forge corrupt history the CLI never writes (a tampered workflow value, a PLAN accepted set)."""
+    path = run.path / "runlog.jsonl"
+    records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
+               if line.strip()]
+    mutate(records)
+    path.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
+
+
+def test_report_corrupt_workflow_metadata_renders_invalid(tmp_path):
+    # F1: a schema-v2 run whose run_start records a PRESENT but unrecognized workflow value is corrupt.
+    # The report must render INVALID with a clear workflow-metadata issue, render NO symmetric result,
+    # and never crash — not silently default the corrupt value to a build report.
+    run = _symmetric_dep_run(tmp_path, accepted="pre")  # otherwise a CLEAN pr-review run
+
+    def mutate(records):
+        for r in records:
+            if r.get("event") == "run_start":
+                r["workflow"] = "bogus"
+    _rewrite_run_events(run, mutate)
+    md = render_markdown(run)  # must not raise
+    assert "INVALID" in md
+    assert "CLEAN" not in md
+    assert "workflow" in md.lower()
+    assert "## Review result" not in md and "## Investigation result" not in md
+
+
+def test_report_corrupt_null_workflow_metadata_renders_invalid(tmp_path):
+    # A present JSON null workflow is corrupt too (distinct from an ABSENT key, which reads as build).
+    run = _symmetric_dep_run(tmp_path, accepted="pre")
+
+    def mutate(records):
+        for r in records:
+            if r.get("event") == "run_start":
+                r["workflow"] = None
+    _rewrite_run_events(run, mutate)
+    md = render_markdown(run)
+    assert "INVALID" in md and "CLEAN" not in md
+
+
+def test_report_plan_accepted_finding_set_renders_invalid(tmp_path):
+    # F2: a forged PLAN accepted finding set (a symmetric PLAN never carries one) fails the report
+    # closed to INVALID and renders no symmetric result — even though the workflow value is valid.
+    run = _symmetric_dep_run(tmp_path, accepted="pre")
+
+    def mutate(records):
+        sv = next(r for r in records
+                  if r.get("event") == "symmetric_verdict" and r.get("gate") == "plan")
+        bind = {k: sv[k] for k in ("artifact_sha256", "dag_sha256", "node_sha256") if k in sv}
+        term_idx = next(i for i, r in enumerate(records)
+                        if r.get("event") == "gate_consensus" and r.get("gate") == "plan")
+        records.insert(term_idx, {"event": "accepted_finding_set", "gate": "plan",
+                                  "round": sv.get("round", 1),
+                                  "payload": {"summary": "", "findings": []}, **bind})
+    _rewrite_run_events(run, mutate)
+    md = render_markdown(run)
+    assert "INVALID" in md
+    assert "CLEAN" not in md
+    assert "## Review result" not in md
+
+
 # --- Task 4: mode-aware symmetric result rendering ---------------------------
 
 def _section(md, heading):

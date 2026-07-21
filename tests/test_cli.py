@@ -2603,7 +2603,114 @@ def test_result_commands_reject_intervening_protocol_event(tmp_path):
         assert "incomplete" in r.stderr.lower()
 
 
-def test_review_result_rejects_stale_final_dag_binding(tmp_path):
+# --- F1: a corrupt (present null/non-string/unknown) workflow value fails closed ------------------
+
+def _corrupt_workflow(run_dir, value):
+    """Tamper the run_start's recorded ``workflow`` to a PRESENT but invalid value (corrupt run
+    metadata init_run never writes). ``value`` may be None (JSON null), an int, or an unknown string.
+    """
+    def mutate(records):
+        for record in records:
+            if record.get("event") == "run_start":
+                record["workflow"] = value
+    _rewrite_events(run_dir, mutate)
+
+
+def test_load_dag_rejects_corrupt_workflow_metadata(tmp_path):
+    # load-dag is a mutating command: a present unrecognized workflow value is corrupt run metadata,
+    # so it must reject cleanly (no dag_loaded appended) rather than proceed as build.
+    run_dir = _init(tmp_path)
+    _corrupt_workflow(run_dir, "not-a-workflow")
+    dagf = Path(tmp_path) / "dag.json"; dagf.write_text(json.dumps(_two_node_dag()))
+    r = _run(["load-dag", "--run", run_dir, "--file", str(dagf)])
+    assert r.returncode != 0
+    assert "invalid workflow" in r.stderr.lower()
+    assert "dag_loaded" not in [e["event"] for e in _events(run_dir)]
+
+
+def test_verdict_rejects_corrupt_workflow_without_appending(tmp_path):
+    # The build-only `verdict` must NOT route a corrupt run as build and append a critic_verdict. The
+    # Builder artifact + bindings are prepared while the workflow is still valid, so only the corrupt
+    # metadata (a present null value) can be what stops the append.
+    run_dir = _init(tmp_path)
+    _load(run_dir, tmp_path, {"a": "pending"})
+    _log_artifact_and_get_bindings(run_dir, tmp_path, "plan", 1, "plan body")
+    vpath = _write_bound_verdict(tmp_path, run_dir, "plan", 1, "APPROVE", [])
+    _corrupt_workflow(run_dir, None)  # present JSON null => corrupt, not "absent => build"
+    r = _run(["verdict", "--run", run_dir, "--gate", "plan", "--round", "1", "--file", str(vpath)])
+    assert r.returncode != 0
+    assert "invalid workflow" in r.stderr.lower()
+    assert "critic_verdict" not in [e["event"] for e in _events(run_dir)]
+
+
+def test_set_status_rejects_corrupt_workflow(tmp_path):
+    run_dir = _init(tmp_path)
+    _load(run_dir, tmp_path, {"a": "pending"})
+    _settle_plan(run_dir, tmp_path)
+    before = _events(run_dir)
+    _corrupt_workflow(run_dir, 123)  # non-string => corrupt
+    r = _run(["set-status", "--run", run_dir, "--node", "a", "--status", "in_progress"])
+    assert r.returncode != 0
+    assert "invalid workflow" in r.stderr.lower()
+    assert len(_events(run_dir)) == len(before)  # no node_status_change appended
+
+
+def test_symmetric_verdict_rejects_corrupt_workflow(tmp_path):
+    # A tampered symmetric run must reject as CORRUPT, not be silently re-routed as a build run.
+    run_dir = _init_symmetric(tmp_path, "pr-review")
+    _load(run_dir, tmp_path, {"a": "pending"})
+    _log_text(run_dir, tmp_path, "plan", 1, "# plan", "p.md")
+    b = _sym_bindings(run_dir, "plan", 1)
+    _corrupt_workflow(run_dir, "bogus")
+    a = _peer_file(tmp_path, "A", "plan", 1, b)
+    bb = _peer_file(tmp_path, "B", "plan", 1, b)
+    r = _run(["symmetric-verdict", "--run", run_dir, "--gate", "plan", "--round", "1",
+              "--peer-a", a, "--peer-b", bb])
+    assert r.returncode != 0
+    assert "invalid workflow" in r.stderr.lower()  # identified as corrupt, not a "build run"
+    assert not _sym_events(run_dir, "symmetric_verdict")
+
+
+def test_result_commands_reject_corrupt_workflow(tmp_path):
+    run_dir = _complete_one_node_symmetric(tmp_path, "auth",
+                                           findings=[_accepted_finding("dep:auth", "F1", "major")])
+    _corrupt_workflow(run_dir, None)
+    for command in ("accepted-findings", "review-result"):
+        r = _run([command, "--run", run_dir])
+        assert r.returncode != 0, command
+        assert "invalid workflow" in r.stderr.lower(), (command, r.stderr)
+
+
+# --- F2: a symmetric PLAN gate never persists an accepted finding set -----------------------------
+
+def _inject_plan_accepted_set(run_dir):
+    """Forge an otherwise-valid PLAN trio: insert an accepted_finding_set between the PLAN gate's
+    two-peer decision and its consensus terminal (a symmetric PLAN never persists an accepted set)."""
+    def mutate(records):
+        sv = next(r for r in records
+                  if r.get("event") == "symmetric_verdict" and r.get("gate") == "plan")
+        bind = {k: sv[k] for k in ("artifact_sha256", "dag_sha256", "node_sha256") if k in sv}
+        term_idx = next(i for i, r in enumerate(records)
+                        if r.get("event") == "gate_consensus" and r.get("gate") == "plan")
+        records.insert(term_idx, {"event": "accepted_finding_set", "gate": "plan",
+                                  "round": sv.get("round", 1),
+                                  "payload": {"summary": "", "findings": []}, **bind})
+    _rewrite_events(run_dir, mutate)
+
+
+def test_result_commands_reject_plan_accepted_finding_set(tmp_path):
+    # A forged PLAN accepted finding set forms an otherwise-valid trio the dependency resolver does
+    # not own; the Finish-time completeness guard must independently fail both result commands closed.
+    run_dir = _complete_one_node_symmetric(tmp_path, "auth",
+                                           findings=[_accepted_finding("dep:auth", "F1", "major")])
+    _inject_plan_accepted_set(run_dir)
+    for command in ("accepted-findings", "review-result"):
+        r = _run([command, "--run", run_dir])
+        assert r.returncode != 0, command
+        assert "incomplete" in r.stderr.lower(), (command, r.stderr)
+
+
+
     # F2 (FINAL dimension): a complete run WITH FINAL whose tree is mutated after FINAL consensus.
     # The accepted FINAL terminal now binds a stale dag_sha256, so review-result fails closed.
     run_dir = _complete_one_node_symmetric(tmp_path, "auth", final_review=True,
