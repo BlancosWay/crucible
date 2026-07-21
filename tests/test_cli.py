@@ -3346,6 +3346,10 @@ def _github_pr_manifest(head_repository, diff_bytes):
     "https://github.com/owner/repo.git#frag",        # fragment
     "/home/user/secret/repo",                        # absolute filesystem path
     "local:not-a-real-fingerprint",                  # malformed local identity
+    "file://localhost/Users/foo/repo",               # file URL with a host
+    "FILE://localhost/Users/foo/repo",               # file URL, uppercase scheme
+    "file://localhost/Users/te%20st/repo",           # file URL, percent-encoded local path
+    "file:/Users/foo/repo",                          # file: single-slash local reference
 ])
 def test_load_target_rejects_noncanonical_repository(tmp_path, bad_repo):
     run_dir = _init_pr_review(tmp_path)
@@ -3370,6 +3374,23 @@ def test_load_target_rejects_credentialed_nested_head_repository(tmp_path):
     assert r.returncode != 0
     assert "repository" in r.stderr
     assert "target_loaded" not in [e["event"] for e in _events(run_dir)]
+
+
+@pytest.mark.parametrize("bad_head", [
+    "file://localhost/Users/foo/fork",               # file URL with a host
+    "file:///Users/foo/fork",                        # file URL, empty authority
+    "file:/Users/foo/fork",                          # file: single-slash local reference
+])
+def test_load_target_rejects_file_url_nested_head_repository(tmp_path, bad_head):
+    run_dir = _init_pr_review(tmp_path)
+    diff_bytes = b"patch-body"
+    dpath = tmp_path / "h.diff"; dpath.write_bytes(diff_bytes)
+    mpath = _write_manifest(tmp_path, "h.json", _github_pr_manifest(bad_head, diff_bytes))
+    r = _run(["load-target", "--run", run_dir, "--file", str(mpath), "--diff", str(dpath)])
+    assert r.returncode != 0
+    assert "repository" in r.stderr
+    assert "target_loaded" not in [e["event"] for e in _events(run_dir)]
+    assert not (Path(run_dir) / "target.json").exists()
 
 
 def test_load_target_accepts_canonical_local_fingerprint(tmp_path):

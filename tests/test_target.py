@@ -252,6 +252,12 @@ _NONCANONICAL_REPO_IDENTITIES = [
     "https://github.com/owner/repo.git?token=abc",   # query
     "https://github.com/owner/repo.git#frag",        # fragment
     "file:///home/user/repo",                        # file URL (no host)
+    "file://localhost/home/user/repo",               # file URL WITH host (never a remote identity)
+    "FILE://localhost/home/user/repo",               # file URL, uppercase scheme
+    "File://localhost/home/user/repo",               # file URL, mixed-case scheme
+    "file://localhost/home/us%20er/repo",            # file URL, percent-encoded local path
+    "file:/home/user/repo",                          # file: single-slash local reference
+    "file:home/user/repo",                           # file: opaque local reference
     "/home/user/secret/repo",                        # absolute path
     "./repo",                                         # relative path
     "../repo",                                        # parent-relative path
@@ -309,6 +315,54 @@ def test_github_head_repository_accepts_canonical_fork_slug():
     target = ReviewTarget.from_dict(data)
     assert target.head.repository == "another-fork/repo"
     assert target.to_dict()["head"]["repository"] == "another-fork/repo"
+
+
+# A file: URL (or any local/opaque file reference) is never a canonical remote identity: it names a
+# path on the local filesystem, so it must never survive sanitization or persist as a repository
+# identity. urlsplit lowercases the scheme, so case variants collapse to the same rejection.
+_FILE_LOCAL_REFERENCES = [
+    "file://localhost/Users/foo/repo",               # authority form with a host
+    "file:///Users/foo/repo",                        # empty authority (no host)
+    "FILE://localhost/Users/foo/repo",               # uppercase scheme
+    "File://localhost/Users/foo/repo",               # mixed-case scheme
+    "file://localhost/Users/te%20st/repo",           # percent-encoded local path
+    "file://LOCALHOST/Users/foo/repo",               # uppercase host
+    "file:/Users/foo/repo",                          # single-slash local reference
+    "file:Users/foo/repo",                           # opaque local reference
+]
+
+
+@pytest.mark.parametrize("ref", _FILE_LOCAL_REFERENCES)
+def test_sanitize_remote_url_rejects_file_references(ref):
+    from crucible.target import _sanitize_remote_url
+    assert _sanitize_remote_url(ref) is None
+
+
+@pytest.mark.parametrize("ref", _FILE_LOCAL_REFERENCES)
+def test_canonical_identity_rejects_file_references(ref):
+    from crucible.target import _is_canonical_repository_identity
+    assert _is_canonical_repository_identity(ref) is False
+
+
+def test_sanitize_remote_url_allows_only_network_schemes_with_host_and_path():
+    from crucible.target import _sanitize_remote_url
+    # Supported network schemes with a non-empty host and a safe path round-trip unchanged.
+    for good in ["https://github.com/owner/repo.git", "ssh://github.com/owner/repo",
+                 "git://github.com/owner/repo.git", "https://github.com:443/owner/repo"]:
+        assert _sanitize_remote_url(good) == good
+    # scp-like remotes still sanitize to host/path (credentials dropped).
+    assert _sanitize_remote_url("git@github.com:owner/repo.git") == "github.com/owner/repo.git"
+
+
+def test_sanitize_remote_url_requires_host_and_safe_path():
+    from crucible.target import _sanitize_remote_url
+    assert _sanitize_remote_url("https://") is None                     # no host
+    assert _sanitize_remote_url("https://github.com") is None           # no path
+    assert _sanitize_remote_url("https://github.com/") is None          # empty path
+    assert _sanitize_remote_url("https://github.com/../secret") is None  # traversal in path
+    # Only known network schemes pass; unknown or local schemes are rejected even with host+path.
+    assert _sanitize_remote_url("unknownscheme://example.com/o/r") is None
+    assert _sanitize_remote_url("file://example.com/o/r") is None
 
 
 # --------------------------------------------------------------------------------------
@@ -549,6 +603,42 @@ def test_local_normalization_identity_matches_repository_identity(tmp_path):
     target, _ = normalize_local_target(repo, "main..feature", {"title": "t", "body": "b"})
     assert target.repository == normalized_repository_identity(repo)
     assert "pw" not in target.repository
+
+
+# A file:// remote (or a bare filesystem path) names a local checkout, not a network identity. Its
+# path must NEVER persist as the repository identity: normalization must fall back to the
+# credential-free local fingerprint local:<sha256(real repo path)>.
+@pytest.mark.parametrize("remote", [
+    "file://localhost/Users/foo/checkout",           # file URL with a host
+    "file:///Users/foo/checkout",                    # file URL, empty authority
+    "FILE://localhost/Users/foo/checkout",           # file URL, uppercase scheme
+    "File://localhost/Users/foo/checkout",           # file URL, mixed-case scheme
+    "file://localhost/Users/te%20st/checkout",       # file URL, percent-encoded local path
+    "file:/Users/foo/checkout",                      # file: single-slash local reference
+    "/Users/foo/checkout",                           # absolute filesystem path
+    "../sibling/checkout",                           # relative filesystem path
+    "./checkout",                                     # relative filesystem path
+])
+def test_repository_identity_never_persists_local_paths(tmp_path, remote):
+    repo = _init_repo(tmp_path / "repo")
+    _git(repo, "remote", "add", "origin", remote)
+    real = os.path.realpath(str(repo))
+    expected = "local:" + hashlib.sha256(real.encode("utf-8")).hexdigest()
+    identity = normalized_repository_identity(repo)
+    # Falls back to the local fingerprint — never the remote path text or the file scheme.
+    assert identity == expected, (remote, identity)
+    assert "file" not in identity.lower()
+    assert "checkout" not in identity and "Users" not in identity
+    assert real not in identity and str(repo) not in identity
+
+
+def test_local_normalization_with_file_remote_uses_local_fingerprint(tmp_path):
+    repo = init_diverged_repo(tmp_path)
+    _git(repo, "remote", "add", "origin", "file://localhost/Users/foo/checkout")
+    target, _ = normalize_local_target(repo, "main..feature", {"title": "t", "body": "b"})
+    real = os.path.realpath(str(repo))
+    assert target.repository == "local:" + hashlib.sha256(real.encode("utf-8")).hexdigest()
+    assert "file" not in target.repository.lower() and "checkout" not in target.repository
 
 
 # --------------------------------------------------------------------------------------

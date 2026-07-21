@@ -56,6 +56,13 @@ LOCAL_IDENTITY_RE = re.compile(r"^local:[0-9a-f]{64}$")
 _SLUG_SEGMENT_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 _CONTROL_OR_SPACE_RE = re.compile(r"[\x00-\x20\x7f]")
 
+# Git's network transport URL schemes (see ``_sanitize_remote_url``). ``file`` — and any unknown
+# scheme — is deliberately excluded: a ``file:`` URL, or a bare/relative filesystem path, names a
+# local checkout rather than a network identity, so it must fall back to the credential-free
+# ``local:<sha256(real path)>`` fingerprint instead of persisting a local path as the repository
+# identity.
+_NETWORK_URL_SCHEMES = frozenset({"http", "https", "ssh", "git", "ftp", "ftps"})
+
 
 # The common fields every target kind carries, plus the kind-specific field set. A target manifest
 # must contain EXACTLY ``_COMMON_FIELDS | _VARIANT_FIELDS[kind]`` — no missing and no extra keys.
@@ -461,35 +468,54 @@ def _git(repo: Path, *args: str) -> str:
     ).stdout
 
 
+def _is_safe_remote_path(path: str) -> bool:
+    """Whether a URL ``path`` is the safe ``/owner/repo[.git]`` shape the network normalizers emit:
+    absolute, non-empty beyond the leading slash, with no empty/``.``/``..`` segment and no ASCII
+    control or whitespace character."""
+    if not path.startswith("/") or _CONTROL_OR_SPACE_RE.search(path):
+        return False
+    return all(segment not in ("", ".", "..") for segment in path[1:].split("/"))
+
+
 def _sanitize_remote_url(url: str) -> str | None:
     """A public host/path identity with userinfo, query, and fragment removed, or ``None`` when no
-    safe identity can be derived. Credentials are never persisted."""
+    safe network identity can be derived. Credentials are never persisted, and a local reference —
+    a ``file:`` URL (any case, with or without an authority, including percent-encoded local paths)
+    or a bare/relative filesystem path — is never accepted: it has no credential-free network
+    identity, so callers fall back to the ``local:<hash>`` fingerprint."""
     url = url.strip()
     if not url:
         return None
-    if "://" not in url:
-        # scp-like syntax: [user@]host:path
-        m = re.match(r"^(?:[^@/]+@)?([^/:]+):(.+)$", url)
-        if m:
-            host, path = m.group(1), m.group(2)
-            return f"{host}/{path.lstrip('/')}"
-        return None
-    parts = urlsplit(url)
-    if not parts.scheme or not parts.hostname:
-        return None
-    host = parts.hostname
-    if parts.port:
-        host = f"{host}:{parts.port}"
-    # netloc rebuilt from hostname/port only -> any user:pass@ userinfo is dropped.
-    return urlunsplit((parts.scheme, host, parts.path, "", ""))
+    if "://" in url:
+        parts = urlsplit(url)
+        # Only known network schemes with a non-empty host and a safe path yield a remote identity.
+        if parts.scheme.lower() not in _NETWORK_URL_SCHEMES:
+            return None
+        if not parts.hostname or not _is_safe_remote_path(parts.path):
+            return None
+        host = parts.hostname
+        if parts.port:
+            host = f"{host}:{parts.port}"
+        # netloc rebuilt from hostname/port only -> any user:pass@ userinfo is dropped.
+        return urlunsplit((parts.scheme, host, parts.path, "", ""))
+    # scp-like syntax: [user@]host:path -- but never a ``file:path`` local reference.
+    m = re.match(r"^(?:[^@/]+@)?([^/:]+):(.+)$", url)
+    if m:
+        host, path = m.group(1), m.group(2)
+        if host.lower() == "file":
+            return None
+        return f"{host}/{path.lstrip('/')}"
+    return None
 
 
 def normalized_repository_identity(repo: str | Path) -> str:
     """A stable, credential-free identity for a local repository.
 
-    Prefers the sanitized ``origin`` remote URL (userinfo/query/fragment stripped). When no remote
-    exists, falls back to ``local:<sha256(real repository path)>`` — a fingerprint that never exposes
-    the local filesystem path.
+    Prefers the sanitized ``origin`` remote URL (userinfo/query/fragment stripped) when it is a
+    supported network scheme with a non-empty host and safe path. When there is no remote, or the
+    remote is a local reference (a ``file:`` URL or a bare/relative filesystem path), falls back to
+    ``local:<sha256(real repository path)>`` — a fingerprint that never exposes the local filesystem
+    path or a local remote's path text.
     """
     repo = Path(repo)
     try:
