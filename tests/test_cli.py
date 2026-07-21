@@ -1,8 +1,11 @@
 import json
+import hashlib
 import os
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -649,7 +652,8 @@ def test_load_dag_cycle_is_clean(tmp_path):
 def test_next_missing_dag_is_clean(tmp_path):
     run_dir = _init(tmp_path)  # no dag loaded
     r = _run(["next", "--run", run_dir])
-    _assert_clean_error(r)
+    _assert_clean_error(r, "no dependency tree loaded")
+    assert r.stdout.strip() == ""  # never empty-success (which means every node is done)
 
 
 def test_set_status_unknown_node_is_clean(tmp_path):
@@ -2034,10 +2038,28 @@ def test_approve_plan_rejects_legacy_run(tmp_path):
 
 # --- symmetric-verdict: two-peer atomic gate decisions -----------------------
 
+def _load_diff_target(run_dir, tmp_path, *, diff=b"", name="guardtgt"):
+    """Load a minimal revision-unbound diff-file target so a pr-review run satisfies the Task 1
+    loaded-target guard. Kept tiny: the guard only requires a valid loaded target, not a kind."""
+    dpath = Path(tmp_path) / f"{name}.diff"
+    dpath.write_bytes(diff)
+    manifest = {"version": 1, "kind": "diff-file", "revision_bound": False, "repository": None,
+                "diff_sha256": hashlib.sha256(diff).hexdigest(),
+                "changed_files": [], "intent": {"title": "t", "body": "b"}}
+    mpath = Path(tmp_path) / f"{name}.json"
+    mpath.write_text(json.dumps(manifest))
+    r = _run(["load-target", "--run", run_dir, "--file", str(mpath), "--diff", str(dpath)])
+    assert r.returncode == 0, r.stderr
+    return r
+
+
 def _init_symmetric(tmp_path, workflow="pr-review"):
     r = _run(["init-run", "--goal", "g", "--base-dir", str(tmp_path), "--workflow", workflow])
     assert r.returncode == 0, r.stderr
-    return r.stdout.strip()
+    run_dir = r.stdout.strip()
+    if workflow == "pr-review":
+        _load_diff_target(run_dir, tmp_path)
+    return run_dir
 
 
 def _sym_bindings(run_dir, gate, round_index):
@@ -2329,6 +2351,7 @@ def test_symmetric_verdict_caps_when_halt_configured(tmp_path):
               "--workflow", "pr-review", "--config", str(cfg)])
     assert r.returncode == 0, r.stderr
     run_dir = r.stdout.strip()
+    _load_diff_target(run_dir, tmp_path)
     _load(run_dir, tmp_path, {"auth": "pending"})
     _settle_symmetric_plan(run_dir, tmp_path)
     _start(run_dir, "auth")
@@ -2349,6 +2372,7 @@ def test_symmetric_verdict_proceeds_with_flags_persists_accepted_with_flags(tmp_
               "--workflow", "pr-review", "--config", str(cfg)])
     assert r.returncode == 0, r.stderr
     run_dir = r.stdout.strip()
+    _load_diff_target(run_dir, tmp_path)
     _load(run_dir, tmp_path, {"auth": "pending"})
     _settle_symmetric_plan(run_dir, tmp_path)
     _start(run_dir, "auth")
@@ -2402,7 +2426,10 @@ def _init_symmetric_cfg(tmp_path, config, workflow="pr-review"):
     r = _run(["init-run", "--goal", "g", "--base-dir", str(tmp_path),
               "--workflow", workflow, "--config", str(cfg)])
     assert r.returncode == 0, r.stderr
-    return r.stdout.strip()
+    run_dir = r.stdout.strip()
+    if workflow == "pr-review":
+        _load_diff_target(run_dir, tmp_path)
+    return run_dir
 
 
 def _complete_symmetric_node(run_dir, tmp_path, node, *, findings=None):
@@ -3104,3 +3131,360 @@ def test_result_commands_reject_out_of_scope_final_objection_when_disabled(tmp_p
         for command in ("accepted-findings", "review-result"):
             r = _run([command, "--run", run_dir])
             assert r.returncode != 0, (terminal, command)
+
+
+# =====================================================================================
+# Task 1: pr-review target commands, loaded-target guard, and pre-DAG status/next/report
+# =====================================================================================
+
+def _git_t(repo, *args):
+    return subprocess.run(["git", "-C", str(repo), *args], check=True, text=True,
+                          capture_output=True).stdout
+
+
+def _diverged_repo(tmp_path, name="repo"):
+    repo = Path(tmp_path) / name
+    repo.mkdir(parents=True, exist_ok=True)
+    _git_t(repo, "init", "-q", "-b", "main")
+    _git_t(repo, "config", "user.email", "t@example.com")
+    _git_t(repo, "config", "user.name", "Tester")
+    _git_t(repo, "config", "commit.gpgsign", "false")
+    (repo / "app.py").write_text("base\n")
+    _git_t(repo, "add", "app.py"); _git_t(repo, "commit", "-q", "-m", "base")
+    _git_t(repo, "checkout", "-q", "-b", "feature")
+    (repo / "app.py").write_text("feature\n")
+    _git_t(repo, "add", "app.py"); _git_t(repo, "commit", "-q", "-m", "feature")
+    _git_t(repo, "checkout", "-q", "main")
+    (repo / "main-only.py").write_text("m\n")
+    _git_t(repo, "add", "main-only.py"); _git_t(repo, "commit", "-q", "-m", "main-only")
+    return repo
+
+
+def _init_pr_review(tmp_path):
+    """A pr-review run with NO target loaded (for guard / load-target tests)."""
+    r = _run(["init-run", "--goal", "g", "--base-dir", str(tmp_path), "--workflow", "pr-review"])
+    assert r.returncode == 0, r.stderr
+    return r.stdout.strip()
+
+
+def _intent_file(tmp_path, title="t", body="b", name="intent.json"):
+    p = Path(tmp_path) / name
+    p.write_text(json.dumps({"title": title, "body": body}))
+    return str(p)
+
+
+# --- normalize-target (no run mutation) --------------------------------------
+
+def test_normalize_target_diff_writes_canonical_without_run(tmp_path):
+    diff = (tmp_path / "in.diff")
+    diff.write_bytes(b"diff --git a/src/a.py b/src/a.py\n--- a/src/a.py\n+++ b/src/a.py\n"
+                     b"@@ -1 +1 @@\n-o\n+n\n")
+    out = tmp_path / "target.json"; dout = tmp_path / "target.out.diff"
+    r = _run(["normalize-target", "diff", "--diff", str(diff), "--intent", _intent_file(tmp_path),
+              "--output", str(out), "--diff-output", str(dout)])
+    assert r.returncode == 0, r.stderr
+    manifest = json.loads(out.read_text())
+    assert manifest["kind"] == "diff-file"
+    assert manifest["revision_bound"] is False
+    assert manifest["changed_files"] == ["src/a.py"]
+    assert dout.read_bytes() == diff.read_bytes()
+    # sorted-key canonical layout
+    assert out.read_text() == json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+
+
+def test_normalize_target_local_uses_merge_base(tmp_path):
+    repo = _diverged_repo(tmp_path)
+    out = tmp_path / "t.json"; dout = tmp_path / "t.diff"
+    r = _run(["normalize-target", "local", "--repo", str(repo), "--range", "main..feature",
+              "--intent", _intent_file(tmp_path), "--output", str(out), "--diff-output", str(dout)])
+    assert r.returncode == 0, r.stderr
+    manifest = json.loads(out.read_text())
+    assert manifest["kind"] == "local-range"
+    assert manifest["changed_files"] == ["app.py"]
+    assert "main-only.py" not in dout.read_text()
+
+
+def test_normalize_target_github_rejects_metadata_drift(tmp_path):
+    before = {"number": 7, "url": "https://github.com/base/repo/pull/7", "title": "t", "body": "b",
+              "files": [{"path": "src/a.py"}], "baseRefName": "main", "baseRefOid": "1" * 40,
+              "headRefName": "feature", "headRefOid": "2" * 40,
+              "headRepository": {"nameWithOwner": "fork/repo"},
+              "headRepositoryOwner": {"login": "fork"}, "isCrossRepository": True}
+    after = dict(before, headRefOid="9" * 40)  # head advanced mid-acquisition
+    bpath = tmp_path / "before.json"; bpath.write_text(json.dumps(before))
+    apath = tmp_path / "after.json"; apath.write_text(json.dumps(after))
+    diff = tmp_path / "pr.diff"; diff.write_bytes(b"patch")
+    r = _run(["normalize-target", "github", "--metadata-before", str(bpath),
+              "--metadata-after", str(apath), "--diff", str(diff),
+              "--output", str(tmp_path / "o.json"), "--diff-output", str(tmp_path / "o.diff")])
+    assert r.returncode != 0
+    assert "changed during normalization" in r.stderr
+    assert not (tmp_path / "o.json").exists()  # no output written on rejection
+
+
+# --- repository-identity -----------------------------------------------------
+
+def test_repository_identity_matches_local_normalization(tmp_path):
+    repo = _diverged_repo(tmp_path)
+    _git_t(repo, "remote", "add", "origin", "https://user:pw@example.com/o/r.git")
+    ident = _run(["repository-identity", "--repo", str(repo)])
+    assert ident.returncode == 0, ident.stderr
+    identity = ident.stdout.strip()
+    assert "pw" not in identity and str(repo) not in identity
+    out = tmp_path / "t.json"; dout = tmp_path / "t.diff"
+    _run(["normalize-target", "local", "--repo", str(repo), "--range", "main..feature",
+          "--intent", _intent_file(tmp_path), "--output", str(out), "--diff-output", str(dout)])
+    assert json.loads(out.read_text())["repository"] == identity
+
+
+# --- load-target -------------------------------------------------------------
+
+def _normalize_diff(tmp_path, diff=b"patch-body", name="t"):
+    d = tmp_path / f"{name}.in.diff"; d.write_bytes(diff)
+    out = tmp_path / f"{name}.json"; dout = tmp_path / f"{name}.diff"
+    r = _run(["normalize-target", "diff", "--diff", str(d), "--intent", _intent_file(tmp_path),
+              "--output", str(out), "--diff-output", str(dout)])
+    assert r.returncode == 0, r.stderr
+    return out, dout
+
+
+def test_load_target_pr_review_only(tmp_path):
+    out, dout = _normalize_diff(tmp_path)
+    for workflow in ("build", "deep-dive"):
+        r = _run(["init-run", "--goal", "g", "--base-dir", str(tmp_path / workflow),
+                  "--workflow", workflow])
+        run_dir = r.stdout.strip()
+        rr = _run(["load-target", "--run", run_dir, "--file", str(out), "--diff", str(dout)])
+        assert rr.returncode != 0
+        assert "pr-review" in rr.stderr
+        assert "target_loaded" not in [e["event"] for e in _events(run_dir)]
+
+
+def test_load_target_verifies_exact_diff_bytes(tmp_path):
+    run_dir = _init_pr_review(tmp_path)
+    out, dout = _normalize_diff(tmp_path, diff=b"correct")
+    wrong = tmp_path / "wrong.diff"; wrong.write_bytes(b"tampered")
+    r = _run(["load-target", "--run", run_dir, "--file", str(out), "--diff", str(wrong)])
+    assert r.returncode != 0
+    assert "diff_sha256" in r.stderr or "do not match" in r.stderr
+    assert "target_loaded" not in [e["event"] for e in _events(run_dir)]
+
+
+def test_load_target_appends_one_event_and_writes_canonical_files(tmp_path):
+    run_dir = _init_pr_review(tmp_path)
+    out, dout = _normalize_diff(tmp_path, diff=b"exact-bytes")
+    r = _run(["load-target", "--run", run_dir, "--file", str(out), "--diff", str(dout)])
+    assert r.returncode == 0, r.stderr
+    loaded = [e for e in _events(run_dir) if e["event"] == "target_loaded"]
+    assert len(loaded) == 1
+    assert loaded[0]["target"]["kind"] == "diff-file"
+    assert len(loaded[0]["target_sha256"]) == 64
+    # authoritative canonical scratch copies
+    manifest = json.loads((Path(run_dir) / "target.json").read_text())
+    assert manifest == loaded[0]["target"]
+    assert (Path(run_dir) / "target.diff").read_bytes() == b"exact-bytes"
+
+
+def test_load_target_duplicate_rejects_without_second_append(tmp_path):
+    run_dir = _init_pr_review(tmp_path)
+    out, dout = _normalize_diff(tmp_path)
+    assert _run(["load-target", "--run", run_dir, "--file", str(out), "--diff", str(dout)]).returncode == 0
+    r = _run(["load-target", "--run", run_dir, "--file", str(out), "--diff", str(dout)])
+    assert r.returncode != 0
+    assert "already loaded" in r.stderr
+    assert len([e for e in _events(run_dir) if e["event"] == "target_loaded"]) == 1
+
+
+def test_load_target_late_rejects(tmp_path):
+    run_dir = _init_pr_review(tmp_path)
+    # Simulate DAG work having started without a target (an INVALID run).
+    with (Path(run_dir) / "runlog.jsonl").open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"ts": "x", "event": "dag_loaded", "gate": "plan"}) + "\n")
+    out, dout = _normalize_diff(tmp_path)
+    r = _run(["load-target", "--run", run_dir, "--file", str(out), "--diff", str(dout)])
+    assert r.returncode != 0
+    assert "before load-dag" in r.stderr
+    assert "target_loaded" not in [e["event"] for e in _events(run_dir)]
+
+
+# --- show-target -------------------------------------------------------------
+
+def test_show_target_emits_authoritative_event_not_scratch_file(tmp_path):
+    run_dir = _init_pr_review(tmp_path)
+    out, dout = _normalize_diff(tmp_path)
+    _run(["load-target", "--run", run_dir, "--file", str(out), "--diff", str(dout)])
+    loaded = [e for e in _events(run_dir) if e["event"] == "target_loaded"][0]
+    # Tamper the scratch file; show-target must ignore it and emit the run-log event's manifest.
+    (Path(run_dir) / "target.json").write_text('{"tampered": true}')
+    r = _run(["show-target", "--run", run_dir])
+    assert r.returncode == 0, r.stderr
+    assert json.loads(r.stdout) == loaded["target"]
+
+
+def test_show_target_without_target_rejects(tmp_path):
+    run_dir = _init_pr_review(tmp_path)
+    r = _run(["show-target", "--run", run_dir])
+    assert r.returncode != 0
+    assert "no target" in r.stderr.lower()
+
+
+# --- materialize-target ------------------------------------------------------
+
+def _load_local_target(run_dir, tmp_path, repo):
+    out = tmp_path / "lt.json"; dout = tmp_path / "lt.diff"
+    assert _run(["normalize-target", "local", "--repo", str(repo), "--range", "main..feature",
+                 "--intent", _intent_file(tmp_path), "--output", str(out),
+                 "--diff-output", str(dout)]).returncode == 0
+    assert _run(["load-target", "--run", run_dir, "--file", str(out),
+                 "--diff", str(dout)]).returncode == 0
+
+
+def _head_archive(tmp_path, repo, name="src.tar"):
+    head = _git_t(repo, "rev-parse", "feature").strip()
+    archive = tmp_path / name
+    _git_t(repo, "archive", "--format=tar", "--output", str(archive), head)
+    return archive
+
+
+def test_materialize_target_happy_path_records_event(tmp_path):
+    run_dir = _init_pr_review(tmp_path)
+    repo = _diverged_repo(tmp_path)
+    _load_local_target(run_dir, tmp_path, repo)
+    archive = _head_archive(tmp_path, repo)
+    r = _run(["materialize-target", "--run", run_dir, "--archive", str(archive)])
+    assert r.returncode == 0, r.stderr
+    assert (Path(run_dir) / "source" / "app.py").read_text() == "feature\n"
+    events = [e for e in _events(run_dir) if e["event"] == "source_materialized"]
+    assert len(events) == 1
+    assert events[0]["kind"] == "local-range"
+    assert len(events[0]["target_sha256"]) == 64
+    assert len(events[0]["archive_sha256"]) == 64
+
+
+def test_materialize_target_rejects_diff_file(tmp_path):
+    run_dir = _init_pr_review(tmp_path)
+    out, dout = _normalize_diff(tmp_path)
+    _run(["load-target", "--run", run_dir, "--file", str(out), "--diff", str(dout)])
+    archive = tmp_path / "any.tar"
+    with __import__("tarfile").open(archive, "w") as tar:
+        info = __import__("tarfile").TarInfo("top/a.py"); info.size = 1
+        tar.addfile(info, __import__("io").BytesIO(b"x"))
+    r = _run(["materialize-target", "--run", run_dir, "--archive", str(archive)])
+    assert r.returncode != 0
+    assert "revision-unbound" in r.stderr or "diff-file" in r.stderr
+    assert not (Path(run_dir) / "source").exists()
+    assert "source_materialized" not in [e["event"] for e in _events(run_dir)]
+
+
+def test_materialize_target_rejects_second_materialization(tmp_path):
+    run_dir = _init_pr_review(tmp_path)
+    repo = _diverged_repo(tmp_path)
+    _load_local_target(run_dir, tmp_path, repo)
+    archive = _head_archive(tmp_path, repo)
+    assert _run(["materialize-target", "--run", run_dir, "--archive", str(archive)]).returncode == 0
+    r = _run(["materialize-target", "--run", run_dir, "--archive", str(archive)])
+    assert r.returncode != 0
+    assert len([e for e in _events(run_dir) if e["event"] == "source_materialized"]) == 1
+
+
+def test_materialize_target_rejects_after_dag_loaded(tmp_path):
+    run_dir = _init_pr_review(tmp_path)
+    repo = _diverged_repo(tmp_path)
+    _load_local_target(run_dir, tmp_path, repo)
+    # A DAG has been loaded -> materialization is no longer 'immediately after target_loaded'.
+    _load(run_dir, tmp_path, {"a": "pending"})
+    archive = _head_archive(tmp_path, repo)
+    r = _run(["materialize-target", "--run", run_dir, "--archive", str(archive)])
+    assert r.returncode != 0
+    assert "downstream" in r.stderr or "immediately after" in r.stderr
+    assert not (Path(run_dir) / "source").exists()
+    assert "source_materialized" not in [e["event"] for e in _events(run_dir)]
+
+
+def test_materialize_target_without_target_rejects(tmp_path):
+    run_dir = _init_pr_review(tmp_path)
+    repo = _diverged_repo(tmp_path)
+    archive = _head_archive(tmp_path, repo)
+    r = _run(["materialize-target", "--run", run_dir, "--archive", str(archive)])
+    assert r.returncode != 0
+    assert "no target" in r.stderr.lower()
+    assert not (Path(run_dir) / "source").exists()
+
+
+# --- loaded-target guard (every guarded pr-review command rejects before append) ---
+
+GUARDED_COMMANDS = [
+    ("load-dag", lambda run_dir, tmp_path: ["load-dag", "--run", run_dir, "--file",
+                                            _write_dag_file(tmp_path)]),
+    ("log", lambda run_dir, tmp_path: ["log", "--run", run_dir, "--event", "builder_output",
+                                       "--gate", "plan", "--round", "1", "--file",
+                                       _write_text_file(tmp_path, "a.md", "x")]),
+    ("set-status", lambda run_dir, tmp_path: ["set-status", "--run", run_dir, "--node", "a",
+                                              "--status", "in_progress"]),
+    ("bindings", lambda run_dir, tmp_path: ["bindings", "--run", run_dir, "--gate", "plan",
+                                            "--round", "1"]),
+    ("symmetric-verdict", lambda run_dir, tmp_path: [
+        "symmetric-verdict", "--run", run_dir, "--gate", "plan", "--round", "1",
+        "--peer-a", _write_text_file(tmp_path, "pa.json", "{}"),
+        "--peer-b", _write_text_file(tmp_path, "pb.json", "{}")]),
+    ("accepted-findings", lambda run_dir, tmp_path: ["accepted-findings", "--run", run_dir]),
+    ("review-result", lambda run_dir, tmp_path: ["review-result", "--run", run_dir]),
+    ("approve-plan", lambda run_dir, tmp_path: ["approve-plan", "--run", run_dir]),
+    ("show-plan", lambda run_dir, tmp_path: ["show-plan", "--run", run_dir]),
+]
+
+
+def _write_dag_file(tmp_path):
+    p = Path(tmp_path) / "guard-dag.json"
+    p.write_text(json.dumps({"nodes": [{"id": "a", "title": "A", "description": "", "files": [],
+                 "test_plan": "", "status": "pending"}], "edges": []}))
+    return str(p)
+
+
+def _write_text_file(tmp_path, name, text):
+    p = Path(tmp_path) / name
+    p.write_text(text)
+    return str(p)
+
+
+@pytest.mark.parametrize("command,argv_fn", GUARDED_COMMANDS, ids=[c for c, _ in GUARDED_COMMANDS])
+def test_pr_review_command_rejects_missing_target(command, argv_fn, tmp_path):
+    run_dir = _init_pr_review(tmp_path)  # pr-review, NO target
+    before = _events(run_dir)
+    r = _run(argv_fn(run_dir, tmp_path))
+    assert r.returncode != 0, (command, r.stdout)
+    assert "target is missing" in r.stderr, (command, r.stderr)
+    # rejected before any append
+    assert _events(run_dir) == before, command
+
+
+def test_build_commands_do_not_require_target(tmp_path):
+    # A build run never needs a target: the guard is a no-op for build.
+    run_dir = _init(tmp_path)
+    r = _run(["load-dag", "--run", run_dir, "--file", _write_dag_file(tmp_path)])
+    assert r.returncode == 0, r.stderr
+
+
+# --- pre-DAG read-only behavior ---------------------------------------------
+
+def test_status_zero_counts_before_dag(tmp_path):
+    run_dir = _init_pr_review(tmp_path)
+    r = _run(["status", "--run", run_dir])
+    assert r.returncode == 0, r.stderr
+    assert json.loads(r.stdout) == {"total": 0, "pending": 0, "in_progress": 0,
+                                    "in_review": 0, "done": 0, "blocked": 0}
+
+
+def test_report_in_progress_before_dag(tmp_path):
+    run_dir = _init_pr_review(tmp_path)
+    r = _run(["report", "--run", run_dir])
+    assert r.returncode == 0, r.stderr
+    assert "IN PROGRESS" in r.stdout
+
+
+def test_next_before_dag_exits_nonzero_with_message(tmp_path):
+    run_dir = _init_pr_review(tmp_path)
+    r = _run(["next", "--run", run_dir])
+    assert r.returncode != 0
+    assert "no dependency tree loaded" in r.stderr
+    assert r.stdout.strip() == ""

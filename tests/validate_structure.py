@@ -35,7 +35,11 @@ SEMVER = re.compile(
 )
 
 # Deterministic helper modules the skill/CLI depend on.
-PACKAGE_MODULES = ("__init__", "__main__", "config", "dag", "integrity", "verdict", "runlog", "symmetric", "workflow", "report", "cli")
+PACKAGE_MODULES = ("__init__", "__main__", "config", "dag", "integrity", "verdict", "runlog", "symmetric", "workflow", "report", "target", "cli")
+
+# Test modules that must accompany their deterministic package module (registered here so a dropped
+# suite is caught structurally, not only by a green run that silently skipped it).
+REQUIRED_TESTS = ("test_target.py",)
 
 # Reference docs each skill's orchestrator depends on, keyed by skill directory name. Additive:
 # registering a new skill's required refs here does not touch crucible's set.
@@ -162,6 +166,8 @@ def main() -> int:
     check(pkg.is_dir(), "missing scripts/crucible package")
     for mod in PACKAGE_MODULES:
         check((pkg / f"{mod}.py").exists(), f"missing scripts/crucible/{mod}.py")
+    for test_name in REQUIRED_TESTS:
+        check((ROOT / "tests" / test_name).exists(), f"missing tests/{test_name}")
     check((ROOT / "pytest.ini").exists(), "missing pytest.ini (sets pythonpath=scripts)")
 
     # --- 5. Cross-references resolve ------------------------------------------

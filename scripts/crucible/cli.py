@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -11,7 +12,7 @@ import webbrowser
 from pathlib import Path
 
 from crucible.config import Config, load_config
-from crucible.dag import DAG
+from crucible.dag import DAG, VALID_STATUSES
 from crucible.integrity import (
     current_bindings,
     dag_sha256,
@@ -35,6 +36,17 @@ from crucible.symmetric import (
     review_result,
     validate_final_finding_set,
     workflow_kind,
+)
+from crucible.target import (
+    ReviewTarget,
+    normalize_diff_target,
+    normalize_github_target,
+    normalize_local_target,
+    normalized_repository_identity,
+    protocol_work_started,
+    safe_extract_source_archive,
+    target_from_events,
+    target_sha256,
 )
 from crucible.verdict import VALID_RESOLUTIONS, Finding, Verdict, decide
 from crucible.workflow import (
@@ -83,6 +95,58 @@ def _require_run_integrity(run: RunLog) -> None:
         workflow_kind(run.read_events())
     except CorruptWorkflowError as exc:
         raise SystemExit(f"crucible: {exc}")
+
+
+def _require_pr_review_target(run: RunLog) -> None:
+    """Shared loaded-target guard for every pr-review mutation/certification command.
+
+    Except for ``init-run``, ``normalize-target``, and ``load-target`` (which create/load the target),
+    a pr-review command may only proceed once exactly one valid target has been loaded. ``build`` and
+    ``deep-dive`` runs are untouched. Called AFTER :func:`_require_run_integrity` so a corrupt workflow
+    is still reported as corrupt (never masked as a missing target), and BEFORE any append so a
+    targetless pr-review run is rejected without mutating the run.
+    """
+    events = run.read_events()
+    if workflow_kind(events) != "pr-review":
+        return
+    try:
+        target = target_from_events(events)
+    except ValueError as exc:
+        raise SystemExit(f"crucible: invalid pr-review target: {exc}")
+    if target is None:
+        raise SystemExit(
+            "crucible: pr-review target is missing; run load-target before this command")
+
+
+def _canonical_target_text(manifest: dict) -> str:
+    """The canonical on-disk manifest text: sorted keys, UTF-8, trailing newline. The hash is over
+    ``canonical_json_sha256`` (also sorted), so the file layout never affects target identity."""
+    return json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Write ``data`` to ``path`` atomically (S1): sibling temp file, fsync, then ``os.replace``.
+
+    A crash mid-write can never leave a half-written ``target.json``/``target.diff``; a reader sees
+    either the old file or the complete new one. Used for the target scratch/authoritative outputs.
+    """
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        with tmp.open("wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _sha256_file(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _print_dependency_tree(dag, stream=None) -> None:
@@ -316,6 +380,7 @@ def cmd_init_run(args) -> int:
 def cmd_load_dag(args) -> int:
     run = RunLog(args.run)
     _require_run_integrity(run)
+    _require_pr_review_target(run)
     # Artifact immutability: once the PLAN gate concludes (any terminal outcome), the accepted
     # dependency tree is frozen. Refuse to replace it — even with --force — because a Critic already
     # reviewed and the run bound its decision to this exact tree. A changed plan/DAG needs a fresh
@@ -369,7 +434,14 @@ def cmd_load_dag(args) -> int:
 
 def cmd_next(args) -> int:
     run = RunLog(args.run)
-    dag = DAG.from_dict(run.load_dag())
+    try:
+        dag = DAG.from_dict(run.load_dag())
+    except FileNotFoundError:
+        # No dependency tree yet: exit nonzero with a clear message rather than empty-success (an
+        # empty stdout means "every node is done"). Read-only and never a traceback.
+        print("crucible: next: no dependency tree loaded; run load-dag first "
+              "(there is no plan to schedule from yet)", file=sys.stderr)
+        return 2
     state, node = dag.next_state()
     if state == "ready":
         # A ready node is about to be scheduled for implementation, so the PLAN gate (and configured
@@ -404,6 +476,7 @@ def cmd_set_status(args) -> int:
     # set-status is a mutating command: a legacy run's provenance is unverified, so refuse to
     # transition (or forcibly complete) its nodes — start a fresh run instead.
     _require_run_integrity(run)
+    _require_pr_review_target(run)
     dag = DAG.from_dict(run.load_dag())
     if args.node not in dag.nodes:
         raise ValueError(f"unknown node: {args.node}")
@@ -499,6 +572,7 @@ def cmd_log(args) -> int:
         raise SystemExit("log --round must be >= 1 (rounds are 1-based)")
     run = RunLog(args.run)
     _require_run_integrity(run)
+    _require_pr_review_target(run)
     _require_dep_node_in_dag(run, args.gate)
     # Stage/phase prerequisites (Task 3): a Builder artifact may only be logged when the gate is
     # legitimately reachable — REPRODUCE consensus before PLAN when configured; an accepted+bound
@@ -791,6 +865,7 @@ def cmd_symmetric_verdict(args) -> int:
     run = RunLog(args.run)
     # Schema guard first: a legacy run's provenance is unverified, so never certify it.
     _require_run_integrity(run)
+    _require_pr_review_target(run)
     cfg = load_config(run.path / "config.json")
     # Routing guard: symmetric-verdict is only for the two-peer workflows. A build run uses the
     # asymmetric `verdict` command — reject before any read/append.
@@ -991,6 +1066,7 @@ def cmd_accepted_findings(args) -> int:
     """
     run = RunLog(args.run)
     _require_run_integrity(run)
+    _require_pr_review_target(run)
     events = run.read_events()
     _require_symmetric_result_workflow(events, "accepted-findings")
     dag = _load_result_dag(run)
@@ -1014,6 +1090,7 @@ def cmd_review_result(args) -> int:
     """
     run = RunLog(args.run)
     _require_run_integrity(run)
+    _require_pr_review_target(run)
     events = run.read_events()
     cfg = load_config(run.path / "config.json")
     workflow = _require_symmetric_result_workflow(events, "review-result")
@@ -1038,6 +1115,7 @@ def cmd_bindings(args) -> int:
     _validate_gate(args.gate)
     run = RunLog(args.run)
     _require_run_integrity(run)
+    _require_pr_review_target(run)
     _require_dep_node_in_dag(run, args.gate)
     # Bindings are only meaningful for a legitimately reachable gate (the same stage/phase order the
     # `log`/`verdict` handshake enforces), so validate the stage prerequisites before emitting them.
@@ -1048,7 +1126,13 @@ def cmd_bindings(args) -> int:
 
 def cmd_status(args) -> int:
     run = RunLog(args.run)
-    dag = DAG.from_dict(run.load_dag())
+    try:
+        dag = DAG.from_dict(run.load_dag())
+    except FileNotFoundError:
+        # No dependency tree yet: report zero counts (usable before a target/DAG exists) rather than
+        # a traceback or an errno. A pr-review run legitimately reaches this state before load-dag.
+        print(json.dumps({"total": 0, **{status: 0 for status in VALID_STATUSES}}))
+        return 0
     print(json.dumps(dag.progress()))
     return 0
 
@@ -1097,6 +1181,7 @@ def cmd_approve_plan(args) -> int:
     """
     run = RunLog(args.run)
     _require_run_integrity(run)
+    _require_pr_review_target(run)
     cfg = load_config(run.path / "config.json")
     if not cfg.human_approval:
         raise SystemExit(
@@ -1145,6 +1230,7 @@ def cmd_show_plan(args) -> int:
     """
     run = RunLog(args.run)
     _require_run_integrity(run)
+    _require_pr_review_target(run)
     events = run.read_events()
     terminal = _plan_advance_terminal(events)
     if terminal is None:
@@ -1214,6 +1300,144 @@ def cmd_critic_lenses(args) -> int:
     """
     cfg = load_config(RunLog(args.run).path / "config.json")
     sys.stdout.write(read_critic_lenses(cfg.critic_checklists))
+    return 0
+
+
+def cmd_normalize_target(args) -> int:
+    """Normalize a github/local/diff target into a canonical manifest + exact patch, WITHOUT mutating
+    any run. The orchestrator then loads them with ``load-target``. This makes normalization behavior
+    executable and directly testable rather than prose-only.
+    """
+    kind = args.target_kind
+    if kind == "github":
+        before = json.loads(Path(args.metadata_before).read_text(encoding="utf-8"))
+        after = json.loads(Path(args.metadata_after).read_text(encoding="utf-8"))
+        diff_bytes = Path(args.diff).read_bytes()
+        target = normalize_github_target(before, after, diff_bytes)
+    elif kind == "local":
+        intent = json.loads(Path(args.intent).read_text(encoding="utf-8"))
+        target, diff_bytes = normalize_local_target(args.repo, args.range, intent)
+    elif kind == "diff":
+        diff_bytes = Path(args.diff).read_bytes()
+        intent = json.loads(Path(args.intent).read_text(encoding="utf-8"))
+        target = normalize_diff_target(diff_bytes, intent)
+    else:  # pragma: no cover - argparse 'required=True' subparser prevents this
+        raise SystemExit(f"normalize-target: unknown kind {kind!r}")
+    _atomic_write_bytes(Path(args.output),
+                        _canonical_target_text(target.to_dict()).encode("utf-8"))
+    _atomic_write_bytes(Path(args.diff_output), diff_bytes)
+    print(f"normalized {target.kind} target -> {args.output} ({args.diff_output})")
+    return 0
+
+
+def cmd_repository_identity(args) -> int:
+    """Emit the credential-free repository identity local normalization would record (a sanitized
+    remote URL or a ``local:<hash>`` fingerprint), so a checkout can be compared without duplicating
+    logic and without ever exposing URL credentials or a local filesystem path."""
+    print(normalized_repository_identity(args.repo))
+    return 0
+
+
+def cmd_load_target(args) -> int:
+    """Record the one immutable ``target_loaded`` event for a pr-review run.
+
+    Validates the manifest and the EXACT patch bytes (``diff_sha256`` must match ``--diff``),
+    canonicalizes the manifest, appends a single ``target_loaded`` event carrying the canonical payload
+    plus ``target_sha256``, and writes the canonical payload back to ``RUN/target.json`` (+ the exact
+    bytes to ``RUN/target.diff``). Only valid for a pr-review run, exactly once, before any DAG/PLAN/
+    review work — a correction requires a fresh run. The run-log event is authoritative; the files are
+    a convenient scratch copy.
+    """
+    run = RunLog(args.run)
+    _require_run_integrity(run)
+    events = run.read_events()
+    workflow = workflow_kind(events)
+    if workflow != "pr-review":
+        raise SystemExit(
+            f"crucible: load-target is only valid for pr-review runs (this run is {workflow!r})")
+    if any(e.get("event") == "target_loaded" for e in events):
+        raise SystemExit(
+            "crucible: a target is already loaded for this run; a target is immutable — correcting it "
+            "requires a fresh run")
+    if protocol_work_started(events):
+        raise SystemExit(
+            "crucible: a target must be loaded before load-dag, PLAN output, or any review event; "
+            "this run has already begun that work — start a fresh run")
+    data = json.loads(Path(args.file).read_text(encoding="utf-8"))
+    target = ReviewTarget.from_dict(data)
+    diff_bytes = Path(args.diff).read_bytes()
+    actual = hashlib.sha256(diff_bytes).hexdigest()
+    if actual != target.diff_sha256:
+        raise SystemExit(
+            f"crucible: --diff bytes ({actual}) do not match the manifest diff_sha256 "
+            f"({target.diff_sha256}); refusing to load a target whose patch does not verify")
+    manifest = target.to_dict()
+    sha = target_sha256(target)
+    # The run-log event is authoritative and self-contained (full canonical manifest + target_sha256,
+    # verified against the exact diff bytes above), so it is appended first; RUN/target.json and
+    # RUN/target.diff are convenience scratch copies written atomically afterward.
+    run.append("target_loaded", target=manifest, target_sha256=sha)
+    _atomic_write_bytes(run.path / "target.json",
+                        _canonical_target_text(manifest).encode("utf-8"))
+    _atomic_write_bytes(run.path / "target.diff", diff_bytes)
+    print(f"loaded {target.kind} target ({sha[:12]}…)")
+    return 0
+
+
+def cmd_show_target(args) -> int:
+    """Emit the canonical authoritative target from the ``target_loaded`` run-log event (never the
+    later-editable scratch file). Fails closed when no target is loaded or the recorded event is
+    malformed/duplicated/hash-mismatched."""
+    run = RunLog(args.run)
+    target = target_from_events(run.read_events())
+    if target is None:
+        raise SystemExit("crucible: no target is loaded for this run")
+    sys.stdout.write(_canonical_target_text(target.to_dict()))
+    return 0
+
+
+def cmd_materialize_target(args) -> int:
+    """One-shot materialization of a confined, read-only source snapshot into ``RUN/source``.
+
+    Permitted only for a revision-bound (github-pr/local-range) pr-review target, immediately after
+    ``target_loaded`` and before any DAG/PLAN/review or prior materialization event. Extraction is
+    confined (see ``crucible.target.safe_extract_source_archive``): it rejects path escapes, links,
+    devices/FIFOs, duplicate normalized paths, and archives over the member/byte caps, and atomically
+    replaces the ABSENT ``RUN/source``. Records a ``source_materialized`` event with the target and
+    archive hashes ONLY after a successful extract — a rejection never creates ``RUN/source`` or
+    appends an event.
+    """
+    run = RunLog(args.run)
+    _require_run_integrity(run)
+    events = run.read_events()
+    workflow = workflow_kind(events)
+    if workflow != "pr-review":
+        raise SystemExit(
+            f"crucible: materialize-target is only valid for pr-review runs (this run is {workflow!r})")
+    target = target_from_events(events)
+    if target is None:
+        raise SystemExit(
+            "crucible: no target is loaded; run load-target before materialize-target")
+    if not target.revision_bound:
+        raise SystemExit(
+            "crucible: a diff-file target is revision-unbound and has no source snapshot to "
+            "materialize; the review stays patch-only")
+    # Materialization happens immediately after target_loaded: the ONLY events allowed before it are
+    # run_start and the one target_loaded. Any DAG/PLAN/verdict/terminal/status/approval event, or a
+    # prior source_materialized, rejects here — before any filesystem change or append.
+    downstream = [e.get("event") for e in events
+                  if e.get("event") not in ("run_start", "target_loaded")]
+    if downstream:
+        raise SystemExit(
+            "crucible: source can only be materialized immediately after target_loaded — before any "
+            f"DAG/PLAN/review work or a prior materialization; found downstream events: {downstream}")
+    destination = run.path / "source"
+    if destination.exists():
+        raise SystemExit(f"crucible: source already materialized at {destination}")
+    safe_extract_source_archive(args.archive, destination)
+    run.append("source_materialized", kind=target.kind,
+               target_sha256=target_sha256(target), archive_sha256=_sha256_file(args.archive))
+    print(f"materialized {target.kind} source at {destination}")
     return 0
 
 
@@ -1306,6 +1530,48 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("critic-lenses"); s.add_argument("--run", required=True)
     s.set_defaults(func=cmd_critic_lenses)
+
+    # --- pr-review target commands (Task 1) ---
+    normalize = sub.add_parser("normalize-target")
+    normalize_sub = normalize.add_subparsers(dest="target_kind", required=True)
+
+    ng = normalize_sub.add_parser("github")
+    ng.add_argument("--metadata-before", required=True)
+    ng.add_argument("--metadata-after", required=True)
+    ng.add_argument("--diff", required=True)
+    ng.add_argument("--output", required=True)
+    ng.add_argument("--diff-output", required=True)
+    ng.set_defaults(func=cmd_normalize_target)
+
+    nl = normalize_sub.add_parser("local")
+    nl.add_argument("--repo", required=True)
+    nl.add_argument("--range", required=True,
+                    help="BASE..HEAD or BASE...HEAD (both normalize to merge_base..head)")
+    nl.add_argument("--intent", required=True)
+    nl.add_argument("--output", required=True)
+    nl.add_argument("--diff-output", required=True)
+    nl.set_defaults(func=cmd_normalize_target)
+
+    nd = normalize_sub.add_parser("diff")
+    nd.add_argument("--diff", required=True)
+    nd.add_argument("--intent", required=True)
+    nd.add_argument("--output", required=True)
+    nd.add_argument("--diff-output", required=True)
+    nd.set_defaults(func=cmd_normalize_target)
+
+    identity = sub.add_parser("repository-identity"); identity.add_argument("--repo", required=True)
+    identity.set_defaults(func=cmd_repository_identity)
+
+    load = sub.add_parser("load-target"); load.add_argument("--run", required=True)
+    load.add_argument("--file", required=True); load.add_argument("--diff", required=True)
+    load.set_defaults(func=cmd_load_target)
+
+    show = sub.add_parser("show-target"); show.add_argument("--run", required=True)
+    show.set_defaults(func=cmd_show_target)
+
+    materialize = sub.add_parser("materialize-target"); materialize.add_argument("--run", required=True)
+    materialize.add_argument("--archive", required=True)
+    materialize.set_defaults(func=cmd_materialize_target)
 
     return p
 
