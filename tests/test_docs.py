@@ -319,6 +319,76 @@ def test_symmetric_design_marked_implemented_and_links_plan():
     assert "2026-07-20-symmetric-consensus.md" in design, "design must link its implementation plan"
 
 
+# --- Companion runtime-guidance guards (docs/cli.md Conventions, AGENTS.md, CLAUDE.md) -------------
+# The three top-level runtime-guidance surfaces must teach the CURRENT symmetric two-peer protocol —
+# `--workflow` init, separate Peer A / Peer B attestation files settled by `symmetric-verdict`,
+# `accepted-findings` before FINAL, the Finish `review-result` (with pr-review's deterministic
+# recommendation + preserved execution/posting safety), and the honest slot-proof scope — and must NOT
+# teach the superseded single-union / merged-set verdict. Section-scoped so a stale sentence in a live
+# surface fails HERE even though docs/cli.md's detailed "Symmetric workflows" section is already
+# correct; these guards exist so a future protocol migration cannot miss the companion summaries.
+
+STALE_SYMMETRIC_MECHANISM = (
+    "verdict is the union",
+    "union of their findings",
+    "union of both peers",
+    "review the merged set",
+    "merged set",
+)
+
+
+def _assert_no_stale_union(scope: str, where: str):
+    for phrase in STALE_SYMMETRIC_MECHANISM:
+        assert phrase not in scope, f"{where} still teaches the superseded {phrase!r} mechanism"
+
+
+def test_cli_docs_conventions_gate_bullet_uses_two_peer_protocol():
+    # The Conventions "Gates" bullet must route each symmetric round through `symmetric-verdict` from
+    # two separate peer attestations (not a single union verdict), while keeping the pr-review
+    # execution-safety scope in the same bullet.
+    bullet = _flat(_bullet((ROOT / "docs" / "cli.md").read_text(), "**Gates**"))
+    assert "symmetric-verdict" in bullet
+    assert "peer attestation" in bullet
+    assert "not a single union verdict" in bullet
+    assert "static/ci-only" in bullet
+    assert "consent" in bullet
+    _assert_no_stale_union(bullet, "docs/cli.md Conventions Gates bullet")
+
+
+@pytest.mark.parametrize("doc", ["AGENTS.md", "CLAUDE.md"])
+def test_companion_deepdive_section_uses_two_peer_protocol(doc):
+    # Required implemented commands/terms (not merely an absent phrase): workflow-kind init, the
+    # symmetric decision command, separate Peer A / Peer B attestations, the FINAL assembly and Finish
+    # deliverable, the honest slot-proof scope, and an explicit negation of the single-union verdict.
+    section = _flat(_section((ROOT / doc).read_text(), "Companion skill: deep-dive"))
+    assert "--workflow deep-dive" in section
+    assert "symmetric-verdict" in section
+    assert "peer a" in section and "peer b" in section
+    assert "attestation" in section
+    assert "accepted-findings" in section
+    assert "review-result" in section
+    assert "two configured slots" in section
+    assert "cryptograph" in section and "process" in section
+    assert "no single serialized union verdict" in section
+    _assert_no_stale_union(section, f"{doc} deep-dive companion section")
+
+
+@pytest.mark.parametrize("doc", ["AGENTS.md", "CLAUDE.md"])
+def test_companion_prreview_section_uses_two_peer_protocol(doc):
+    # pr-review companion summary: same symmetric two-peer decision command, a DETERMINISTIC derived
+    # recommendation from `review-result`, and the preserved execution + posting safety scope.
+    section = _flat(_section((ROOT / doc).read_text(), "Companion skill: pr-review"))
+    assert "--workflow pr-review" in section
+    assert "symmetric-verdict" in section
+    assert "review-result" in section
+    assert "deterministic" in section and "recommendation" in section
+    assert "approve/comment/request-changes" in section
+    assert "static/ci-only" in section
+    assert "consent" in section
+    assert "posting" in section
+    _assert_no_stale_union(section, f"{doc} pr-review companion section")
+
+
 # --- --resolutions grammar guards: the skill/rubric examples must match the CLI parser --------------
 # `_load_resolutions` rejects a bare `wontfix`/`deferred` (a resolution that clears a finding without a
 # fix must carry the object form with a non-empty `rationale`). A user copy/pasting a documented

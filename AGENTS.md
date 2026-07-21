@@ -38,9 +38,15 @@ This repo also ships an independent second skill, **`deep-dive`** (`skills/deep-
 *investigation* against the actual code or data: two **equal peers** (no Builder/Critic asymmetry)
 investigate independently, cross-examine, and converge on an **evidence-grounded consensus finding
 set** (citations either peer can re-verify; disputes settled by returning to the source, never a vote
-or an average). It reuses the same deterministic `crucible` CLI with no config-schema change — each
-round both peers review the merged set and the recorded verdict is the union of their findings.
-Follow `skills/deep-dive/SKILL.md` and its `references/`.
+or an average). It runs on the same deterministic `crucible` CLI with no config-schema change:
+`init-run --workflow deep-dive` selects the symmetric flow, and every gate is settled by
+`crucible symmetric-verdict --peer-a … --peer-b …` from **separate Peer A / Peer B attestation
+files** (never the build-only `verdict`) — the union of the two peers' *objections* decides gate
+progress; there is **no single serialized union verdict**. `accepted-findings` assembles the accepted
+dependency findings before FINAL and `review-result` is the Finish-time deliverable. A symmetric
+decision proves **two configured slots** each attested to the same bound candidate — not a
+cryptographic proof that two distinct model *processes* ran. Follow `skills/deep-dive/SKILL.md` and
+its `references/`.
 
 ## Companion skill: pr-review
 
@@ -49,8 +55,12 @@ This repo also ships an independent third skill, **`pr-review`** (`skills/pr-rev
 *review* of a pull request: two **equal peers** (no Builder/Critic asymmetry) review a GitHub PR (via
 `gh`) or a local diff independently against the real code, cross-examine, and converge on an
 **evidence-grounded consensus finding set** plus a **derived** Approve/Comment/Request-changes
-recommendation. It reuses the same deterministic `crucible` CLI with no config-schema change, and is
-read-only over the target by default (posting to the PR is a consented, per-run side effect).
+recommendation. It runs on the same deterministic `crucible` CLI with no config-schema change:
+`init-run --workflow pr-review` selects the same symmetric two-peer flow (gates settled by
+`crucible symmetric-verdict` from separate **Peer A / Peer B** attestations, never a single union
+verdict), and the Approve/Comment/Request-changes call is a **deterministic** projection of the
+accepted finding set from `crucible review-result` (not a separate vote). It is read-only over the
+target by default (posting to the PR is a consented, per-run side effect).
 **Execution safety:** a PR-URL and a diff-file review are **static/CI-only** and never execute
 locally; running tests or builds is available only for a **trusted local checkout**, after explicit
 execution **consent** to the exact commands and an arbitrary-code warning — consent does not imply
