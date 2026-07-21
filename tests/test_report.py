@@ -1767,3 +1767,113 @@ def test_report_ignores_out_of_order_source(tmp_path):
     md = render_markdown(run)
     assert "materialized" not in _section(md, "Review target").lower()
     assert "**Status:** INVALID" in md
+
+
+# --- Task 2 (round-2 finding): the absent-DAG report validates general target-event state ----------
+#
+# A schema-v2 pr-review report with NO dag.json present (nothing to certify yet) still fails closed on
+# an INVALID target-event history: a duplicate, malformed/hash-mismatched, or late ``target_loaded``,
+# or pr-review protocol work recorded with no target, renders INVALID rather than being masked as
+# merely IN PROGRESS. This reuses the central ``crucible.target.target_event_issues`` validator — the
+# same one the DAG-present path already applies via ``workflow_issues`` — so both paths agree, and it
+# layers cleanly with the existing source-materialization fail-closed check (source issues once, no
+# duplicate messages). An init-only run (no target yet) and a single valid target stay IN PROGRESS.
+
+def _absent_dag_pr_review(tmp_path, name="absent dag"):
+    """An init-only pr-review run with NO dag.json saved (the absent-tree report path)."""
+    return init_run(name, Config.from_dict({"final_review": False}),
+                    base_dir=tmp_path, workflow="pr-review")
+
+
+def test_report_absent_dag_init_only_no_target_is_in_progress(tmp_path):
+    # No target, no work, no tree: nothing to certify yet -> IN PROGRESS, and no target section.
+    md = render_markdown(_absent_dag_pr_review(tmp_path))
+    assert "**Status:** IN PROGRESS" in md
+    assert "## Review target" not in md
+    assert "**Status:** INVALID" not in md
+
+
+def test_report_absent_dag_single_valid_target_is_in_progress_with_section(tmp_path):
+    # A single valid loaded target with no tree yet stays IN PROGRESS but may render its identity.
+    run, sha = _pr_review_with_target(tmp_path, _LOCAL_TARGET)
+    md = render_markdown(run)
+    assert "**Status:** IN PROGRESS" in md
+    assert "## Review target" in md
+    assert sha in _section(md, "Review target")
+
+
+def test_report_absent_dag_duplicate_target_is_invalid(tmp_path):
+    # Two target_loaded events with no tree: INVALID (a target is immutable; load exactly one). No
+    # success-shaped target or result section is fabricated.
+    run = _absent_dag_pr_review(tmp_path)
+    _load_target_manifest(run, _LOCAL_TARGET)
+    _load_target_manifest(run, _LOCAL_TARGET)
+    md = render_markdown(run)
+    assert "**Status:** INVALID" in md
+    assert "## Review target" not in md
+    assert "## Review result" not in md
+    assert "multiple target_loaded events" in _section(md, "Summary")
+
+
+def test_report_absent_dag_hash_mismatched_target_is_invalid(tmp_path):
+    # A target_loaded whose recorded target_sha256 disagrees with its payload is malformed -> INVALID,
+    # even with no tree present.
+    run = _absent_dag_pr_review(tmp_path)
+    run.append("target_loaded", target=ReviewTarget.from_dict(_LOCAL_TARGET).to_dict(),
+               target_sha256="9" * 64)
+    md = render_markdown(run)
+    assert "**Status:** INVALID" in md
+    assert "## Review target" not in md
+    assert "## Review result" not in md
+    assert "malformed target_loaded event" in _section(md, "Summary")
+
+
+def test_report_absent_dag_protocol_work_without_target_is_invalid(tmp_path):
+    # pr-review protocol work (a builder output) recorded with no loaded target and no tree -> INVALID.
+    run = _absent_dag_pr_review(tmp_path)
+    run.append("builder_output", gate="plan", round=1, payload="plan",
+               artifact_sha256=artifact_sha256(b"plan"))
+    md = render_markdown(run)
+    assert "**Status:** INVALID" in md
+    assert "## Review target" not in md
+    assert "## Review result" not in md
+    assert "without a loaded target" in _section(md, "Summary")
+
+
+def test_report_absent_dag_late_target_after_protocol_is_invalid(tmp_path):
+    # A target loaded AFTER protocol work began is late -> INVALID even without a tree.
+    run = _absent_dag_pr_review(tmp_path)
+    run.append("builder_output", gate="plan", round=1, payload="plan",
+               artifact_sha256=artifact_sha256(b"plan"))
+    _load_target_manifest(run, _LOCAL_TARGET)
+    md = render_markdown(run)
+    assert "**Status:** INVALID" in md
+    assert "target loaded after" in _section(md, "Summary")
+
+
+def test_report_absent_dag_source_issue_reported_once(tmp_path):
+    # A forged source snapshot on a valid revision-unbound diff-file target renders INVALID with the
+    # single source issue listed exactly ONCE — the added target-event layer must not duplicate the
+    # centrally-reported source-materialization message.
+    run, sha = _pr_review_with_target(tmp_path, _DIFF_TARGET)
+    run.append("source_materialized", kind="diff-file", target_sha256=sha, archive_sha256="d" * 64)
+    md = render_markdown(run)
+    assert "**Status:** INVALID" in md
+    assert _section(md, "Summary").count("revision-unbound diff-file target") == 1
+
+
+def test_report_absent_dag_corrupt_workflow_metadata_is_invalid(tmp_path):
+    # Corrupt workflow metadata still fails closed on the absent-tree path (handled BEFORE the target
+    # checks), rendering INVALID with a workflow-metadata issue — never a target message, never a crash.
+    run = _absent_dag_pr_review(tmp_path)
+    _load_target_manifest(run, _LOCAL_TARGET)
+
+    def mutate(records):
+        for r in records:
+            if r.get("event") == "run_start":
+                r["workflow"] = "bogus"
+    _rewrite_run_events(run, mutate)
+    md = render_markdown(run)  # must not raise
+    assert "**Status:** INVALID" in md
+    assert "workflow" in md.lower()
+    assert "## Review result" not in md

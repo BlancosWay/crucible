@@ -19,7 +19,12 @@ from crucible.symmetric import (
     review_result,
     workflow_kind,
 )
-from crucible.target import target_from_events, target_sha256, validate_source_materialization
+from crucible.target import (
+    target_event_issues,
+    target_from_events,
+    target_sha256,
+    validate_source_materialization,
+)
 from crucible.workflow import WorkflowIssue, workflow_issues
 
 
@@ -177,10 +182,11 @@ def _schema_v2_issues(
     tree that cannot be loaded as a JSON object fails closed to an ``invalid`` issue; a present,
     loadable tree is validated by :func:`_config_aware_issues` (which itself fails closed on a
     malformed tree/config). A legacy run yields ``[]`` (never certifiable). An ABSENT tree yields only
-    the fail-closed source-materialization integrity issues (F2/F3) — a forged/duplicate/target-less
-    ``source_materialized`` is INVALID even before a tree is loaded — and otherwise ``[]`` (still in
-    progress). Shared by the run summary and the symmetric result section so both agree on
-    INVALID/MISSING integrity.
+    the fail-closed target-identity and source-materialization integrity issues — a
+    duplicate/malformed/late ``target_loaded``, pr-review protocol work with no target, or a
+    forged/duplicate/target-less ``source_materialized`` is INVALID even before a tree is loaded — and
+    otherwise ``[]`` (still in progress). Shared by the run summary and the symmetric result section so
+    both agree on INVALID/MISSING integrity.
     """
     schema_current = schema_version is not None and schema_version >= RUN_SCHEMA_VERSION
     if not schema_current:
@@ -201,13 +207,23 @@ def _schema_v2_issues(
             "object and cannot be parsed, bound, or certified")]
     if dag_present:
         return _config_aware_issues(events, dag, config)
-    # An ABSENT tree normally stays IN PROGRESS (nothing to certify yet). But a source snapshot is
-    # fail-closed downstream work (F2/F3): a `source_materialized` event is a concrete materialization
-    # that either bound a valid revision-bound target or is tampering — it is validated NOW, tree or
-    # no tree, so a forged/duplicate/target-less/wrong source event renders the run INVALID rather than
-    # being masked as merely in progress. Tree-dependent phases still wait for the tree.
-    return [WorkflowIssue("invalid", msg)
-            for msg in validate_source_materialization(events, workflow).issues]
+    # An ABSENT tree normally stays IN PROGRESS (nothing to certify yet). But target IDENTITY and the
+    # source snapshot are BOTH authoritative over the event history alone — not the dependency tree —
+    # so they are validated NOW, tree or no tree, and each renders the run INVALID rather than being
+    # masked as merely in progress:
+    #   - target-EVENT integrity (`target_event_issues`): a duplicate/malformed/late `target_loaded`,
+    #     or pr-review DAG/PLAN/review work recorded with no target (an init-only pr-review run that
+    #     has simply not loaded its target yet is *missing*, not invalid, and returns []);
+    #   - source-MATERIALIZATION integrity (`validate_source_materialization`, F2/F3): a
+    #     forged/duplicate/target-less/wrong-kind/-hash/-order `source_materialized` event.
+    # This reuses the SAME central validators the present-tree path applies via
+    # `workflow_issues`/`_target_issues`, so both paths agree, and the source issue is listed exactly
+    # once (target-event issues name `target_loaded`; source issues name `source_materialized`).
+    # Tree-dependent phases (binding, DAG/PLAN/FINAL ordering) still wait for the tree.
+    issues = [WorkflowIssue("invalid", msg) for msg in target_event_issues(events, workflow)]
+    issues.extend(WorkflowIssue("invalid", msg)
+                  for msg in validate_source_materialization(events, workflow).issues)
+    return issues
 
 
 def _overall_status(
