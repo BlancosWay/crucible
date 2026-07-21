@@ -984,3 +984,106 @@ def test_require_complete_symmetric_run_rejects_mis_scoped_dependency_finding():
     events = _dep_events("a", findings=[_finding("final", "X1")], bindings=_bindings("a", "d", "na"))
     with pytest.raises(ValueError, match="incomplete symmetric workflow"):
         require_complete_symmetric_run(events, dag, require_final=False, final_enabled=False)
+
+
+# --- round-8 F1: unresolved objections / recommendation are BLOCKING-only ------------------------
+#
+# review_result promises unresolved_objections are unresolved BLOCKING objections. A forged
+# terminal-bound symmetric_verdict carrying only nonblocking objections must not yield REQUEST_CHANGES
+# nor appear as unresolved blocking state — the projection defensively keeps only configured blocking.
+
+def _proceeded_dep(node, objections, bindings=None):
+    """A proceeded-with-flags dep gate carrying ``objections`` on the terminal-bound verdict."""
+    return _dep_events(node, findings=[], outcome="PROCEED_WITH_FLAGS", objections=objections,
+                       bindings=bindings or _bindings(node[0], "d", "n" + node[0]))
+
+
+def test_review_result_drops_nonblocking_terminal_objection():
+    events = _proceeded_dep("a", [_obj("A:m", "minor")])
+    result = review_result(events, Config.from_dict({}), "pr-review")
+    assert result["recommendation"] == "APPROVE"
+    assert result["unresolved_objections"] == []
+
+
+def test_review_result_keeps_blocking_terminal_objection():
+    events = _proceeded_dep("a", [_obj("A:b", "blocker")])
+    result = review_result(events, Config.from_dict({}), "pr-review")
+    assert result["recommendation"] == "REQUEST_CHANGES"
+    assert [o["id"] for o in result["unresolved_objections"]] == ["A:b"]
+
+
+def test_review_result_filters_objections_by_custom_blocking_severities():
+    # Custom blocking_severities=["blocker"]: a 'major' objection is NOT blocking, so it must not
+    # drive REQUEST_CHANGES nor appear as unresolved blocking state.
+    events = _proceeded_dep("a", [_obj("A:maj", "major")])
+    cfg = Config.from_dict({"blocking_severities": ["blocker"], "on_cap": "proceed_with_flags"})
+    result = review_result(events, cfg, "pr-review")
+    assert result["recommendation"] == "APPROVE"
+    assert result["unresolved_objections"] == []
+
+
+def test_review_result_mixed_objections_keeps_only_blocking():
+    events = _proceeded_dep("a", [_obj("A:m", "minor"), _obj("A:b", "blocker")])
+    result = review_result(events, Config.from_dict({}), "pr-review")
+    assert [o["id"] for o in result["unresolved_objections"]] == ["A:b"]
+
+
+def test_unresolved_objections_filters_to_blocking_when_cfg_given():
+    from crucible.symmetric import unresolved_objections
+
+    events = _proceeded_dep("a", [_obj("A:m", "minor"), _obj("A:b", "blocker")])
+    keep = unresolved_objections(events, cfg=Config.from_dict({}))
+    assert [o["id"] for o in keep] == ["A:b"]
+    # No cfg => best-effort partial helper, unfiltered (unchanged legacy contract).
+    allobjs = unresolved_objections(events)
+    assert {o["id"] for o in allobjs} == {"A:m", "A:b"}
+
+
+# --- round-8 F4: the accepted trio resolver requires outcome<->terminal consistency --------------
+#
+# An accepted set is certified only by a symmetric_verdict whose outcome matches its advancing
+# terminal (CONSENSUS<->gate_consensus, PROCEED_WITH_FLAGS<->gate_proceeded_with_flags). A
+# CHANGES/CAPPED/wrong advancing outcome has a valid STRUCTURE but must never certify an accepted set.
+
+def _trio_outcome(gate, verdict_outcome, terminal_event, *, findings=None, objections=None,
+                  bindings=None, rnd=1):
+    """Forge a symmetric_verdict(verdict_outcome) -> accepted_finding_set -> terminal_event trio whose
+    verdict outcome may DISAGREE with the terminal (the corrupt history a real write never produces)."""
+    b = bindings or _bindings()
+    objections = objections or []
+    payload = {"summary": "", "findings": findings if findings is not None else []}
+    evs = [{"event": "symmetric_verdict", "gate": gate, "round": rnd, "outcome": verdict_outcome,
+            "objections": objections, **b},
+           {"event": "accepted_finding_set", "gate": gate, "round": rnd, "payload": payload, **b}]
+    tev = {"event": terminal_event, "gate": gate, "round": rnd, **b}
+    if terminal_event in ("gate_proceeded_with_flags", "gate_capped"):
+        tev["open_findings"] = [o["id"] for o in objections]
+    evs.append(tev)
+    return evs
+
+
+@pytest.mark.parametrize("verdict_outcome", ["CHANGES", "CAPPED", "PROCEED_WITH_FLAGS"])
+def test_resolve_gate_acceptance_rejects_wrong_outcome_for_consensus(verdict_outcome):
+    from crucible.symmetric import resolve_gate_acceptance
+
+    events = _trio_outcome("dep:a", verdict_outcome, "gate_consensus",
+                           findings=[_finding("dep:a", "F1")],
+                           objections=([_obj("A:b", "blocker")] if verdict_outcome != "CHANGES"
+                                       else [_obj("A:b", "blocker")]))
+    assert resolve_gate_acceptance(events, "dep:a").accepted_index is None
+
+
+def test_accepted_findings_excludes_wrong_outcome_trio():
+    dag = _one_done_dag("a")
+    events = _trio_outcome("dep:a", "CHANGES", "gate_consensus",
+                           findings=[_finding("dep:a", "F1")], objections=[_obj("A:b", "blocker")],
+                           bindings=_bindings("a", "d", "na"))
+    assert accepted_findings(events, dag).findings == []
+
+
+def test_accepted_finding_set_for_gate_none_on_wrong_outcome():
+    from crucible.symmetric import accepted_finding_set_for_gate
+
+    events = _trio_outcome("dep:a", "PROCEED_WITH_FLAGS", "gate_consensus",
+                           findings=[_finding("dep:a", "F1")], objections=[_obj("A:b", "blocker")])
+    assert accepted_finding_set_for_gate(events, "dep:a") is None

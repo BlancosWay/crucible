@@ -1099,6 +1099,8 @@ def _symmetric_dep_run(tmp_path, *, accepted="pre"):
     plan_art = artifact_sha256(plan_payload.encode("utf-8"))
     run.append("builder_output", gate="plan", round=1, payload=plan_payload,
                artifact_sha256=plan_art)
+    run.append("symmetric_verdict", gate="plan", round=1, outcome="CONSENSUS", objections=[],
+               artifact_sha256=plan_art, dag_sha256=dsha)
     run.append("gate_consensus", gate="plan", round=1, artifact_sha256=plan_art, dag_sha256=dsha)
 
     candidate = _sym_candidate()

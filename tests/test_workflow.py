@@ -446,7 +446,7 @@ def _af(source_gate="dep:a", fid="F1", severity="major"):
             "location": "src/a.py:1", "claim": "c", "suggestion": "s"}
 
 
-def _symmetric_run(tmp_path, *, accepted="valid", final=None, verdict="match"):
+def _symmetric_run(tmp_path, *, accepted="valid", final=None, verdict="match", plan="valid"):
     """A pr-review run with one done node 'a' backed by a symmetric dependency gate, plus optional
     FINAL. ``accepted`` selects a dependency accepted-set fault: ``"valid"``, ``"binding"`` (its
     bindings differ from the terminal), or ``"malformed"`` (its payload is not a valid finding set).
@@ -454,7 +454,11 @@ def _symmetric_run(tmp_path, *, accepted="valid", final=None, verdict="match"):
     artifact/DAG/node as the accepted set + terminal) or ``"mismatch"`` (it binds a different
     artifact, so the accepted result is not the candidate the peers reviewed).
     ``final`` selects the FINAL accepted-set inclusion: ``None`` (no FINAL gate), ``"valid"`` (adds a
-    ``source_gate: final`` extra), or ``"drops"`` (omits the accepted dependency finding)."""
+    ``source_gate: final`` extra), or ``"drops"`` (omits the accepted dependency finding).
+    ``plan`` selects the symmetric PLAN attestation: ``"valid"`` (a bound symmetric_verdict backs the
+    accepted PLAN terminal), ``"bare"`` (a terminal with no symmetric_verdict), ``"critic"`` (a
+    build-style critic_verdict instead of two-peer), ``"wrong_round"``/``"wrong_bindings"``/
+    ``"wrong_outcome"`` (a symmetric_verdict that does not correspond to the terminal)."""
     cfg = Config.from_dict({"final_review": final is not None})
     run = init_run("sym", cfg, base_dir=tmp_path, workflow="pr-review")
     dag = _dag(status="done")
@@ -463,9 +467,49 @@ def _symmetric_run(tmp_path, *, accepted="valid", final=None, verdict="match"):
 
     plan_art = artifact_sha256(b"plan")
     run.append("builder_output", gate="plan", round=1, payload="plan", artifact_sha256=plan_art)
-    run.append("gate_consensus", gate="plan", round=1, artifact_sha256=plan_art, dag_sha256=dsha)
+    plan_bind = {"artifact_sha256": plan_art, "dag_sha256": dsha}
+    if plan == "critic":
+        run.append("critic_verdict", gate="plan", round=1, verdict="APPROVE", **plan_bind)
+    elif plan != "bare":
+        v_round = 2 if plan == "wrong_round" else 1
+        v_bind = ({**plan_bind, "artifact_sha256": "7" * 64} if plan == "wrong_bindings"
+                  else plan_bind)
+        v_outcome = "CHANGES" if plan == "wrong_outcome" else "CONSENSUS"
+        run.append("symmetric_verdict", gate="plan", round=v_round, outcome=v_outcome,
+                   objections=[], **v_bind)
+    run.append("gate_consensus", gate="plan", round=1, **plan_bind)
 
     candidate = {"summary": "", "findings": [_af("dep:a", "F1")]}
+    cand_text = json.dumps(candidate)
+    cand_art = artifact_sha256(cand_text.encode("utf-8"))
+    dep_bind = {"artifact_sha256": cand_art, "dag_sha256": dsha, "node_sha256": nsha}
+    run.append("builder_output", gate="dep:a", round=1, payload=cand_text, artifact_sha256=cand_art)
+    ver_bind = dep_bind if verdict == "match" else {**dep_bind, "artifact_sha256": "9" * 64}
+    run.append("symmetric_verdict", gate="dep:a", round=1, outcome="CONSENSUS", objections=[],
+               candidate=candidate, **ver_bind)
+    acc_bind = dep_bind if accepted != "binding" else {**dep_bind, "artifact_sha256": "0" * 64}
+    acc_payload = candidate if accepted != "malformed" else {"findings": "not-a-list"}
+    run.append("accepted_finding_set", gate="dep:a", round=1, payload=acc_payload, **acc_bind)
+    run.append("gate_consensus", gate="dep:a", round=1, **dep_bind)
+    run.append("node_status_change", node="a", status="done")
+
+    if final is not None:
+        if final == "drops":
+            final_findings = [_af("final", "C1", "nit")]  # drops the accepted dependency finding
+        else:
+            final_findings = [_af("dep:a", "F1"), _af("final", "C1", "nit")]
+        final_payload = {"summary": "", "findings": final_findings}
+        final_text = json.dumps(final_payload)
+        final_art = artifact_sha256(final_text.encode("utf-8"))
+        fbind = {"artifact_sha256": final_art, "dag_sha256": dsha}
+        run.append("builder_output", gate="final", round=1, payload=final_text,
+                   artifact_sha256=final_art)
+        run.append("symmetric_verdict", gate="final", round=1, outcome="CONSENSUS", objections=[],
+                   candidate=final_payload, **fbind)
+        run.append("accepted_finding_set", gate="final", round=1, payload=final_payload, **fbind)
+        run.append("gate_consensus", gate="final", round=1, **fbind)
+
+    return run, dag, cfg
     cand_text = json.dumps(candidate)
     cand_art = artifact_sha256(cand_text.encode("utf-8"))
     dep_bind = {"artifact_sha256": cand_art, "dag_sha256": dsha, "node_sha256": nsha}
@@ -767,3 +811,178 @@ def test_workflow_issues_clean_when_final_review_disabled_and_no_final_events(tm
     run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
     assert cfg.final_review is False
     assert workflow_issues(run.read_events(), dag, cfg) == []
+
+
+# --- round-8 F3: a symmetric PLAN accepted terminal must be backed by a two-peer symmetric_verdict ---
+
+def _dep_gate_bindings_w(events, gate):
+    sv = next(e for e in events
+              if e.get("event") == "symmetric_verdict" and e.get("gate") == gate)
+    return {k: sv[k] for k in ("artifact_sha256", "dag_sha256", "node_sha256") if k in sv}
+
+
+@pytest.mark.parametrize("plan", ["bare", "critic", "wrong_round", "wrong_bindings", "wrong_outcome"])
+def test_workflow_issues_flags_unattested_symmetric_plan(tmp_path, plan):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid", plan=plan)
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "invalid" and "plan" in i.message.lower() for i in issues), \
+        [(i.kind, i.message) for i in issues]
+
+
+def test_workflow_issues_clean_for_valid_symmetric_plan(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid", plan="valid")
+    assert workflow_issues(run.read_events(), dag, cfg) == []
+
+
+def test_workflow_issues_build_plan_critic_verdict_unchanged(tmp_path):
+    # F3 must not touch the asymmetric build workflow: a build run's PLAN is a critic_verdict +
+    # terminal and stays CLEAN (the symmetric attestation rule is symmetric-only).
+    cfg = Config.from_dict({"final_review": False})
+    run = init_run("g", cfg, base_dir=tmp_path)  # default = build workflow
+    dag = _dag(status="done")
+    _bind_plan(run, dag)
+    _bind_dep_a(run, dag)
+    run.append("node_status_change", node="a", status="done")
+    assert workflow_issues(run.read_events(), dag, cfg) == []
+
+
+# --- round-8 F2: symmetric protocol integrity still runs when PLAN is missing --------------------
+
+def _symmetric_no_plan(tmp_path):
+    """A pr-review run whose PLAN never reached a terminal (no plan events at all)."""
+    cfg = Config.from_dict({"final_review": False})
+    run = init_run("sym", cfg, base_dir=tmp_path, workflow="pr-review")
+    dag = _dag(status="pending")
+    run.save_dag(dag.to_dict())
+    return run, dag, cfg
+
+
+def test_workflow_issues_flags_arbitrary_residue_when_plan_missing(tmp_path):
+    run, dag, cfg = _symmetric_no_plan(tmp_path)
+    _forge_objection_gate(run, "sidequest", "gate_capped", [_obj("A:S1", "blocker")],
+                          {"artifact_sha256": "e" * 64, "dag_sha256": dag_sha256(dag),
+                           "node_sha256": "f" * 64})
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "missing" and "PLAN" in i.message for i in issues)
+    assert any(i.kind == "invalid" and "sidequest" in i.message for i in issues)
+
+
+def test_workflow_issues_flags_ghost_dep_residue_when_plan_missing(tmp_path):
+    run, dag, cfg = _symmetric_no_plan(tmp_path)
+    _forge_objection_gate(run, "dep:ghost", "gate_proceeded_with_flags", [_obj("A:G1", "blocker")],
+                          {"artifact_sha256": "e" * 64, "dag_sha256": dag_sha256(dag),
+                           "node_sha256": "f" * 64})
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "invalid" and "ghost" in i.message for i in issues)
+
+
+def test_workflow_issues_flags_disabled_final_residue_when_plan_missing(tmp_path):
+    run, dag, cfg = _symmetric_no_plan(tmp_path)  # final_review off
+    run.append("symmetric_verdict", gate="final", round=1, outcome="CONSENSUS", objections=[],
+               candidate={"summary": "", "findings": []},
+               artifact_sha256="e" * 64, dag_sha256=dag_sha256(dag))
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "invalid" and "final" in i.message.lower() for i in issues)
+
+
+def test_workflow_issues_flags_disabled_final_terminal_when_plan_missing(tmp_path):
+    run, dag, cfg = _symmetric_no_plan(tmp_path)  # final_review off
+    fb = {"artifact_sha256": "e" * 64, "dag_sha256": dag_sha256(dag)}
+    run.append("symmetric_verdict", gate="final", round=1, outcome="CONSENSUS", objections=[],
+               candidate={"summary": "", "findings": []}, **fb)
+    run.append("accepted_finding_set", gate="final", round=1,
+               payload={"summary": "", "findings": []}, **fb)
+    run.append("gate_consensus", gate="final", round=1, **fb)
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "invalid" and "final" in i.message.lower() for i in issues)
+
+
+# --- round-8 F4: decision outcome must match its terminal (dep/final trio) -----------------------
+
+def _find_ev(events, event, gate):
+    return next(e for e in events if e.get("event") == event and e.get("gate") == gate)
+
+
+def test_workflow_issues_flags_consensus_terminal_with_proceed_verdict(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    events = run.read_events()
+    _find_ev(events, "symmetric_verdict", "dep:a")["outcome"] = "PROCEED_WITH_FLAGS"
+    issues = workflow_issues(events, dag, cfg)
+    assert any(i.kind == "invalid" and "dep:a" in i.message for i in issues)
+
+
+def test_workflow_issues_flags_consensus_terminal_with_changes_verdict(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    events = run.read_events()
+    _find_ev(events, "symmetric_verdict", "dep:a")["outcome"] = "CHANGES"
+    issues = workflow_issues(events, dag, cfg)
+    assert any(i.kind == "invalid" and "dep:a" in i.message for i in issues)
+
+
+def test_workflow_issues_flags_proceeded_terminal_with_consensus_verdict(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    events = run.read_events()
+    term = _find_ev(events, "gate_consensus", "dep:a")
+    term["event"] = "gate_proceeded_with_flags"
+    term["open_findings"] = []
+    issues = workflow_issues(events, dag, cfg)
+    assert any(i.kind == "invalid" and "dep:a" in i.message for i in issues)
+
+
+# --- round-8 F1: decision objections must be blocking and match the terminal's open_findings -----
+
+def test_workflow_issues_flags_proceeded_with_only_nonblocking_objection(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    events = run.read_events()
+    sv = _find_ev(events, "symmetric_verdict", "dep:a")
+    sv["outcome"] = "PROCEED_WITH_FLAGS"
+    sv["objections"] = [_obj("A:m", "minor")]
+    acc = _find_ev(events, "accepted_finding_set", "dep:a")
+    acc["accepted_with_flags"] = True
+    acc["open_objections"] = ["A:m"]
+    term = _find_ev(events, "gate_consensus", "dep:a")
+    term["event"] = "gate_proceeded_with_flags"
+    term["open_findings"] = ["A:m"]
+    issues = workflow_issues(events, dag, cfg)
+    assert any(i.kind == "invalid" and "dep:a" in i.message for i in issues)
+
+
+def test_workflow_issues_flags_consensus_decision_with_objections(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    events = run.read_events()
+    _find_ev(events, "symmetric_verdict", "dep:a")["objections"] = [_obj("A:x", "blocker")]
+    issues = workflow_issues(events, dag, cfg)
+    assert any(i.kind == "invalid" and "dep:a" in i.message for i in issues)
+
+
+def test_workflow_issues_flags_proceeded_open_findings_mismatch(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    events = run.read_events()
+    sv = _find_ev(events, "symmetric_verdict", "dep:a")
+    sv["outcome"] = "PROCEED_WITH_FLAGS"
+    sv["objections"] = [_obj("A:b", "blocker")]
+    acc = _find_ev(events, "accepted_finding_set", "dep:a")
+    acc["accepted_with_flags"] = True
+    acc["open_objections"] = ["A:b"]
+    term = _find_ev(events, "gate_consensus", "dep:a")
+    term["event"] = "gate_proceeded_with_flags"
+    term["open_findings"] = ["A:DIFFERENT"]  # does not match the decision's objection ids
+    issues = workflow_issues(events, dag, cfg)
+    assert any(i.kind == "invalid" and "dep:a" in i.message for i in issues)
+
+
+def test_workflow_issues_flags_proceeded_nonblocking_under_custom_severities(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    cfg = Config.from_dict({"final_review": False, "blocking_severities": ["blocker"]})
+    events = run.read_events()
+    sv = _find_ev(events, "symmetric_verdict", "dep:a")
+    sv["outcome"] = "PROCEED_WITH_FLAGS"
+    sv["objections"] = [_obj("A:maj", "major")]  # major is NOT blocking here
+    acc = _find_ev(events, "accepted_finding_set", "dep:a")
+    acc["accepted_with_flags"] = True
+    acc["open_objections"] = ["A:maj"]
+    term = _find_ev(events, "gate_consensus", "dep:a")
+    term["event"] = "gate_proceeded_with_flags"
+    term["open_findings"] = ["A:maj"]
+    issues = workflow_issues(events, dag, cfg)
+    assert any(i.kind == "invalid" and "dep:a" in i.message for i in issues)

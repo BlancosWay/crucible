@@ -331,6 +331,14 @@ _TERMINAL_EVENTS = ("gate_consensus", "gate_proceeded_with_flags", "gate_capped"
 # every other gate's events are ignored, but no OTHER protocol event of the same gate may intervene.
 _PROTOCOL_EVENTS = ("symmetric_verdict", "accepted_finding_set", *_TERMINAL_EVENTS)
 
+# The symmetric_verdict.outcome that certifies each terminal event. A terminal is only legitimate
+# when its terminal-bound decision carries the matching outcome (round-8 F4).
+_TERMINAL_OUTCOME = {
+    "gate_consensus": "CONSENSUS",
+    "gate_proceeded_with_flags": "PROCEED_WITH_FLAGS",
+    "gate_capped": "CAPPED",
+}
+
 # Resolver issue reasons (stable, human-readable fragments the workflow layer prefixes with the gate).
 _ORPHAN_WITHOUT_TERMINAL = ("records an accepted finding set with no advancing terminal "
                             "(orphan/pre-terminal, not accepted state)")
@@ -421,10 +429,141 @@ def resolve_gate_acceptance(events: list[dict[str, Any]], gate: str) -> GateAcce
             or event_bindings(events[decision_idx]) != want_bind):
         return _result(None, terminal_idx, _NO_MATCHING_DECISION)
 
+    # (4) The decision's OUTCOME must certify THIS advancing terminal (round-8 F4): a CHANGES/CAPPED/
+    #     wrong advancing outcome trio has valid STRUCTURE but never certifies an accepted set. The
+    #     decision-semantics violation itself is reported by the shared :func:`symmetric_decision_issues`
+    #     validator; here we only ensure such a trio yields NO accepted state and is not counted as an
+    #     orphan set (avoiding a duplicate diagnostic).
+    if events[decision_idx].get("outcome") != _TERMINAL_OUTCOME.get(events[terminal_idx].get("event")):
+        return GateAcceptance(gate, None, terminal_idx, (), ())
+
     # Valid trio. Any OTHER accepted set for the gate is post-terminal residue, never accepted state.
     orphans = tuple(i for i in accepted_all if i != accepted_idx)
     issues = (_POST_TERMINAL_RESIDUE,) if orphans else ()
     return GateAcceptance(gate, accepted_idx, terminal_idx, orphans, issues)
+
+
+def _terminal_bound_decision_index(
+    events: list[dict[str, Any]], gate: str
+) -> tuple[int | None, int | None, str | None, int | None]:
+    """``(decision_index, terminal_index, terminal_event, accepted_index)`` for ``gate``'s
+    authoritative (last) terminal — the ONE place pairing a terminal with the symmetric_verdict bound
+    to it, shared by accepted-state resolution, PLAN attestation, and objection projection.
+
+    For an ADVANCING terminal immediately preceded (in the gate's protocol subsequence) by an
+    ``accepted_finding_set`` (a dependency/FINAL trio), the decision is the event before that set;
+    otherwise (a PLAN advance with no accepted set, or a CAPPED terminal) the decision is the event
+    immediately before the terminal. The decision must be a ``symmetric_verdict`` echoing the
+    terminal's round + bindings, else ``decision_index`` is ``None`` (a bare terminal, a
+    ``critic_verdict``, or a mismatched verdict). ``terminal_index``/``terminal_event`` are ``None``
+    only when the gate has no terminal at all. Pure; never raises.
+    """
+    protocol = [i for i, e in enumerate(events)
+                if e.get("gate") == gate and e.get("event") in _PROTOCOL_EVENTS]
+    terminals = [i for i in protocol if events[i].get("event") in _TERMINAL_EVENTS]
+    if not terminals:
+        return (None, None, None, None)
+    terminal_idx = terminals[-1]
+    term_event = events[terminal_idx].get("event")
+    tpos = protocol.index(terminal_idx)
+    accepted_idx: int | None = None
+    decision_pos = tpos - 1
+    if (term_event in _ADVANCE_TERMINALS and tpos >= 1
+            and events[protocol[tpos - 1]].get("event") == "accepted_finding_set"):
+        accepted_idx = protocol[tpos - 1]
+        decision_pos = tpos - 2
+    if decision_pos < 0 or events[protocol[decision_pos]].get("event") != "symmetric_verdict":
+        return (None, terminal_idx, term_event, accepted_idx)
+    decision_idx = protocol[decision_pos]
+    if (events[decision_idx].get("round") != events[terminal_idx].get("round")
+            or event_bindings(events[decision_idx]) != event_bindings(events[terminal_idx])):
+        return (None, terminal_idx, term_event, accepted_idx)
+    return (decision_idx, terminal_idx, term_event, accepted_idx)
+
+
+def symmetric_decision_issues(
+    events: list[dict[str, Any]], gate: str, cfg: Config | None = None
+) -> list[str]:
+    """Validate the SEMANTICS of ``gate``'s terminal-bound symmetric decision (round-8 F1/F4). The
+    shared terminal-decision validator: workflow validation, accepted-state resolution, completeness,
+    and result projection all agree on what a legitimate decision looks like, so they never diverge.
+
+    Returns stable issue fragments (the workflow layer prefixes them with the gate). Empty when the
+    gate has no terminal (in progress) OR no terminal-bound decision — the ACCEPTED-SET resolver owns
+    the "no decision" report for a dependency/FINAL trio, and the PLAN-attestation check owns it for
+    ``plan``, so this validator never duplicates that. When a bound decision exists it must:
+
+    - carry the outcome that certifies its terminal (``CONSENSUS``/``PROCEED_WITH_FLAGS``/``CAPPED``);
+    - list structurally valid, unique objections — and, when ``cfg`` is given, every objection's
+      severity must be in ``cfg.blocking_severities`` (a decision only ever carries BLOCKING objections);
+    - carry NO objections for ``CONSENSUS`` and at least one for ``PROCEED_WITH_FLAGS``/``CAPPED``;
+    - for a proceeded/capped terminal, have ``open_findings`` equal to the objection ids exactly.
+
+    ``cfg`` is optional so the accepted-state resolver can reuse the structural (cfg-free) subset.
+    Pure; never raises.
+    """
+    decision_idx, terminal_idx, term_event, _accepted = _terminal_bound_decision_index(events, gate)
+    if terminal_idx is None or decision_idx is None:
+        return []
+    decision = events[decision_idx]
+    terminal = events[terminal_idx]
+    issues: list[str] = []
+    expected = _TERMINAL_OUTCOME.get(term_event)
+    if decision.get("outcome") != expected:
+        issues.append(
+            f"terminal-bound decision outcome {decision.get('outcome')!r} does not certify a "
+            f"{term_event!r} terminal (expected {expected!r})")
+    raw = decision.get("objections", [])
+    obj_ids: list[str] = []
+    if not isinstance(raw, list):
+        issues.append("terminal-bound decision objections is not a list")
+    else:
+        blocking = set(cfg.blocking_severities) if cfg is not None else None
+        for objection in raw:
+            if not isinstance(objection, dict):
+                issues.append("terminal-bound decision has a non-object objection")
+                continue
+            oid = objection.get("id")
+            if isinstance(oid, str) and oid:
+                obj_ids.append(oid)
+            else:
+                issues.append("terminal-bound decision has an objection with no id")
+            if blocking is not None and objection.get("severity") not in blocking:
+                issues.append(
+                    f"terminal-bound objection {oid!r} severity {objection.get('severity')!r} is not "
+                    f"a configured blocking severity {sorted(blocking)}")
+        dupes = sorted({i for i in obj_ids if obj_ids.count(i) > 1})
+        if dupes:
+            issues.append(f"terminal-bound decision has duplicate objection ids {dupes}")
+    if expected == "CONSENSUS" and obj_ids:
+        issues.append("a CONSENSUS decision must carry no open objections")
+    if expected in ("PROCEED_WITH_FLAGS", "CAPPED") and not obj_ids:
+        issues.append(f"a {expected} decision must carry at least one blocking objection")
+    if term_event in ("gate_proceeded_with_flags", "gate_capped"):
+        open_ids = terminal.get("open_findings")
+        if not isinstance(open_ids, list) or sorted(str(x) for x in open_ids) != sorted(obj_ids):
+            issues.append(
+                "terminal open_findings do not correspond exactly to the decision's objection ids")
+    return issues
+
+
+def symmetric_plan_attestation_issues(
+    events: list[dict[str, Any]], cfg: Config | None = None
+) -> list[str]:
+    """The symmetric PLAN gate's attestation issues (round-8 F3). A symmetric PLAN advancing terminal
+    must be backed by a terminal-bound TWO-PEER ``symmetric_verdict`` — never a bare terminal, a
+    build-style ``critic_verdict``, or a verdict with a different round/bindings — whose decision
+    semantics are consistent (:func:`symmetric_decision_issues`). Empty when there is no advancing
+    PLAN terminal (a missing/capped PLAN is handled by the PLAN phase checks). Symmetric callers only;
+    the asymmetric build PLAN is untouched. Pure; never raises.
+    """
+    decision_idx, terminal_idx, term_event, _acc = _terminal_bound_decision_index(events, "plan")
+    if terminal_idx is None or term_event not in _ADVANCE_TERMINALS:
+        return []
+    if decision_idx is None:
+        return ["accepted terminal is not backed by a terminal-bound symmetric_verdict "
+                "(a bare terminal, a critic_verdict, or a verdict with a different round/bindings)"]
+    return symmetric_decision_issues(events, "plan", cfg)
 
 
 def _last_terminal(
@@ -696,7 +835,8 @@ def _ordered_unique_gates(events: list[dict[str, Any]]) -> list[str]:
 
 
 def unresolved_objections(
-    events: list[dict[str, Any]], dag: Any = None, *, final_enabled: bool = True
+    events: list[dict[str, Any]], dag: Any = None, *, cfg: Config | None = None,
+    final_enabled: bool = True
 ) -> list[dict[str, Any]]:
     """The namespaced peer objections carried UNRESOLVED past a proceeded-with-flags or capped
     symmetric gate — the peers' still-open disputes with the candidate, taken from the
@@ -707,6 +847,12 @@ def unresolved_objections(
     decision that actually led to the terminal. A ``symmetric_verdict`` appended AFTER the terminal is
     forged/crash residue (:func:`gate_post_terminal_protocol_indices` flags it invalid history) and is
     never selected, so it can neither erase the terminal's blocker nor inflate it.
+
+    When ``cfg`` is given the retained objections are DEFENSIVELY filtered to those whose severity is
+    in ``cfg.blocking_severities`` (round-8 F1): "unresolved objections" are unresolved BLOCKING
+    objections, so a forged terminal-bound verdict carrying nonblocking objections can never inflate
+    the recommendation even if some earlier guard were bypassed. Without ``cfg`` the collection is
+    unfiltered (the legacy best-effort partial-helper contract).
 
     Two calling modes with DELIBERATELY different scope contracts (mirroring
     :func:`accepted_findings`):
@@ -720,6 +866,7 @@ def unresolved_objections(
       proceeded gate in log order, WITHOUT scope validation — it cannot know the tree, so it never
       fails closed on scope.
     """
+    blocking = set(cfg.blocking_severities) if cfg is not None else None
     out_of_scope = (set(out_of_scope_protocol_gates(events, dag, final_enabled=final_enabled))
                     if dag is not None else set())
     out: list[dict[str, Any]] = []
@@ -743,9 +890,13 @@ def unresolved_objections(
                     and event_bindings(e) == want_bind):
                 bound = e
         if bound is not None:
-            out.extend(o for o in bound.get("objections", []) if isinstance(o, dict))
+            candidates: list[dict[str, Any]] = [o for o in bound.get("objections", [])
+                                                if isinstance(o, dict)]
         else:  # pragma: no cover - a terminal always follows its bound symmetric_verdict in practice
-            out.extend({"id": oid} for oid in terminal.get("open_findings", []))
+            candidates = [{"id": oid} for oid in terminal.get("open_findings", [])]
+        if blocking is not None:
+            candidates = [o for o in candidates if o.get("severity") in blocking]
+        out.extend(candidates)
     return out
 
 
@@ -783,7 +934,7 @@ def review_result(
     """
     final_set = accepted_finding_set_for_gate(events, "final") if cfg.final_review else None
     effective = final_set if final_set is not None else accepted_findings(events, dag)
-    objections = unresolved_objections(events, dag, final_enabled=cfg.final_review)
+    objections = unresolved_objections(events, dag, cfg=cfg, final_enabled=cfg.final_review)
     result: dict[str, Any] = {"workflow": workflow}
     if workflow == "pr-review":
         result["recommendation"] = _pr_recommendation(effective.findings, objections, cfg)

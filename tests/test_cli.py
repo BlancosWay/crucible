@@ -2788,6 +2788,48 @@ def test_result_commands_reject_mis_scoped_dependency_finding(tmp_path):
         assert r.returncode != 0, command
 
 
+def test_result_commands_reject_bare_symmetric_plan(tmp_path):
+    # Round-8 F3: strip the two-peer symmetric_verdict backing the PLAN terminal, leaving a bare
+    # gate_consensus. A symmetric PLAN terminal must be attested by a terminal-bound symmetric_verdict,
+    # so both Finish-time result commands must fail closed.
+    run_dir = _complete_one_node_symmetric(tmp_path, "auth",
+                                           findings=[_accepted_finding("dep:auth", "F1", "major")])
+
+    def _strip_plan_verdict(records):
+        records[:] = [r for r in records
+                      if not (r.get("event") == "symmetric_verdict" and r.get("gate") == "plan")]
+    _rewrite_events(run_dir, _strip_plan_verdict)
+    for command in ("accepted-findings", "review-result"):
+        r = _run([command, "--run", run_dir])
+        assert r.returncode != 0, command
+
+
+def test_review_result_rejects_nonblocking_proceeded_objection(tmp_path):
+    # Round-8 F1: a proceed-with-flags dep gate whose terminal-bound verdict is forged to carry only
+    # a nonblocking (minor) objection. review-result must fail closed on the inconsistent history
+    # rather than fold it into an unresolved-blocker REQUEST_CHANGES.
+    run_dir = _init_symmetric_cfg(tmp_path, {
+        "final_review": False, "on_cap": "proceed_with_flags", "max_rounds_dep": 1})
+    _load(run_dir, tmp_path, {"auth": "pending"})
+    _settle_symmetric_plan(run_dir, tmp_path)
+    _start(run_dir, "auth")
+    r = _symmetric_dep_verdict(
+        run_dir, tmp_path, "auth", candidate={"summary": "auth", "findings": []},
+        peer_a={"verdict": "REQUEST_CHANGES", "objections": [_objection("O1", "blocker")]})
+    assert r.stdout.strip() == "PROCEED_WITH_FLAGS", r.stdout + r.stderr
+    assert _run(["set-status", "--run", run_dir, "--node", "auth",
+                 "--status", "done"]).returncode == 0
+
+    def _downgrade(records):
+        for rec in records:
+            if (rec.get("event") == "symmetric_verdict" and rec.get("gate") == "dep:auth"):
+                for o in rec.get("objections", []):
+                    o["severity"] = "minor"
+    _rewrite_events(run_dir, _downgrade)
+    r = _run(["review-result", "--run", run_dir])
+    assert r.returncode != 0, r.stdout
+
+
 def test_symmetric_verdict_final_rejects_dropped_dependency_finding(tmp_path):
     run_dir = _complete_one_node_symmetric(tmp_path, "auth", final_review=True,
                                            findings=[_accepted_finding("dep:auth", "F1", "major")])
