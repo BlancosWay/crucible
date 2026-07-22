@@ -269,9 +269,12 @@ Add GitHub metadata tests preserving `baseRefOid`, `headRefOid`, `headRepository
 fetches plus the base repo's exact-OID `compare/<baseRefOid>...<headRefOid>` payload; assert the patch
 is derived from the merge-base→head snapshots (a base-only commit after the fork never appears), the
 recorded `merge_base_sha` is the compare `merge_base_commit.sha`, and a mismatched compare
-(`base_commit.sha` != `baseRefOid`, a missing/invalid merge base, or a disagreeing file list) is
-rejected; reject any changed PR number/URL/title/body/files/base/head repository/ref/OID/cross-repository
-flag and accept a stable cross-fork tuple. Add diff-file patch-only tests.
+(`base_commit.sha` != `baseRefOid`, or a missing/invalid merge base) is
+rejected; `changed_files` is derived **solely** from the snapshot patch (the paginated/rename-detected
+metadata/compare `files` views are informational and never gate it — assert absent/truncated/disagreeing
+file lists are tolerated and a rename's old+new pair is derived). Reject any changed PR
+number/URL/title/body/base/head repository/ref/OID/cross-repository flag (but **not** a changed file
+list, which is not part of identity) and accept a stable cross-fork tuple. Add diff-file patch-only tests.
 
 - [ ] **Step 5: Implement normalization helpers**
 

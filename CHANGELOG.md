@@ -93,6 +93,20 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
   explanations the same way. Standard `TODO`/`FIXME`/`NOTE`/`HACK` tags are unaffected. Prompt text
   only; no CLI/behavior change. Guarded by `tests/test_references.py`.
 
+### Fixed
+- **`pr-review` trusts the snapshot-derived changed-file set (no false rejections on renames / large
+  PRs).** GitHub PR normalization now derives `changed_files` **solely** from the immutable
+  merge-base→head snapshot patch and no longer requires it to equal GitHub's own `files` view. That view
+  (the `gh pr view --json files` metadata and the compare `files` list) paginates/truncates on large PRs
+  and applies rename detection — reporting a rename as one new path where the historyless snapshot diff,
+  without rename detection, shows the old+new pair — so the previous strict-equality gate falsely
+  rejected legitimate PRs. The changed-file list is also removed from the immutable before/after identity
+  tuple (title/body still trigger a retry; a paginated/reordered/rename-detected `files` drift no longer
+  does), and compare-metadata validation still proves `base_commit.sha == baseRefOid` with a valid
+  `merge_base_commit.sha` while tolerating an absent/truncated compare `files` list. The exact-OID
+  compare/merge-base archive protocol is unchanged. Guarded by `tests/test_target.py` and
+  `tests/test_report.py`.
+
 ### Security
 - **Gate decisions are content-bound and phase-ordered (schema v2), not eyeballed.** The CLI now
   binds every gate decision to the exact reviewed artifact via canonical SHA-256 content bindings the

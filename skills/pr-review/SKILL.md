@@ -71,6 +71,10 @@ a **fresh run**). Full per-source commands live in the "Input normalization" sec
   `repository@headRefOid`) — **never** a server-recomputed PR diff or a caller-supplied patch — so the
   target is a pure function of the pinned merge-base/head OIDs and a base-only commit made on the base
   branch **after** the fork point can never appear as a reverse change (the ABA race is eliminated).
+  The recorded `changed_files` set is derived **solely** from this snapshot patch; GitHub's own `files`
+  view (PR metadata + compare) is informational — it paginates/truncates on large PRs and rename-detects
+  (a rename shows as one new path where the historyless snapshot diff yields the old+new pair), so it is
+  **never** required to equal the derived set and is **not** part of the immutable identity.
   Cross-fork exact head OIDs are supported by the compare endpoint (use OIDs, never branch names). Any
   failure — a non-zero `gh`/parse, a malformed/mismatched compare payload (its `base_commit.sha` must
   equal `baseRefOid`), or a metadata drift between the two reads (an identity field moved, i.e. the PR

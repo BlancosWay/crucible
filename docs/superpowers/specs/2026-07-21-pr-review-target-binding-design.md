@@ -158,8 +158,11 @@ the head `repository@headRefOid` snapshot (`head_archive`) — never accepted fr
 diff, a base-tip two-dot diff, or any caller-supplied patch — so the target is a pure function of the
 pinned merge-base/head OIDs, a base-only commit made on the base branch **after** the fork point can
 never appear as a reverse change, and the PR-state / ABA race is eliminated. Cross-fork exact head OIDs
-are supported by the compare endpoint (OIDs, never branch names). `changed_files` is derived from that
-patch, and a disagreeing metadata or compare file list is rejected. The acquisition fails **closed**
+are supported by the compare endpoint (OIDs, never branch names). `changed_files` is derived **solely**
+from that snapshot patch. GitHub's own `files` views (PR metadata + compare) are informational: they
+paginate/truncate on large PRs and apply rename detection (a rename becomes one new path where the
+historyless snapshot diff, without rename detection, shows the old+new pair), so they are **never**
+required to equal the derived set and a disagreement is not a rejection. The acquisition fails **closed**
 (see [Error handling](#error-handling)): each `gh` read, the compare fetch, the merge-base parse, and
 both archive fetches are error-checked and normalization proceeds only after all of them succeed, so a
 failed fetch or a mismatched compare (its `base_commit.sha` must equal `baseRefOid`) can never feed an
@@ -257,9 +260,10 @@ crucible materialize-target --run RUN --archive SOURCE.tar.gz
   `compare/<baseRefOid>...<headRefOid>` endpoint reports via `--compare-metadata`) and the
   `--head-archive` (head `repository@headRefOid`) codeload snapshots — never a caller-supplied diff or a
   base-tip two-dot diff, so a base-only commit after the fork never appears as a reverse change; every
-  immutable identity field must match between the two reads, the compare `base_commit.sha` must equal
-  `baseRefOid` with a valid `merge_base_commit.sha`, and the derived `changed_files` must agree with the
-  metadata/compare file lists or the target is rejected so the orchestrator can retry;
+  immutable identity field must match between the two reads (the changed-file list is **not** one of
+  them — GitHub's `files` view paginates/rename-detects), the compare `base_commit.sha` must equal
+  `baseRefOid` with a valid `merge_base_commit.sha`, and `changed_files` is derived **solely** from the
+  snapshot patch (the metadata/compare file lists are informational and never gate it);
 - `local` takes one `--range BASE..HEAD|BASE...HEAD` (never separate base/head flags), resolves refs
   and merge base with argument-vector `git` subprocesses (never `shell=True`), and emits the
   merge-base-to-head patch;

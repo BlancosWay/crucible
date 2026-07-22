@@ -1637,6 +1637,17 @@ def test_report_renders_github_target_identity(tmp_path):
     assert sha in target  # the authoritative target hash is rendered
 
 
+def test_report_renders_snapshot_derived_changed_files(tmp_path):
+    # Round-2 F1: the report surfaces the snapshot-DERIVED changed-files list verbatim — including a
+    # rename's old+new pair (which GitHub's rename-detected `files` view would collapse to a single
+    # path). The report never re-derives or filters the list against any external file view.
+    manifest = dict(_GITHUB_TARGET, changed_files=["src/new.py", "src/old.py"], diff_sha256="d" * 64)
+    run, _ = _pr_review_with_target(tmp_path, manifest)
+    target = _section(render_markdown(run), "Review target")
+    assert "Changed files (2)" in target
+    assert "src/new.py" in target and "src/old.py" in target
+
+
 def test_report_renders_local_range_target(tmp_path):
     run, _ = _pr_review_with_target(tmp_path, _LOCAL_TARGET)
     target = _section(render_markdown(run), "Review target")

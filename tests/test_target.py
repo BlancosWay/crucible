@@ -940,22 +940,20 @@ def test_github_patch_is_pure_function_of_snapshots_not_caller(tmp_path):
     assert diff_b != diff_a and target_b.diff_sha256 != target_a.diff_sha256
 
 
-def test_github_normalization_derives_changed_files_and_rejects_metadata_disagreement(tmp_path):
-    # F1: changed_files is DERIVED from the snapshots; metadata files that disagree are rejected rather
-    # than trusted (a tampered/ stale file list can never become the authoritative changed-files set).
+def test_github_normalization_changed_files_come_from_snapshot_not_metadata(tmp_path):
+    # Round-2 F1: changed_files is derived SOLELY from the merge-base->head snapshot patch. GitHub's own
+    # `files` view (PR metadata + compare) is informational/untrusted — it paginates/truncates on large
+    # PRs and applies rename detection — so a metadata/compare file list that DISAGREES with the snapshot
+    # is TOLERATED (never a false rejection) and never becomes the authoritative changed-files set.
     merge_base = _codeload_archive(tmp_path / "merge-base.tar", "base-repo-x",
                                    {"src/app.py": b"a\n"})
     head = _codeload_archive(tmp_path / "head.tar", "fork-repo-y",
                              {"src/app.py": b"b\n"})
-    good = _gh_metadata(files=[{"path": "src/app.py"}])
+    # Both the metadata and the compare claim a completely different file; the snapshot is authoritative.
+    lying = _gh_metadata(files=[{"path": "src/lies.py"}])
     target, _diff = normalize_github_target(
-        good, good, _compare_metadata(files=["src/app.py"]), merge_base, head)
-    assert target.changed_files == ("src/app.py",)
-
-    lying = _gh_metadata(files=[{"path": "src/other.py"}])
-    with pytest.raises(ValueError, match="disagree"):
-        normalize_github_target(
-            lying, lying, _compare_metadata(files=["src/other.py"]), merge_base, head)
+        lying, lying, _compare_metadata(files=["src/also-lies.py"]), merge_base, head)
+    assert target.changed_files == ("src/app.py",)  # the snapshot content delta, not the lying lists
 
 
 @pytest.mark.parametrize("mutate,match", [
@@ -966,14 +964,12 @@ def test_github_normalization_derives_changed_files_and_rejects_metadata_disagre
     (lambda c: c["merge_base_commit"].__setitem__("sha", ""), "merge_base"),
     (lambda c: c["merge_base_commit"].__setitem__("sha", "3" * 39), "merge_base"),
     (lambda c: c["merge_base_commit"].__setitem__("sha", "Z" * 40), "merge_base"),
-    (lambda c: c.__setitem__("files", [{"filename": "src/other.py", "status": "modified"}]),
-     "disagree"),
-    (lambda c: c.pop("files"), "files"),
 ])
 def test_github_normalization_rejects_malformed_compare_metadata(tmp_path, mutate, match):
-    # F1: the compare payload is validated fail-closed — base_commit.sha must equal baseRefOid, the
-    # merge_base_commit.sha must be a valid 40 lowercase hex, and the compare file list must agree with
-    # the metadata/derived file set. Any drift rejects the whole target so the orchestrator can retry.
+    # F1: the compare payload is validated fail-closed on the two IMMUTABLE facts it establishes — the
+    # base_commit.sha must equal baseRefOid and the merge_base_commit.sha must be a valid 40 lowercase
+    # hex fork point. Any drift there rejects the whole target so the orchestrator can retry. (The
+    # compare `files` list is informational only and is covered by the tolerance tests, not here.)
     merge_base = _codeload_archive(tmp_path / "merge-base.tar", "base-repo-1", {"src/a.py": b"o\n"})
     head = _codeload_archive(tmp_path / "head.tar", "fork-repo-2", {"src/a.py": b"n\n"})
     cmp = _compare_metadata()
@@ -1019,10 +1015,11 @@ def test_github_normalization_same_repo_pr_is_not_cross(tmp_path):
     ("headRefName", "other"),
     ("headRepository", {"nameWithOwner": "fork2/repo"}),
     ("isCrossRepository", False),
-    ("files", [{"path": "src/b.py"}]),
 ])
 def test_github_normalization_rejects_before_after_mismatch(tmp_path, field, value):
     # Identity drift is detected BEFORE any archive is extracted, so the archives are never even read.
+    # The changed-file list is deliberately NOT an identity field (see the files-drift tolerance test):
+    # only PR number/URL/title/body, base/head refs+OIDs, head repository, and cross-repo flag gate here.
     merge_base = _codeload_archive(tmp_path / "merge-base.tar", "base-repo-1", {"src/a.py": b"o\n"})
     head = _codeload_archive(tmp_path / "head.tar", "fork-repo-2", {"src/a.py": b"n\n"})
     before = _gh_metadata()
@@ -1032,8 +1029,10 @@ def test_github_normalization_rejects_before_after_mismatch(tmp_path, field, val
 
 
 def test_github_normalization_accepts_stable_identity_reordered_files(tmp_path):
-    # Same file set in a different list order is still stable identity (files are order-normalized), and
-    # the derived changed-files set (from the snapshots) must match that normalized metadata set.
+    # Same identity in a different `files` list order is still stable identity (files are not part of the
+    # identity tuple at all), and the derived changed-files set comes from the snapshots — here both
+    # src/a.py and src/b.py changed, so the snapshot-derived set is (src/a.py, src/b.py) regardless of
+    # the metadata/compare file order.
     merge_base = _codeload_archive(tmp_path / "merge-base.tar", "base-repo-1",
                                    {"src/a.py": b"a1\n", "src/b.py": b"b1\n"})
     head = _codeload_archive(tmp_path / "head.tar", "fork-repo-2",
@@ -1043,6 +1042,84 @@ def test_github_normalization_accepts_stable_identity_reordered_files(tmp_path):
     cmp = _compare_metadata(files=["src/b.py", "src/a.py"])
     target, _diff = normalize_github_target(before, after, cmp, merge_base, head)
     assert target.changed_files == ("src/a.py", "src/b.py")
+
+
+def test_github_normalization_rename_derives_old_and_new_paths(tmp_path):
+    # Round-2 F1 regression: a rename the snapshot tree diff does NOT coalesce (dissimilar content, or —
+    # in the field — a large diff where git skips inexact rename detection). It yields BOTH the deleted
+    # old path and the added new path, while GitHub's rename-detected `files` view reports only the new
+    # path. The earlier strict-equality gate FALSELY rejected this normal PR — now the snapshot-derived
+    # old+new set is accepted and recorded, and the new-only file list never gates.
+    merge_base = _codeload_archive(tmp_path / "merge-base.tar", "base-repo-r",
+                                   {"src/old.py": b"def legacy():\n    return compute_old_value()\n"})
+    head = _codeload_archive(tmp_path / "head.tar", "fork-repo-r",
+                             {"src/new.py": b"class Rewritten:\n    field = 42\n"})
+    md = _gh_metadata(files=[{"path": "src/new.py"}])       # GitHub rename detection -> new path only
+    cmp = _compare_metadata(files=["src/new.py"])           # compare rename detection -> new path only
+    target, diff = normalize_github_target(md, md, cmp, merge_base, head)
+    assert target.changed_files == ("src/new.py", "src/old.py")  # both paths, from the snapshot
+    text = diff.decode()
+    assert "deleted file mode" in text and "new file mode" in text
+    assert "a/src/old.py" in text and "b/src/new.py" in text
+
+
+def test_github_normalization_tolerates_absent_compare_files(tmp_path):
+    # Round-2 F1: the compare `files` list is informational — a compare payload with NO `files` key is
+    # tolerated (large-PR compare responses omit/truncate it). The base_commit/merge_base validation and
+    # the snapshot-derived patch still fully bind the target.
+    merge_base = _codeload_archive(tmp_path / "merge-base.tar", "base-repo-a", {"src/a.py": b"o\n"})
+    head = _codeload_archive(tmp_path / "head.tar", "fork-repo-b", {"src/a.py": b"n\n"})
+    cmp = _compare_metadata()
+    cmp.pop("files")
+    target, _diff = normalize_github_target(_gh_metadata(), _gh_metadata(), cmp, merge_base, head)
+    assert target.changed_files == ("src/a.py",)
+    assert target.merge_base_sha == "3" * 40
+
+
+def test_github_normalization_tolerates_truncated_file_lists(tmp_path):
+    # Round-2 F1: GitHub paginates/truncates the compare + PR `files` view on large PRs. A file list that
+    # is a strict SUBSET of the real change (truncation) must not gate — the full changed-files set comes
+    # from the snapshot patch.
+    merge_base = _codeload_archive(tmp_path / "merge-base.tar", "base-repo-a",
+                                   {"a.py": b"1\n", "b.py": b"1\n", "c.py": b"1\n"})
+    head = _codeload_archive(tmp_path / "head.tar", "fork-repo-b",
+                             {"a.py": b"2\n", "b.py": b"2\n", "c.py": b"2\n"})
+    md = _gh_metadata(files=[{"path": "a.py"}])            # truncated to 1 of 3
+    cmp = _compare_metadata(files=["a.py"])                # truncated to 1 of 3
+    target, _diff = normalize_github_target(md, md, cmp, merge_base, head)
+    assert target.changed_files == ("a.py", "b.py", "c.py")   # the full snapshot set
+
+
+def test_github_normalization_ignores_files_drift_between_reads(tmp_path):
+    # Round-2 F1: the changed-file list is NOT part of the immutable identity tuple — GitHub's `files`
+    # view can legitimately reorder/paginate/rename-detect differently between the two reads without the
+    # review target changing. A files-only drift must NOT trigger a retry; an intent (title) drift still
+    # does.
+    merge_base = _codeload_archive(tmp_path / "merge-base.tar", "base-repo-a", {"src/a.py": b"o\n"})
+    head = _codeload_archive(tmp_path / "head.tar", "fork-repo-b", {"src/a.py": b"n\n"})
+    before = _gh_metadata(files=[{"path": "src/a.py"}])
+    after = _gh_metadata(files=[{"path": "src/a.py"}, {"path": "src/late.py"}])  # moved between reads
+    target, _diff = normalize_github_target(before, after, _compare_metadata(), merge_base, head)
+    assert target.changed_files == ("src/a.py",)              # still derived from the snapshot
+    with pytest.raises(ValueError, match="changed during normalization"):
+        normalize_github_target(before, _gh_metadata(title="edited"), _compare_metadata(),
+                                merge_base, head)
+
+
+def test_github_normalization_large_paginated_file_list_uses_snapshot(tmp_path):
+    # Round-2 F1: a large PR whose GitHub compare/`files` view is PAGINATED (only the first page is
+    # present) must normalize from the snapshot, not the partial list. Shaped like pagination (many
+    # entries) without huge data — tiny file bodies.
+    base_bodies = {f"pkg/mod_{i:02d}.py": (str(i) + "\n").encode() for i in range(25)}
+    head_bodies = {p: b"new-" + c for p, c in base_bodies.items()}
+    merge_base = _codeload_archive(tmp_path / "merge-base.tar", "base-repo-a", base_bodies)
+    head = _codeload_archive(tmp_path / "head.tar", "fork-repo-b", head_bodies)
+    first_page = sorted(base_bodies)[:10]                    # GitHub returned only page 1 (10 of 25)
+    md = _gh_metadata(files=[{"path": p} for p in first_page])
+    cmp = _compare_metadata(files=first_page)
+    target, _diff = normalize_github_target(md, md, cmp, merge_base, head)
+    assert target.changed_files == tuple(sorted(base_bodies))  # all 25 from the snapshot, not 10
+    assert len(target.changed_files) == 25
 
 
 # --------------------------------------------------------------------------------------
