@@ -135,6 +135,66 @@ def _assert_source_materialization_is_executable_per_kind(section: str) -> None:
         "a bare `git archive` (ambient repo) is forbidden — archive only via `git -C \"$LOCAL_REPO\"`"
 
 
+def _assert_block_fails_closed(block: str, fetch: str, archive: str) -> None:
+    """One source-materialization block (GitHub or local) must fail CLOSED and NON-FATAL (Task 3,
+    round 3): the live `gh api ... > source.tar.gz` fetch / local `git -C ... archive` were UNCHECKED, so
+    a failed/truncated/stale archive relied on later or global shell behaviour instead of explicitly
+    switching to source-unavailable. The block must remove any stale archive BEFORE the fetch/archive,
+    default `SOURCE_AVAILABLE=no`, `if`-check the fetch/archive (never a bare command), `if`-check
+    materialize-target so it is unreachable on a failed fetch/archive, set `SOURCE_AVAILABLE=yes` only
+    after materialize succeeds, and `rm -f` the partial archive on every failure branch."""
+    folded = re.sub(r"\\\n\s*", "", block)
+    esc = re.escape(archive)
+    rm = rf"rm -f [^\n]*{esc}(?![\w.])"
+    materialize = r"PYTHONPATH=\S+ python3 -m crucible materialize-target"
+
+    assert "SOURCE_AVAILABLE=no" in folded, "must default SOURCE_AVAILABLE=no (fail closed)"
+    assert "SOURCE_AVAILABLE=yes" in folded, "must set SOURCE_AVAILABLE=yes only on success"
+
+    first_rm = re.search(rm, folded)
+    first_fetch = re.search(fetch, folded)
+    assert first_rm and first_fetch, "a stale archive must be removed and the fetch/archive attempted"
+    assert first_rm.start() < first_fetch.start(), \
+        "any stale archive must be removed BEFORE the fetch/archive"
+
+    assert re.search(rf"if\s+{fetch}", folded), \
+        "the fetch/archive must be explicitly checked (`if ...`), never unchecked"
+    assert not re.search(rf"(?m)^\s*{fetch}", folded), \
+        "the fetch/archive must not be a bare unchecked command"
+
+    assert re.search(rf"if\s+{materialize}", folded), \
+        "materialize-target must be explicitly checked (`if ...`)"
+    assert not re.search(rf"(?m)^\s*{materialize}", folded), \
+        "materialize-target must not be a bare unchecked command (would run on a failed fetch)"
+
+    assert folded.index("materialize-target") < folded.index("SOURCE_AVAILABLE=yes"), \
+        "SOURCE_AVAILABLE=yes must be set only AFTER materialize succeeds"
+    assert len(re.findall(rm, folded)) >= 2, \
+        "the partial archive must be discarded (rm -f) on failure, not left behind"
+
+
+def _assert_source_materialization_fails_closed(section: str) -> None:
+    """Both source-materialization kinds fail closed, and the section documents the NON-FATAL,
+    patch-only continuation when the snapshot is unavailable (Task 3, round 3)."""
+    blocks = _bash_blocks(section)
+    gh = [b for b in blocks if "materialize-target" in b and "gh api" in b]
+    local = [b for b in blocks if "materialize-target" in b and "git -C" in b]
+    assert len(gh) == 1 and len(local) == 1, \
+        "exactly one GitHub and one local source-materialization block are required"
+    _assert_block_fails_closed(gh[0], fetch=r"gh api", archive="source.tar.gz")
+    _assert_block_fails_closed(local[0], fetch=r'git -C "\$LOCAL_REPO" archive', archive="source.tar")
+
+    low = _flat(section)
+    assert "source_available=no" in low, \
+        "the section must document the fail-closed SOURCE_AVAILABLE=no status"
+    assert "patch-only" in low or "patch only" in low, \
+        "on a source failure the review must continue patch-only (non-fatal)"
+    assert "unverified" in low, \
+        "when source is unavailable, runtime-verified claims must be marked unverified"
+    assert any(k in low for k in ("diff-file", "diff file", "diff mode")), \
+        "the diff-file target must be covered (sets SOURCE_AVAILABLE=no, never archives)"
+
+
 def _no_negated_echo(sec: str) -> None:
     assert not re.search(r"\b(?:do not|don't|never|not)\s+echo\b", sec), \
         "each peer attestation must be required to echo the bindings, not negated"
@@ -446,6 +506,16 @@ def test_skill_materializes_pinned_source_per_kind():
     _assert_source_materialization_is_executable_per_kind(
         _section(SKILL.read_text(), "Normalize the input"))
 
+
+def test_skill_source_materialization_fails_closed():
+    # Finding (Task 3, round 3): the live `gh api ... > source.tar.gz` fetch (and the local
+    # `git -C ... archive`) were UNCHECKED — a failed/truncated/stale archive relied on later or global
+    # shell behaviour instead of explicitly switching to source-unavailable. Each kind must fail closed
+    # and NON-FATAL: stale archive removed, SOURCE_AVAILABLE default no, fetch/archive + materialize
+    # if-checked, partial archive discarded on failure, yes only on success; the review continues
+    # patch-only with source explicitly unavailable.
+    _assert_source_materialization_fails_closed(
+        _section(SKILL.read_text(), "Normalize the input"))
 
 
 def test_skill_execution_verifies_exact_head_at_recorded_sha():

@@ -332,22 +332,39 @@ All untrusted labels and intent text use existing sanitization.
 Materialization is **one-shot**, immediately after `load-target` and before any DAG/PLAN/review work,
 into the **absent** `RUN/source` (the CLI refuses a pre-existing destination). The head repository/SHA
 come **only** from `show-target`'s authoritative event payload — never an ambient archive variable —
-and wrapper stripping is derived from the target *kind*, not a caller flag.
+and wrapper stripping is derived from the target *kind*, not a caller flag. Materialization **fails
+closed and is non-fatal**: any stale archive is removed first, `SOURCE_AVAILABLE` defaults to `no`, the
+fetch/archive **and** `materialize-target` are each explicitly checked (never relying on a global
+`set -e`), any failure discards the partial archive and leaves `SOURCE_AVAILABLE=no`, and only a clean
+fetch **and** materialize set `SOURCE_AVAILABLE=yes`. Both peers receive the identical `SOURCE_AVAILABLE`
+status; when it is `no` the review stays patch-only and runtime-verified claims are treated as
+unverified (see [Error handling](#error-handling)).
 
 ### GitHub PR
 
 After loading the target, emit the authoritative loaded manifest, read the head repository/SHA from it
-(never an ambient variable), require them non-empty, download the GitHub codeload archive for that exact
-head, and materialize it:
+(never an ambient variable), require them non-empty, remove any stale archive, then fetch the GitHub
+codeload archive for that exact head and materialize it — each step explicitly checked:
 
 ```bash
 PYTHONPATH=scripts python3 -m crucible show-target --run "$RUN" > "$RUN/loaded-target.json"
 HEAD_REPOSITORY=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["head"]["repository"])' "$RUN/loaded-target.json")
 HEAD_SHA=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["head"]["sha"])' "$RUN/loaded-target.json")
 test -n "$HEAD_REPOSITORY" && test -n "$HEAD_SHA"
-gh api "repos/$HEAD_REPOSITORY/tarball/$HEAD_SHA" > "$RUN/source.tar.gz"
-PYTHONPATH=scripts python3 -m crucible materialize-target \
-  --run "$RUN" --archive "$RUN/source.tar.gz"
+rm -f "$RUN/source.tar.gz"
+SOURCE_AVAILABLE=no
+if gh api "repos/$HEAD_REPOSITORY/tarball/$HEAD_SHA" > "$RUN/source.tar.gz"
+then
+  if PYTHONPATH=scripts python3 -m crucible materialize-target \
+    --run "$RUN" --archive "$RUN/source.tar.gz"
+  then
+    SOURCE_AVAILABLE=yes
+  else
+    rm -f "$RUN/source.tar.gz"
+  fi
+else
+  rm -f "$RUN/source.tar.gz"
+fi
 ```
 
 Peers read/search `RUN/source` plus `RUN/target.diff`. They never execute files from this snapshot.
@@ -357,8 +374,9 @@ Fork heads use `head.repository` from the manifest. Unsafe archive members are n
 
 Static review uses an archive of the exact local head commit under `RUN/source`, not ambient files.
 Read the recorded repository identity + head SHA from the authoritative manifest, prove the caller's
-`$LOCAL_REPO` is that same repository **before** touching it, then archive the exact head with an
-explicit `git -C "$LOCAL_REPO"` (never ambient git) and materialize the uncompressed tar:
+`$LOCAL_REPO` is that same repository **before** touching it (these stay hard gates), remove any stale
+archive, then archive the exact head with an explicit `git -C "$LOCAL_REPO"` (never ambient git) and
+materialize the uncompressed tar — each step explicitly checked:
 
 ```bash
 PYTHONPATH=scripts python3 -m crucible show-target --run "$RUN" > "$RUN/loaded-target.json"
@@ -366,15 +384,27 @@ RECORDED_REPOSITORY=$(python3 -c 'import json,sys; print(json.load(open(sys.argv
 HEAD_SHA=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["head"]["sha"])' "$RUN/loaded-target.json")
 test -n "$RECORDED_REPOSITORY" && test -n "$HEAD_SHA"
 test "$(PYTHONPATH=scripts python3 -m crucible repository-identity --repo "$LOCAL_REPO")" = "$RECORDED_REPOSITORY"
-git -C "$LOCAL_REPO" archive --format=tar --output "$RUN/source.tar" "$HEAD_SHA"
-PYTHONPATH=scripts python3 -m crucible materialize-target \
-  --run "$RUN" --archive "$RUN/source.tar"
+rm -f "$RUN/source.tar"
+SOURCE_AVAILABLE=no
+if git -C "$LOCAL_REPO" archive --format=tar --output "$RUN/source.tar" "$HEAD_SHA"
+then
+  if PYTHONPATH=scripts python3 -m crucible materialize-target \
+    --run "$RUN" --archive "$RUN/source.tar"
+  then
+    SOURCE_AVAILABLE=yes
+  else
+    rm -f "$RUN/source.tar"
+  fi
+else
+  rm -f "$RUN/source.tar"
+fi
 ```
 
 ### Diff file
 
-No source snapshot is inferred. Review remains patch-only unless the user supplies a trusted local
-range, which becomes a separate `local-range` target.
+No source snapshot is inferred: a diff-file target sets `SOURCE_AVAILABLE=no` and never archives or
+materializes. Review remains patch-only unless the user supplies a trusted local range, which becomes a
+separate `local-range` target.
 
 ## Trusted-local execution
 
@@ -403,8 +433,14 @@ and diff-file targets remain non-executable regardless of archive availability.
   before/after metadata would otherwise let `normalize-target` hash into a target, so any failure — a
   non-zero `gh` read or a drifted identity field — discards every partial before/after/diff/target
   artifact and retries, bounded to three attempts and halting clearly on exhaustion.
-- Head archive unavailable or unsafe: continue patch-only only after clearly marking source context
-  unavailable; do not read ambient files.
+- Source snapshot unavailable or unsafe — a failed/truncated/stale `gh api` fetch or `git -C ... archive`,
+  or a rejected `materialize-target`: materialization fails **closed** and **non-fatal**, never relying on
+  a global `set -e`. Remove any stale archive before the fetch/archive; explicitly check the fetch/archive
+  **and** `materialize-target`; on any failure discard (`rm -f`) the partial archive and leave
+  `SOURCE_AVAILABLE=no`; only a clean fetch and materialize set `SOURCE_AVAILABLE=yes`. When
+  `SOURCE_AVAILABLE=no`, the review continues **patch-only** with source context unavailable: do not read
+  ambient files, do not pre-create/read a partial `RUN/source`, hand both peers the identical status, and
+  treat runtime-verified claims as **unverified**.
 - Local ref missing or ambiguous: reject before `load-target`.
 - Local base/head have no merge base: reject.
 - Manifest/path/hash mismatch: reject without appending.

@@ -95,35 +95,65 @@ PYTHONPATH=scripts python3 -m crucible show-target --run "$RUN" > "$RUN"/loaded-
 ```
 
 Then — GitHub/local only — materialize the pinned snapshot of the **exact head commit** on the path
-that matches the target kind. **GitHub PR** — parse the head repository/SHA, require them non-empty,
-download the codeload tarball of that head, and materialize exactly that `source.tar.gz`:
+that matches the target kind. Materialization **fails closed and is non-fatal**: any stale archive is
+removed first, `SOURCE_AVAILABLE` defaults to `no`, the fetch/archive **and** `materialize-target` are
+each explicitly checked, any failure discards the partial archive and leaves `SOURCE_AVAILABLE=no`
+(never relying on a global `set -e`), and only a clean fetch **and** materialize set
+`SOURCE_AVAILABLE=yes`. **GitHub PR** — parse the head repository/SHA, require them non-empty, remove
+any stale archive, then fetch the codeload tarball of that head and materialize exactly that
+`source.tar.gz`, each step checked:
 
 ```bash
 HEAD_REPOSITORY=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["head"]["repository"])' "$RUN"/loaded-target.json)
 HEAD_SHA=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["head"]["sha"])' "$RUN"/loaded-target.json)
 test -n "$HEAD_REPOSITORY" && test -n "$HEAD_SHA"
-gh api "repos/$HEAD_REPOSITORY/tarball/$HEAD_SHA" > "$RUN"/source.tar.gz
-PYTHONPATH=scripts python3 -m crucible materialize-target --run "$RUN" --archive "$RUN"/source.tar.gz
+rm -f "$RUN"/source.tar.gz
+SOURCE_AVAILABLE=no
+if gh api "repos/$HEAD_REPOSITORY/tarball/$HEAD_SHA" > "$RUN"/source.tar.gz
+then
+  if PYTHONPATH=scripts python3 -m crucible materialize-target --run "$RUN" --archive "$RUN"/source.tar.gz
+  then
+    SOURCE_AVAILABLE=yes
+  else
+    rm -f "$RUN"/source.tar.gz
+  fi
+else
+  rm -f "$RUN"/source.tar.gz
+fi
 ```
 
 **Local range** — parse the recorded repository identity + head SHA, prove the caller's `$LOCAL_REPO`
-is that same repository **before** touching it, then archive the exact head with an explicit
-`git -C "$LOCAL_REPO"` (never ambient git) and materialize exactly that uncompressed `source.tar`:
+is that same repository **before** touching it (these stay hard gates), remove any stale archive, then
+archive the exact head with an explicit `git -C "$LOCAL_REPO"` (never ambient git) and materialize
+exactly that uncompressed `source.tar`, each step checked:
 
 ```bash
 RECORDED_REPOSITORY=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["repository"])' "$RUN"/loaded-target.json)
 HEAD_SHA=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["head"]["sha"])' "$RUN"/loaded-target.json)
 test -n "$RECORDED_REPOSITORY" && test -n "$HEAD_SHA"
 test "$(PYTHONPATH=scripts python3 -m crucible repository-identity --repo "$LOCAL_REPO")" = "$RECORDED_REPOSITORY"
-git -C "$LOCAL_REPO" archive --format=tar --output "$RUN"/source.tar "$HEAD_SHA"
-PYTHONPATH=scripts python3 -m crucible materialize-target --run "$RUN" --archive "$RUN"/source.tar
+rm -f "$RUN"/source.tar
+SOURCE_AVAILABLE=no
+if git -C "$LOCAL_REPO" archive --format=tar --output "$RUN"/source.tar "$HEAD_SHA"
+then
+  if PYTHONPATH=scripts python3 -m crucible materialize-target --run "$RUN" --archive "$RUN"/source.tar
+  then
+    SOURCE_AVAILABLE=yes
+  else
+    rm -f "$RUN"/source.tar
+  fi
+else
+  rm -f "$RUN"/source.tar
+fi
 ```
 
-Give **both** peers the same `RUN/target.diff` and the pinned `RUN/source` snapshot — **never ambient**
-checkout files (which may be a different revision or lack files the change introduces). A **diff-file**
-target stays patch-only (no archive, no materialization); if the head fetch/archive/materialization
-fails, the review continues patch-only with source context explicitly marked unavailable — never
-pre-create `RUN/source`, and never fall back to ambient source.
+Hand **both** peers the same `RUN/target.diff`, the pinned `RUN/source` snapshot, and the identical
+`SOURCE_AVAILABLE` status — **never ambient** checkout files (which may be a different revision or lack
+files the change introduces). A **diff-file** target sets `SOURCE_AVAILABLE=no` and never archives or
+materializes. Whenever `SOURCE_AVAILABLE=no` — a failed/truncated/stale fetch, a rejected archive, or a
+diff-file target — the review continues **patch-only** with source context explicitly unavailable: never
+pre-create or read a partial `RUN/source`, never fall back to ambient source, and treat any
+runtime-verified claim as **unverified** (patch-only findings only).
 
 ## The symmetric round (how consensus stays equal)
 

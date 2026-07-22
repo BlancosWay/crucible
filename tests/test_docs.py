@@ -157,6 +157,57 @@ def _assert_github_acquisition_fails_closed(block: str) -> None:
         "the halt must announce the acquisition failure"
 
 
+def _assert_block_fails_closed(block: str, fetch: str, archive: str) -> None:
+    """One source-materialization block (GitHub or local) must fail CLOSED and NON-FATAL (Task 3,
+    round 3): the live `gh api ... > source.tar.gz` fetch / local `git -C ... archive` were UNCHECKED, so
+    a failed/truncated/stale archive relied on later or global shell behaviour instead of explicitly
+    switching to source-unavailable. The block must remove any stale archive BEFORE the fetch/archive,
+    default `SOURCE_AVAILABLE=no`, `if`-check the fetch/archive (never a bare command), `if`-check
+    materialize-target so it is unreachable on a failed fetch/archive, set `SOURCE_AVAILABLE=yes` only
+    after materialize succeeds, and `rm -f` the partial archive on every failure branch."""
+    folded = re.sub(r"\\\n\s*", "", block)
+    esc = re.escape(archive)
+    rm = rf"rm -f [^\n]*{esc}(?![\w.])"
+    materialize = r"PYTHONPATH=\S+ python3 -m crucible materialize-target"
+
+    assert "SOURCE_AVAILABLE=no" in folded, "must default SOURCE_AVAILABLE=no (fail closed)"
+    assert "SOURCE_AVAILABLE=yes" in folded, "must set SOURCE_AVAILABLE=yes only on success"
+
+    first_rm = re.search(rm, folded)
+    first_fetch = re.search(fetch, folded)
+    assert first_rm and first_fetch, "a stale archive must be removed and the fetch/archive attempted"
+    assert first_rm.start() < first_fetch.start(), \
+        "any stale archive must be removed BEFORE the fetch/archive"
+
+    assert re.search(rf"if\s+{fetch}", folded), \
+        "the fetch/archive must be explicitly checked (`if ...`), never unchecked"
+    assert not re.search(rf"(?m)^\s*{fetch}", folded), \
+        "the fetch/archive must not be a bare unchecked command"
+
+    assert re.search(rf"if\s+{materialize}", folded), \
+        "materialize-target must be explicitly checked (`if ...`)"
+    assert not re.search(rf"(?m)^\s*{materialize}", folded), \
+        "materialize-target must not be a bare unchecked command (would run on a failed fetch)"
+
+    assert folded.index("materialize-target") < folded.index("SOURCE_AVAILABLE=yes"), \
+        "SOURCE_AVAILABLE=yes must be set only AFTER materialize succeeds"
+    assert len(re.findall(rm, folded)) >= 2, \
+        "the partial archive must be discarded (rm -f) on failure, not left behind"
+
+
+def _assert_source_materialization_fails_closed(text: str, section_heading: str | None) -> None:
+    """Both source-materialization kinds in `text` (optionally scoped to `section_heading`) fail
+    closed (Task 3, round 3)."""
+    scope = _section(text, section_heading) if section_heading else text
+    blocks = _bash_blocks(scope)
+    gh = [b for b in blocks if "materialize-target" in b and "gh api" in b]
+    local = [b for b in blocks if "materialize-target" in b and "git -C" in b]
+    assert len(gh) == 1 and len(local) == 1, \
+        "exactly one GitHub and one local source-materialization block are required"
+    _assert_block_fails_closed(gh[0], fetch=r"gh api", archive="source.tar.gz")
+    _assert_block_fails_closed(local[0], fetch=r'git -C "\$LOCAL_REPO" archive', archive="source.tar")
+
+
 def test_no_hardcoded_round_cap_override_in_workflow_examples():
     # The cap must come from run config; workflow command examples must not pass the
     # override. (The argv test form '"--max-rounds", "5"' is intentionally different and ok.)
@@ -524,6 +575,38 @@ def test_target_binding_design_github_acquisition_is_fail_closed():
     assert "fail" in variant and "closed" in variant, \
         "the GitHub PR variant prose must state the acquisition fails closed"
 
+
+def test_target_binding_design_source_materialization_fails_closed():
+    # Finding (Task 3, round 3): the design's source-snapshot blocks ran `gh api ... > source.tar.gz` and
+    # `git -C ... archive` UNCHECKED, so a failed/truncated/stale archive relied on later/global shell
+    # behaviour. Each kind must fail closed and non-fatal.
+    _assert_source_materialization_fails_closed(TARGET_BINDING_DESIGN.read_text(), "Source snapshots")
+
+
+def test_target_binding_design_source_snapshot_errors_fail_closed():
+    # The Error-handling contract must state the source-snapshot fail-closed rule: remove the stale
+    # archive, explicitly check the fetch/archive AND materialize, discard the partial archive on
+    # failure, don't rely on a global `set -e`, and continue patch-only (non-fatal) with SOURCE_AVAILABLE
+    # marked no so both peers get the same status and runtime claims stay unverified.
+    errors = _flat(_section(TARGET_BINDING_DESIGN.read_text(), "Error handling"))
+    assert "source_available=no" in errors, \
+        "error handling must mark the source unavailable (SOURCE_AVAILABLE=no) on any snapshot failure"
+    assert "gh api" in errors and "archive" in errors, \
+        "error handling must scope the fail-closed rule to the fetch/archive commands"
+    assert "materialize" in errors, "error handling must require materialize-target to be checked too"
+    assert "discard" in errors or "remove" in errors or "rm -f" in errors, \
+        "error handling must discard the partial/stale archive on failure"
+    assert "set -e" in errors, "error handling must warn against relying on a global set -e"
+    assert "patch-only" in errors or "patch only" in errors, \
+        "on a source failure the review must continue patch-only (non-fatal)"
+    assert "unverified" in errors, \
+        "when source is unavailable, runtime-verified claims must be marked unverified"
+
+
+def test_target_binding_plan_source_materialization_fails_closed():
+    # Finding (Task 3, round 3): the plan's Step-3 materialization ran the fetch/archive + materialize
+    # unchecked. The plan's executable blocks must mirror the fail-closed, non-fatal flow.
+    _assert_source_materialization_fails_closed(TARGET_BINDING_PLAN.read_text(), None)
 
 
 

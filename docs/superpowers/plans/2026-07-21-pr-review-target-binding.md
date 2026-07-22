@@ -679,14 +679,30 @@ HEAD_REPOSITORY=$(/Users/sri/personal/crucible/.venv/bin/python -c \
 HEAD_SHA=$(/Users/sri/personal/crucible/.venv/bin/python -c \
   'import json,sys; print(json.load(open(sys.argv[1]))["head"]["sha"])' \
   "$RUN/loaded-target.json")
-gh api "repos/$HEAD_REPOSITORY/tarball/$HEAD_SHA" > "$RUN/source.tar.gz"
-PYTHONPATH=scripts python3 -m crucible materialize-target \
-  --run "$RUN" --archive "$RUN/source.tar.gz"
+test -n "$HEAD_REPOSITORY" && test -n "$HEAD_SHA"
+rm -f "$RUN/source.tar.gz"
+SOURCE_AVAILABLE=no
+if gh api "repos/$HEAD_REPOSITORY/tarball/$HEAD_SHA" > "$RUN/source.tar.gz"
+then
+  if PYTHONPATH=scripts python3 -m crucible materialize-target \
+    --run "$RUN" --archive "$RUN/source.tar.gz"
+  then
+    SOURCE_AVAILABLE=yes
+  else
+    rm -f "$RUN/source.tar.gz"
+  fi
+else
+  rm -f "$RUN/source.tar.gz"
+fi
 ```
 
 The GitHub normalizer takes intent directly from stable before/after title/body metadata. Both peers
 read `RUN/target.diff` and `RUN/source`, never ambient checkout files. The archive repository/SHA
-come only from `show-target`'s authoritative event payload.
+come only from `show-target`'s authoritative event payload. Materialization **fails closed and is
+non-fatal**: any stale archive is removed first, `SOURCE_AVAILABLE` defaults to `no`, the fetch **and**
+`materialize-target` are each explicitly checked (never a global `set -e`), any failure discards the
+partial archive and leaves `SOURCE_AVAILABLE=no`, and only a clean fetch and materialize set
+`SOURCE_AVAILABLE=yes`.
 
 Local mode materializes on its own executable path: read the recorded `repository`/`head.sha` from the
 same authoritative manifest, prove the caller's `$LOCAL_REPO` is that recorded repository before any
@@ -703,14 +719,29 @@ HEAD_SHA=$(/Users/sri/personal/crucible/.venv/bin/python -c \
   "$RUN/loaded-target.json")
 test -n "$RECORDED_REPOSITORY" && test -n "$HEAD_SHA"
 test "$(PYTHONPATH=scripts python3 -m crucible repository-identity --repo "$LOCAL_REPO")" = "$RECORDED_REPOSITORY"
-git -C "$LOCAL_REPO" archive --format=tar --output "$RUN/source.tar" "$HEAD_SHA"
-PYTHONPATH=scripts python3 -m crucible materialize-target \
-  --run "$RUN" --archive "$RUN/source.tar"
+rm -f "$RUN/source.tar"
+SOURCE_AVAILABLE=no
+if git -C "$LOCAL_REPO" archive --format=tar --output "$RUN/source.tar" "$HEAD_SHA"
+then
+  if PYTHONPATH=scripts python3 -m crucible materialize-target \
+    --run "$RUN" --archive "$RUN/source.tar"
+  then
+    SOURCE_AVAILABLE=yes
+  else
+    rm -f "$RUN/source.tar"
+  fi
+else
+  rm -f "$RUN/source.tar"
+fi
 ```
 
 Document local and diff modes with the corresponding `normalize-target` subcommands. Local mode uses
 the single `--range BASE..HEAD|BASE...HEAD` option, rejects separate base/head flags, always records
-merge base, and emits the same patch for either spelling. Diff mode has no source materialization.
+merge base, and emits the same patch for either spelling. Local materialization mirrors the same
+fail-closed, non-fatal flow (identity/head checks stay hard gates; a failed archive or rejected
+materialization discards the partial `source.tar` and leaves `SOURCE_AVAILABLE=no`). Diff mode sets
+`SOURCE_AVAILABLE=no` and has no source materialization. Whenever `SOURCE_AVAILABLE=no`, both peers get
+the same status and the review continues patch-only with runtime-verified claims treated as unverified.
 
 - [ ] **Step 4: Update peer and execution protocols**
 

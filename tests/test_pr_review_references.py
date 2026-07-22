@@ -123,6 +123,72 @@ def _assert_source_materialization_is_executable_per_kind(section: str) -> None:
         "a bare `git archive` (ambient repo) is forbidden — archive only via `git -C \"$LOCAL_REPO\"`"
 
 
+def _assert_block_fails_closed(block: str, fetch: str, archive: str) -> None:
+    """One source-materialization block (GitHub or local) must fail CLOSED and NON-FATAL (Task 3,
+    round 3): the live `gh api ... > source.tar.gz` fetch / local `git -C ... archive` were UNCHECKED, so
+    a failed/truncated/stale archive relied on later or global shell behaviour instead of explicitly
+    switching to source-unavailable. The block must remove any stale archive BEFORE the fetch/archive,
+    default `SOURCE_AVAILABLE=no`, `if`-check the fetch/archive (never a bare command), `if`-check
+    materialize-target so it is unreachable on a failed fetch/archive, set `SOURCE_AVAILABLE=yes` only
+    after materialize succeeds, and `rm -f` the partial archive on every failure branch."""
+    folded = re.sub(r"\\\n\s*", "", block)
+    esc = re.escape(archive)
+    rm = rf"rm -f [^\n]*{esc}(?![\w.])"
+    materialize = r"PYTHONPATH=\S+ python3 -m crucible materialize-target"
+
+    assert "SOURCE_AVAILABLE=no" in folded, "must default SOURCE_AVAILABLE=no (fail closed)"
+    assert "SOURCE_AVAILABLE=yes" in folded, "must set SOURCE_AVAILABLE=yes only on success"
+
+    first_rm = re.search(rm, folded)
+    first_fetch = re.search(fetch, folded)
+    assert first_rm and first_fetch, "a stale archive must be removed and the fetch/archive attempted"
+    assert first_rm.start() < first_fetch.start(), \
+        "any stale archive must be removed BEFORE the fetch/archive"
+
+    assert re.search(rf"if\s+{fetch}", folded), \
+        "the fetch/archive must be explicitly checked (`if ...`), never unchecked"
+    assert not re.search(rf"(?m)^\s*{fetch}", folded), \
+        "the fetch/archive must not be a bare unchecked command"
+
+    assert re.search(rf"if\s+{materialize}", folded), \
+        "materialize-target must be explicitly checked (`if ...`)"
+    assert not re.search(rf"(?m)^\s*{materialize}", folded), \
+        "materialize-target must not be a bare unchecked command (would run on a failed fetch)"
+
+    assert folded.index("materialize-target") < folded.index("SOURCE_AVAILABLE=yes"), \
+        "SOURCE_AVAILABLE=yes must be set only AFTER materialize succeeds"
+    assert len(re.findall(rm, folded)) >= 2, \
+        "the partial archive must be discarded (rm -f) on failure, not left behind"
+
+
+def _source_materialization_blocks(section: str) -> tuple[str, str]:
+    """(github_block, local_block) — the two executable source-materialization blocks in `section`."""
+    blocks = _bash_blocks(section)
+    gh = [b for b in blocks if "materialize-target" in b and "gh api" in b]
+    local = [b for b in blocks if "materialize-target" in b and "git -C" in b]
+    assert len(gh) == 1 and len(local) == 1, \
+        "exactly one GitHub and one local source-materialization block are required"
+    return gh[0], local[0]
+
+
+def _assert_source_materialization_fails_closed(section: str) -> None:
+    """Both source-materialization kinds fail closed, and the section documents the NON-FATAL,
+    patch-only continuation when the snapshot is unavailable (Task 3, round 3)."""
+    gh, local = _source_materialization_blocks(section)
+    _assert_block_fails_closed(gh, fetch=r"gh api", archive="source.tar.gz")
+    _assert_block_fails_closed(local, fetch=r'git -C "\$LOCAL_REPO" archive', archive="source.tar")
+
+    low = _flat(section)
+    assert "source_available=no" in low, \
+        "the section must document the fail-closed SOURCE_AVAILABLE=no status"
+    assert "patch-only" in low or "patch only" in low, \
+        "on a source failure the review must continue patch-only (non-fatal)"
+    assert "unverified" in low, \
+        "when source is unavailable, runtime-verified claims must be marked unverified"
+    assert any(k in low for k in ("diff-file", "diff file", "diff mode")), \
+        "the diff-file target must be covered (sets SOURCE_AVAILABLE=no, never archives)"
+
+
 def _no_negated_echo(sec: str) -> None:
     assert not re.search(r"\b(?:do not|don't|never|not)\s+echo\b", sec), \
         "each peer attestation must be required to echo the bindings, not negated"
@@ -489,6 +555,144 @@ def test_platform_notes_materializes_pinned_source_per_kind():
     _assert_source_materialization_is_executable_per_kind(
         _section(_read("platform-notes.md"), "Input normalization"))
 
+
+def test_platform_notes_source_materialization_fails_closed():
+    # Finding (Task 3, round 3): the `gh api ... > source.tar.gz` fetch and the local `git -C ... archive`
+    # were UNCHECKED, so a failed/truncated/stale archive relied on later/global shell behaviour instead
+    # of explicitly switching to source-unavailable. platform-notes must fail closed and NON-FATAL.
+    _assert_source_materialization_fails_closed(
+        _section(_read("platform-notes.md"), "Input normalization"))
+
+
+def _materialization_harness(tmp_path, block: str, loaded_target: dict):
+    """Fake `gh`/`git`/`python3` on PATH so the DOCUMENTED materialization block runs under `bash`
+    without touching the network or a real repo: `python3 -c` parsing stays real, `-m crucible
+    materialize-target` records its invocation + honours MATERIALIZE_EXIT, and `-m crucible
+    repository-identity` echoes the recorded identity so the hard identity gate passes. Returns a
+    `run(**env)` callable that resets RUN, executes the block (deliberately NO `set -e`), and reports
+    (CompletedProcess, materialize_invoked, source_left, archive_left)."""
+    import sys
+
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    run_dir = tmp_path / "run"
+    materialize_log = tmp_path / "materialize.log"
+    recorded_identity = loaded_target.get("repository", "")
+
+    gh = bindir / "gh"
+    gh.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [ "$1" = "api" ]; then\n'
+        "  printf 'partial-tarball-bytes'\n"          # truncated archive written via redirection
+        '  exit "${GH_API_EXIT:-0}"\n'
+        "fi\n"
+        "exit 0\n"
+    )
+    gh.chmod(0o755)
+
+    git = bindir / "git"
+    git.write_text(
+        "#!/usr/bin/env bash\n"
+        'out=""; prev=""\n'
+        'for a in "$@"; do [ "$prev" = "--output" ] && out="$a"; prev="$a"; done\n'
+        "[ -n \"$out\" ] && printf 'partial-tar-bytes' > \"$out\"\n"
+        'exit "${GIT_ARCHIVE_EXIT:-0}"\n'
+    )
+    git.chmod(0o755)
+
+    py = bindir / "python3"
+    py.write_text(
+        "#!/usr/bin/env bash\n"
+        'case "$*" in\n'
+        '  *"-m crucible materialize-target"*)\n'
+        '    printf "%s\\n" "$*" >> "$MATERIALIZE_LOG"\n'
+        '    exit "${MATERIALIZE_EXIT:-0}" ;;\n'
+        '  *"-m crucible repository-identity"*)\n'
+        '    printf "%s\\n" "$RECORDED_IDENTITY"\n'
+        "    exit 0 ;;\n"
+        '  *) exec "$REAL_PYTHON" "$@" ;;\n'
+        "esac\n"
+    )
+    py.chmod(0o755)
+
+    archive_gz = run_dir / "source.tar.gz"
+    archive_tar = run_dir / "source.tar"
+
+    def run(**overrides):
+        if run_dir.exists():
+            import shutil
+            shutil.rmtree(run_dir)
+        run_dir.mkdir()
+        (run_dir / "loaded-target.json").write_text(json.dumps(loaded_target))
+        materialize_log.write_text("")
+        env = dict(
+            os.environ,
+            PATH=f"{bindir}:{os.environ['PATH']}",
+            RUN=str(run_dir),
+            LOCAL_REPO=str(tmp_path / "checkout"),
+            REAL_PYTHON=sys.executable,
+            MATERIALIZE_LOG=str(materialize_log),
+            RECORDED_IDENTITY=recorded_identity,
+        )
+        env.update({k: str(v) for k, v in overrides.items()})
+        proc = subprocess.run(
+            ["bash", "-c", "set -u\n" + block + '\nprintf "SOURCE_AVAILABLE=%s\\n" "$SOURCE_AVAILABLE"\n'],
+            cwd=ROOT, env=env, capture_output=True, text=True)
+        invoked = bool(materialize_log.read_text().strip())
+        return proc, invoked, archive_tar.exists() or archive_gz.exists()
+
+    return run
+
+
+def test_platform_notes_source_materialization_github_fetch_failure_stays_patch_only(tmp_path):
+    # Behavioral proof (Task 3, round 3): run the DOCUMENTED GitHub materialization block with a `gh api`
+    # that fails. A failed fetch must NEVER invoke materialize-target and must leave no source/archive,
+    # while the review continues patch-only (non-fatal, SOURCE_AVAILABLE=no). The happy path reaches
+    # materialize and reports SOURCE_AVAILABLE=yes.
+    gh, _local = _source_materialization_blocks(
+        _section(_read("platform-notes.md"), "Input normalization"))
+    run = _materialization_harness(
+        tmp_path, gh, {"head": {"repository": "octo/repo", "sha": "a" * 40}})
+
+    proc, invoked, archive_left = run(GH_API_EXIT="1")
+    assert proc.returncode == 0, f"a failed fetch must be non-fatal (patch-only):\n{proc.stderr}"
+    assert not invoked, "materialize-target must NEVER run after a failed GitHub fetch"
+    assert not archive_left, "a truncated GitHub archive must be discarded, not left behind"
+    assert "SOURCE_AVAILABLE=no" in proc.stdout, "a failed fetch must leave the source unavailable"
+
+    proc, invoked, _ = run(GH_API_EXIT="0", MATERIALIZE_EXIT="0")
+    assert proc.returncode == 0 and invoked, "the happy path must fetch then materialize"
+    assert "SOURCE_AVAILABLE=yes" in proc.stdout, "a materialized snapshot marks the source available"
+
+    proc, invoked, archive_left = run(GH_API_EXIT="0", MATERIALIZE_EXIT="1")
+    assert invoked, "a successful fetch must still attempt materialize-target"
+    assert not archive_left, "a rejected archive must be discarded, not left behind"
+    assert "SOURCE_AVAILABLE=no" in proc.stdout, "a rejected materialization stays source-unavailable"
+
+
+def test_platform_notes_source_materialization_local_failure_stays_patch_only(tmp_path):
+    # Behavioral proof (Task 3, round 3): run the DOCUMENTED local materialization block with a
+    # `git -C ... archive` that fails, then with a materialize-target that rejects. Neither may invoke
+    # the next step with a broken archive nor leave a partial source/archive; the review stays patch-only.
+    _gh, local = _source_materialization_blocks(
+        _section(_read("platform-notes.md"), "Input normalization"))
+    run = _materialization_harness(
+        tmp_path, local, {"repository": "github.com/octo/repo.git", "head": {"sha": "b" * 40}})
+
+    proc, invoked, archive_left = run(GIT_ARCHIVE_EXIT="1")
+    assert proc.returncode == 0, f"a failed archive must be non-fatal (patch-only):\n{proc.stderr}"
+    assert not invoked, "materialize-target must NEVER run after a failed local archive"
+    assert not archive_left, "a truncated local archive must be discarded, not left behind"
+    assert "SOURCE_AVAILABLE=no" in proc.stdout, "a failed archive must leave the source unavailable"
+
+    proc, invoked, archive_left = run(GIT_ARCHIVE_EXIT="0", MATERIALIZE_EXIT="1")
+    assert invoked, "a successful archive must still attempt materialize-target"
+    assert not archive_left, "a rejected archive must be discarded, not left behind"
+    assert "SOURCE_AVAILABLE=no" in proc.stdout, "a rejected materialization stays source-unavailable"
+
+    proc, invoked, _ = run(GIT_ARCHIVE_EXIT="0", MATERIALIZE_EXIT="0")
+    assert proc.returncode == 0 and invoked, "the happy path must archive then materialize"
+    assert "SOURCE_AVAILABLE=yes" in proc.stdout, "a materialized snapshot marks the source available"
 
 
 def test_platform_notes_execution_verifies_repository_identity_and_head():
