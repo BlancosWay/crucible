@@ -1221,3 +1221,72 @@ def test_documented_local_protocol_binds_and_reports_target(tmp_path, capsys):
     assert base_sha in report and head_sha in report and merge_base in report
     assert manifest["diff_sha256"] in report
     assert expected_hash in report
+
+
+def test_documented_local_source_materialization_pins_head_snapshot(tmp_path, capsys):
+    """Drive the documented *local* source-materialization sequence end-to-end with the real CLI and the
+    real `git -C "$LOCAL_REPO" archive` command, proving the executable protocol pins the exact head:
+
+      load-target -> show-target > loaded-target.json -> parse repository/head.sha -> verify
+      repository-identity(--repo LOCAL_REPO) == recorded -> git -C LOCAL_REPO archive --output source.tar
+      HEAD_SHA -> materialize-target --archive source.tar
+
+    Asserts the snapshot is the feature head (only `app.py`, no base-only `main-only.py`), materialized
+    from `source.tar` (never the GitHub `source.tar.gz`), and recorded as a valid `source_materialized`
+    event. This is the local-materialization complement to the binding/report behavioral test above; it
+    exercises the archive+materialize path that test does not."""
+    from crucible.runlog import RunLog
+
+    repo = init_diverged_repo(tmp_path)
+    intent = tmp_path / "intent.json"
+    intent.write_text(json.dumps({"title": "Local range review", "body": "feature change"}))
+
+    out = _cli(capsys, "init-run", "--goal", "review main..feature",
+               "--workflow", "pr-review", "--base-dir", str(tmp_path / "runs"))
+    run = [ln.strip() for ln in out.splitlines() if ln.strip()][-1]
+
+    target_json = tmp_path / "target.json"
+    target_diff = tmp_path / "target.diff"
+    _cli(capsys, "normalize-target", "local", "--repo", str(repo),
+         "--range", "main..feature", "--intent", str(intent),
+         "--output", str(target_json), "--diff-output", str(target_diff))
+    _cli(capsys, "load-target", "--run", run,
+         "--file", str(target_json), "--diff", str(target_diff))
+
+    # show-target emits the authoritative loaded manifest; the head SHA / recorded identity come ONLY
+    # from it — never an ambient archive variable.
+    loaded = json.loads(_cli(capsys, "show-target", "--run", run))
+    recorded_repository = loaded["repository"]
+    head_sha = loaded["head"]["sha"]
+    assert recorded_repository and head_sha, "loaded manifest must carry a non-empty repository/head.sha"
+
+    # The caller's LOCAL_REPO must be proven to be the recorded repository before any archive.
+    observed = _cli(capsys, "repository-identity", "--repo", str(repo)).strip()
+    assert observed == recorded_repository, "the local checkout must be the recorded repository"
+
+    # The documented archive command: an explicit `git -C "$LOCAL_REPO" archive` of the exact head.
+    source_tar = Path(run) / "source.tar"
+    subprocess.run(
+        ["git", "-C", str(repo), "archive", "--format=tar",
+         "--output", str(source_tar), head_sha],
+        check=True, text=True, capture_output=True)
+    assert source_tar.exists() and not (Path(run) / "source.tar.gz").exists(), \
+        "the local path writes source.tar (never the GitHub source.tar.gz)"
+
+    _cli(capsys, "materialize-target", "--run", run, "--archive", str(source_tar))
+
+    # The pinned snapshot is the feature head: only app.py (the base-only main-only.py never appears).
+    materialized = Path(run) / "source"
+    assert (materialized / "app.py").read_text() == "print('feature change')\n"
+    assert not (materialized / "main-only.py").exists(), \
+        "the head snapshot must not contain the base-only file"
+
+    # A single valid source_materialized event is recorded with the target + archive hashes.
+    events = RunLog(run).read_events()
+    materializations = [e for e in events if e.get("event") == "source_materialized"]
+    assert len(materializations) == 1
+    assert materializations[0]["kind"] == "local-range"
+    assert materializations[0]["target_sha256"] == target_sha256(target_from_events(events))
+    assert materializations[0]["archive_sha256"] == hashlib.sha256(source_tar.read_bytes()).hexdigest()
+    validated = validate_source_materialization(events, "pr-review")
+    assert validated.issues == [] and validated.event is not None

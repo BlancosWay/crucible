@@ -332,10 +332,15 @@ and wrapper stripping is derived from the target *kind*, not a caller flag.
 
 ### GitHub PR
 
-After loading the target, download a GitHub-generated archive for the exact head SHA:
+After loading the target, emit the authoritative loaded manifest, read the head repository/SHA from it
+(never an ambient variable), require them non-empty, download the GitHub codeload archive for that exact
+head, and materialize it:
 
 ```bash
-# HEAD_REPOSITORY / HEAD_SHA read from `crucible show-target` (authoritative), never ambient
+PYTHONPATH=scripts python3 -m crucible show-target --run "$RUN" > "$RUN/loaded-target.json"
+HEAD_REPOSITORY=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["head"]["repository"])' "$RUN/loaded-target.json")
+HEAD_SHA=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["head"]["sha"])' "$RUN/loaded-target.json")
+test -n "$HEAD_REPOSITORY" && test -n "$HEAD_SHA"
 gh api "repos/$HEAD_REPOSITORY/tarball/$HEAD_SHA" > "$RUN/source.tar.gz"
 PYTHONPATH=scripts python3 -m crucible materialize-target \
   --run "$RUN" --archive "$RUN/source.tar.gz"
@@ -346,11 +351,18 @@ Fork heads use `head.repository` from the manifest. Unsafe archive members are n
 
 ### Local range
 
-Static review uses an archive of the exact local head commit under `RUN/source`, not ambient files
-(`HEAD_SHA` from `show-target`):
+Static review uses an archive of the exact local head commit under `RUN/source`, not ambient files.
+Read the recorded repository identity + head SHA from the authoritative manifest, prove the caller's
+`$LOCAL_REPO` is that same repository **before** touching it, then archive the exact head with an
+explicit `git -C "$LOCAL_REPO"` (never ambient git) and materialize the uncompressed tar:
 
 ```bash
-git archive --format=tar --output "$RUN/source.tar" "$HEAD_SHA"
+PYTHONPATH=scripts python3 -m crucible show-target --run "$RUN" > "$RUN/loaded-target.json"
+RECORDED_REPOSITORY=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["repository"])' "$RUN/loaded-target.json")
+HEAD_SHA=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["head"]["sha"])' "$RUN/loaded-target.json")
+test -n "$RECORDED_REPOSITORY" && test -n "$HEAD_SHA"
+test "$(PYTHONPATH=scripts python3 -m crucible repository-identity --repo "$LOCAL_REPO")" = "$RECORDED_REPOSITORY"
+git -C "$LOCAL_REPO" archive --format=tar --output "$RUN/source.tar" "$HEAD_SHA"
 PYTHONPATH=scripts python3 -m crucible materialize-target \
   --run "$RUN" --archive "$RUN/source.tar"
 ```

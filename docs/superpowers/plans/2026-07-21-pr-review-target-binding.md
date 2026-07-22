@@ -685,6 +685,26 @@ The GitHub normalizer takes intent directly from stable before/after title/body 
 read `RUN/target.diff` and `RUN/source`, never ambient checkout files. The archive repository/SHA
 come only from `show-target`'s authoritative event payload.
 
+Local mode materializes on its own executable path: read the recorded `repository`/`head.sha` from the
+same authoritative manifest, prove the caller's `$LOCAL_REPO` is that recorded repository before any
+archive, then archive the exact head with an explicit `git -C "$LOCAL_REPO"` (never ambient git) and
+materialize exactly that uncompressed `source.tar` — never the GitHub `source.tar.gz`:
+
+```bash
+PYTHONPATH=scripts python3 -m crucible show-target --run "$RUN" > "$RUN/loaded-target.json"
+RECORDED_REPOSITORY=$(/Users/sri/personal/crucible/.venv/bin/python -c \
+  'import json,sys; print(json.load(open(sys.argv[1]))["repository"])' \
+  "$RUN/loaded-target.json")
+HEAD_SHA=$(/Users/sri/personal/crucible/.venv/bin/python -c \
+  'import json,sys; print(json.load(open(sys.argv[1]))["head"]["sha"])' \
+  "$RUN/loaded-target.json")
+test -n "$RECORDED_REPOSITORY" && test -n "$HEAD_SHA"
+test "$(PYTHONPATH=scripts python3 -m crucible repository-identity --repo "$LOCAL_REPO")" = "$RECORDED_REPOSITORY"
+git -C "$LOCAL_REPO" archive --format=tar --output "$RUN/source.tar" "$HEAD_SHA"
+PYTHONPATH=scripts python3 -m crucible materialize-target \
+  --run "$RUN" --archive "$RUN/source.tar"
+```
+
 Document local and diff modes with the corresponding `normalize-target` subcommands. Local mode uses
 the single `--range BASE..HEAD|BASE...HEAD` option, rejects separate base/head flags, always records
 merge base, and emits the same patch for either spelling. Diff mode has no source materialization.

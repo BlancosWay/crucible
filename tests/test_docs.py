@@ -108,6 +108,10 @@ def _flat(s: str) -> str:
     return " ".join(s.lower().replace("*", "").replace("`", "").replace("#", " ").split())
 
 
+def _bash_blocks(text: str) -> list[str]:
+    return re.findall(r"```bash\n(.*?)```", text, re.DOTALL)
+
+
 def test_no_hardcoded_round_cap_override_in_workflow_examples():
     # The cap must come from run config; workflow command examples must not pass the
     # override. (The argv test form '"--max-rounds", "5"' is intentionally different and ok.)
@@ -397,6 +401,46 @@ def test_target_binding_design_marked_implemented_and_links_plan():
     assert re.search(r"\*\*Status:\*\*\s*implemented", design, re.IGNORECASE), \
         "the 2026-07-21 pr-review-target-binding design must be marked implemented"
     assert "2026-07-21-pr-review-target-binding.md" in design, "design must link its implementation plan"
+
+
+def test_target_binding_design_source_snapshots_are_executable_per_kind():
+    # Finding (Task 3, round 1): the design's source-snapshot commands must be executable and separate —
+    # GitHub parses the authoritative head repository/SHA and materializes source.tar.gz; local verifies
+    # the recorded identity, archives the exact head via an explicit `git -C "$LOCAL_REPO"` (never
+    # ambient), and materializes source.tar. No shared command with unset head variables or a mismatched
+    # archive path.
+    design = (ROOT / "docs" / "superpowers" / "specs"
+              / "2026-07-21-pr-review-target-binding-design.md").read_text()
+    snapshots = _section(design, "Source snapshots")
+    gh_sec = _section(snapshots, "GitHub PR")
+    local_sec = _section(snapshots, "Local range")
+    gh_blocks, local_blocks = _bash_blocks(gh_sec), _bash_blocks(local_sec)
+    assert len(gh_blocks) == 1 and len(local_blocks) == 1, \
+        "each source-snapshot kind documents exactly one executable command block"
+    gh, local = gh_blocks[0], local_blocks[0]
+
+    # GitHub: authoritative parse -> require non-empty -> codeload tarball -> materialize source.tar.gz.
+    assert "loaded-target.json" in gh, "GitHub design block must read the authoritative loaded manifest"
+    assert '["head"]["repository"]' in gh and '["head"]["sha"]' in gh
+    assert 'test -n "$HEAD_REPOSITORY"' in gh and 'test -n "$HEAD_SHA"' in gh
+    assert 'gh api "repos/$HEAD_REPOSITORY/tarball/$HEAD_SHA" > "$RUN/source.tar.gz"' in gh
+    assert '--archive "$RUN/source.tar.gz"' in gh
+    assert not re.search(r"git\s+archive", gh_sec), "GitHub design section must not archive with git"
+
+    # Local: recorded-identity check BEFORE the archive -> explicit `git -C` -> materialize source.tar.
+    assert "loaded-target.json" in local, "local design block must read the authoritative loaded manifest"
+    assert '["repository"]' in local and '["head"]["sha"]' in local
+    assert 'test -n "$HEAD_SHA"' in local
+    assert 'repository-identity --repo "$LOCAL_REPO"' in local
+    assert local.index("repository-identity") < local.index("git -C"), \
+        "the recorded-identity check must precede the archive"
+    assert re.search(
+        r'git -C "\$LOCAL_REPO" archive --format=tar --output "\$RUN/source.tar" "\$HEAD_SHA"', local), \
+        'local design block must archive via `git -C "$LOCAL_REPO" archive` (never ambient)'
+    assert '--archive "$RUN/source.tar"' in local
+    assert "source.tar.gz" not in local, "local path must not feed the GitHub source.tar.gz to materialize"
+
+
 
 
 # --- Companion runtime-guidance guards (docs/cli.md Conventions, AGENTS.md, CLAUDE.md) -------------

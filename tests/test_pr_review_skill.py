@@ -61,6 +61,80 @@ def _json_blocks(text: str) -> list[dict]:
     return out
 
 
+def _bash_blocks(text: str) -> list[str]:
+    return re.findall(r"```bash\n(.*?)```", text, re.DOTALL)
+
+
+def _basename(token: str) -> str:
+    """Trailing path component of a shell token, with quotes/backticks stripped."""
+    return token.split("/")[-1].strip().strip('"').strip("'").strip("`")
+
+
+def _capture(pattern: str, block: str) -> str:
+    m = re.search(pattern, block)
+    assert m, f"expected {pattern!r} in:\n{block}"
+    return _basename(m.group(1))
+
+
+def _assert_source_materialization_is_executable_per_kind(section: str) -> None:
+    """The pinned source snapshot is materialized on TWO separate, self-contained, executable paths —
+    never one shared command that (a) claims the head repository/SHA are authoritative yet leaves the
+    variables unset, (b) archives with ambient `git archive`, or (c) feeds `source.tar.gz` to
+    `materialize-target` even when the local path wrote `source.tar`. Reused verbatim by SKILL.md and
+    platform-notes.md so both live surfaces carry the identical fix."""
+    low = _flat(section)
+    # The authoritative loaded manifest is emitted (show-target -> loaded-target.json) before any head
+    # identity is read — the head repository/SHA come only from it, never an ambient archive variable.
+    assert "show-target --run" in low and "loaded-target.json" in low, \
+        "materialization must emit the authoritative loaded manifest before parsing head identity"
+
+    blocks = _bash_blocks(section)
+    gh = [b for b in blocks if "materialize-target" in b and "gh api" in b]
+    local = [b for b in blocks if "materialize-target" in b and "git -C" in b]
+    assert len(gh) == 1, "exactly one executable GitHub source-materialization block is required"
+    assert len(local) == 1, "exactly one executable local source-materialization block is required"
+    gh, local = gh[0], local[0]
+
+    # GitHub: parse head.repository/head.sha from the loaded manifest, REQUIRE non-empty, fetch the
+    # codeload tarball to source.tar.gz, and materialize exactly that source.tar.gz.
+    assert '["head"]["repository"]' in gh and '["head"]["sha"]' in gh, \
+        "GitHub path must parse head.repository/head.sha from the loaded manifest"
+    assert "HEAD_REPOSITORY=" in gh and "HEAD_SHA=" in gh, \
+        "GitHub path must assign HEAD_REPOSITORY/HEAD_SHA — never reference them unset"
+    assert 'test -n "$HEAD_REPOSITORY"' in gh and 'test -n "$HEAD_SHA"' in gh, \
+        "GitHub path must require non-empty head identity before fetching"
+    assert 'gh api "repos/$HEAD_REPOSITORY/tarball/$HEAD_SHA"' in gh, \
+        "GitHub path must fetch the tarball of the exact recorded head"
+    assert _capture(r"gh api[^\n]*>\s*(\S+)", gh) == "source.tar.gz", \
+        "GitHub fetch must write source.tar.gz"
+    assert _capture(r"materialize-target[^\n]*--archive\s+(\S+)", gh) == "source.tar.gz", \
+        "GitHub must materialize the fetched source.tar.gz (no archive-path mismatch)"
+    assert not re.search(r"git\s+archive", gh), "GitHub path must not archive with git"
+    assert "gh api" not in local, "local path must not fetch a GitHub tarball"
+
+    # Local: parse repository/head.sha, REQUIRE non-empty, verify repository-identity(--repo $LOCAL_REPO)
+    # equals the recorded identity BEFORE any archive, archive the exact head via an explicit
+    # `git -C "$LOCAL_REPO"` (never ambient), and materialize exactly that source.tar.
+    assert '["repository"]' in local and '["head"]["sha"]' in local, \
+        "local path must parse repository/head.sha from the loaded manifest"
+    assert "HEAD_SHA=" in local, "local path must assign HEAD_SHA — never reference it unset"
+    assert 'test -n "$HEAD_SHA"' in local, "local path must require a non-empty head SHA"
+    assert 'repository-identity --repo "$LOCAL_REPO"' in local, \
+        "local path must verify the caller's $LOCAL_REPO identity"
+    assert local.index("repository-identity") < local.index("git -C"), \
+        "the recorded-identity check must precede the archive"
+    assert re.search(
+        r'git -C "\$LOCAL_REPO" archive --format=tar --output \S+ "\$HEAD_SHA"', local), \
+        'local path must archive the exact head via `git -C "$LOCAL_REPO" archive` (never ambient)'
+    assert _capture(r"--output\s+(\S+)", local) == "source.tar", "local archive must write source.tar"
+    assert _capture(r"materialize-target[^\n]*--archive\s+(\S+)", local) == "source.tar", \
+        "local must materialize source.tar (never the GitHub source.tar.gz — no archive-path mismatch)"
+
+    # No bare, ambient `git archive` anywhere in the section: it must always be scoped to $LOCAL_REPO.
+    assert not re.search(r"git\s+archive", section), \
+        "a bare `git archive` (ambient repo) is forbidden — archive only via `git -C \"$LOCAL_REPO\"`"
+
+
 def _no_negated_echo(sec: str) -> None:
     assert not re.search(r"\b(?:do not|don't|never|not)\s+echo\b", sec), \
         "each peer attestation must be required to echo the bindings, not negated"
@@ -309,6 +383,16 @@ def test_skill_reads_pinned_source_not_ambient_checkout():
     assert "run/source" in low
     assert "target.diff" in low
     assert "never ambient" in low or "not ambient" in low or "never the ambient" in low
+
+
+def test_skill_materializes_pinned_source_per_kind():
+    # Finding (Task 3, round 1): the shared materialization command claimed the head repository/SHA are
+    # authoritative but left the variables unset, archived with ambient `git archive`, and always fed
+    # `source.tar.gz` to materialize-target even when the local path wrote `source.tar`. The live skill
+    # must instead document two separate, self-contained, executable paths.
+    _assert_source_materialization_is_executable_per_kind(
+        _section(SKILL.read_text(), "Normalize the input"))
+
 
 
 def test_skill_execution_verifies_exact_head_at_recorded_sha():

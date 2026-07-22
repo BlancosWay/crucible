@@ -74,19 +74,44 @@ a **fresh run**). Full per-source commands live in the "Input normalization" sec
   flags): `PYTHONPATH=scripts python3 -m crucible normalize-target local --repo "$REPO" --range BASE..HEAD --intent "$RUN"/intent.json --output "$RUN"/target.json --diff-output "$RUN"/target.diff`. `BASE..HEAD` and `BASE...HEAD` both normalize to `merge_base..head`, so a base-only commit never appears as a reverse change.
 - **Diff file** — patch identity only: `PYTHONPATH=scripts python3 -m crucible normalize-target diff --diff "$PATCH" --intent "$RUN"/intent.json --output "$RUN"/target.json --diff-output "$RUN"/target.diff`. A diff-file target is `revision_bound: false`, has **no source snapshot**, and never borrows ambient checkout files.
 
-Load the target, then — GitHub/local only — materialize the pinned snapshot from an archive of the
-**exact head commit**. The head repository/SHA come **only** from `show-target`'s authoritative event
-payload (`gh api "repos/$HEAD_REPOSITORY/tarball/$HEAD_SHA"`, or `git archive` at the local head SHA):
+Load the target and emit the authoritative loaded manifest; the head repository/SHA for the snapshot
+come **only** from that `show-target` payload, never an ambient archive variable:
 
 ```bash
 PYTHONPATH=scripts python3 -m crucible load-target --run "$RUN" --file "$RUN"/target.json --diff "$RUN"/target.diff
+PYTHONPATH=scripts python3 -m crucible show-target --run "$RUN" > "$RUN"/loaded-target.json
+```
+
+Then — GitHub/local only — materialize the pinned snapshot of the **exact head commit** on the path
+that matches the target kind. **GitHub PR** — parse the head repository/SHA, require them non-empty,
+download the codeload tarball of that head, and materialize exactly that `source.tar.gz`:
+
+```bash
+HEAD_REPOSITORY=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["head"]["repository"])' "$RUN"/loaded-target.json)
+HEAD_SHA=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["head"]["sha"])' "$RUN"/loaded-target.json)
+test -n "$HEAD_REPOSITORY" && test -n "$HEAD_SHA"
+gh api "repos/$HEAD_REPOSITORY/tarball/$HEAD_SHA" > "$RUN"/source.tar.gz
 PYTHONPATH=scripts python3 -m crucible materialize-target --run "$RUN" --archive "$RUN"/source.tar.gz
 ```
 
+**Local range** — parse the recorded repository identity + head SHA, prove the caller's `$LOCAL_REPO`
+is that same repository **before** touching it, then archive the exact head with an explicit
+`git -C "$LOCAL_REPO"` (never ambient git) and materialize exactly that uncompressed `source.tar`:
+
+```bash
+RECORDED_REPOSITORY=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["repository"])' "$RUN"/loaded-target.json)
+HEAD_SHA=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["head"]["sha"])' "$RUN"/loaded-target.json)
+test -n "$RECORDED_REPOSITORY" && test -n "$HEAD_SHA"
+test "$(PYTHONPATH=scripts python3 -m crucible repository-identity --repo "$LOCAL_REPO")" = "$RECORDED_REPOSITORY"
+git -C "$LOCAL_REPO" archive --format=tar --output "$RUN"/source.tar "$HEAD_SHA"
+PYTHONPATH=scripts python3 -m crucible materialize-target --run "$RUN" --archive "$RUN"/source.tar
+```
+
 Give **both** peers the same `RUN/target.diff` and the pinned `RUN/source` snapshot — **never ambient**
-checkout files (which may be a different revision or lack files the change introduces). A diff-file
-target stays patch-only; if the head archive is unavailable or rejected, the review continues
-patch-only with source context explicitly marked unavailable.
+checkout files (which may be a different revision or lack files the change introduces). A **diff-file**
+target stays patch-only (no archive, no materialization); if the head fetch/archive/materialization
+fails, the review continues patch-only with source context explicitly marked unavailable — never
+pre-create `RUN/source`, and never fall back to ambient source.
 
 ## The symmetric round (how consensus stays equal)
 
