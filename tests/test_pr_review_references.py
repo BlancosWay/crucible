@@ -145,8 +145,9 @@ def _assert_block_fails_closed(block: str, fetch: str, archive: str) -> None:
     assert first_rm.start() < first_fetch.start(), \
         "any stale archive must be removed BEFORE the fetch/archive"
 
-    assert re.search(rf"if\s+{fetch}", folded), \
-        "the fetch/archive must be explicitly checked (`if ...`), never unchecked"
+    assert re.search(rf"(?:if|&&)\s+{fetch}", folded), \
+        "the fetch/archive must be checked (`if ...` or the final `&&` conjunct of a compound if), " \
+        "never an unchecked bare command"
     assert not re.search(rf"(?m)^\s*{fetch}", folded), \
         "the fetch/archive must not be a bare unchecked command"
 
@@ -187,6 +188,68 @@ def _assert_source_materialization_fails_closed(section: str) -> None:
         "when source is unavailable, runtime-verified claims must be marked unverified"
     assert any(k in low for k in ("diff-file", "diff file", "diff mode")), \
         "the diff-file target must be covered (sets SOURCE_AVAILABLE=no, never archives)"
+
+
+def _assert_local_source_identity_gates_archive(section: str) -> None:
+    """Task 3, round 4: the local source block ran its `test -n`, repository-identity equality, and
+    recorded-HEAD checks as BARE commands. The snippets deliberately do NOT rely on a global `set -e`,
+    so a mismatch was ignored and `git archive` + `materialize-target` still succeeded. The archive
+    must instead be gated by ONE explicit compound `if`: parse `RECORDED_REPOSITORY_IDENTITY` +
+    `HEAD_SHA`, compute `OBSERVED_REPOSITORY` only when those parses (and a valid `$LOCAL_REPO`) hold,
+    then require — all `&&`-joined so any mismatch short-circuits past the archive — non-empty parses,
+    `OBSERVED_REPOSITORY == RECORDED_REPOSITORY_IDENTITY`, `git rev-parse HEAD == HEAD_SHA`, and finally
+    `git -C "$LOCAL_REPO" archive`. Reused verbatim by SKILL.md and platform-notes.md."""
+    blocks = _bash_blocks(section)
+    local = [b for b in blocks
+             if "materialize-target" in b and 'git -C "$LOCAL_REPO" archive' in b]
+    assert len(local) == 1, "exactly one executable local source-materialization block is required"
+    folded = re.sub(r"\\\n\s*", "", local[0])
+
+    # The recorded-identity variable is renamed to align with the execution gate; the old bare name is gone.
+    assert "RECORDED_REPOSITORY_IDENTITY=" in folded, \
+        "the local path must parse RECORDED_REPOSITORY_IDENTITY from the loaded manifest"
+    assert not re.search(r"RECORDED_REPOSITORY(?!_IDENTITY)", folded), \
+        "the old bare RECORDED_REPOSITORY name must be gone (use RECORDED_REPOSITORY_IDENTITY)"
+
+    # OBSERVED_REPOSITORY is initialized empty (safe under `set -u`) and only assigned under a guard —
+    # never an unconditional `repository-identity` that could run git against a missing/ambient repo.
+    assert re.search(r"(?m)^\s*OBSERVED_REPOSITORY=\s*$", folded), \
+        "OBSERVED_REPOSITORY must be initialized empty before the guarded computation (set -u safe)"
+    assert re.search(
+        r'(?m)^\s+OBSERVED_REPOSITORY=\$\(PYTHONPATH=\S+ python3 -m crucible '
+        r'repository-identity --repo "\$LOCAL_REPO"\)', folded), \
+        "OBSERVED_REPOSITORY must be computed via repository-identity inside a guard, not unconditionally"
+
+    # ONE compound `if` gates the archive: the non-empty parses, the identity equality, and the recorded
+    # HEAD equality are all `&&`-joined conjuncts ending in the archive, so any mismatch short-circuits.
+    assert re.search(
+        r'if\b[^\n]*?test -n "\$RECORDED_REPOSITORY_IDENTITY"[^\n]*?'
+        r'&&[^\n]*?test -n "\$HEAD_SHA"[^\n]*?'
+        r'&&[^\n]*?test "\$OBSERVED_REPOSITORY" = "\$RECORDED_REPOSITORY_IDENTITY"[^\n]*?'
+        r'&&[^\n]*?test "\$\(git -C "\$LOCAL_REPO" rev-parse HEAD\)" = "\$HEAD_SHA"[^\n]*?'
+        r'&&[^\n]*?git -C "\$LOCAL_REPO" archive', folded), \
+        "the archive must be gated by ONE compound `if` with the identity + recorded-HEAD checks " \
+        "&&-joined ahead of it (a mismatch must skip the archive/materialize)"
+
+    # $LOCAL_REPO directory validity is a conjunct of the gate, checked BEFORE any git runs against it,
+    # so a missing/empty $LOCAL_REPO never runs `git rev-parse`/archive in an unrelated/ambient repo.
+    assert 'test -d "$LOCAL_REPO"' in folded, \
+        "the gate must validate $LOCAL_REPO is a directory before running git against it"
+    gate = next((ln for ln in folded.splitlines()
+                 if 'git -C "$LOCAL_REPO" rev-parse HEAD' in ln), "")
+    assert 'test -d "$LOCAL_REPO"' in gate and \
+        gate.index('test -d "$LOCAL_REPO"') < gate.index('git -C "$LOCAL_REPO" rev-parse'), \
+        "the $LOCAL_REPO directory check must precede `git rev-parse HEAD` in the compound gate"
+
+    # The gated checks must NOT also appear as bare, ignorable standalone commands (the round-4 defect).
+    assert not re.search(r'(?m)^\s*test -n "\$RECORDED_REPOSITORY_IDENTITY"', folded), \
+        "the non-empty identity parse must gate the archive inside `if`, not run as a bare command"
+    assert not re.search(r'(?m)^\s*test "\$OBSERVED_REPOSITORY" = "\$RECORDED_REPOSITORY_IDENTITY"', folded), \
+        "the identity-equality check must gate the archive inside `if`, not run as a bare command"
+    assert not re.search(r'(?m)^\s*test "\$\([^\n]*repository-identity', folded), \
+        'the identity check must not be a bare inline `test "$(... repository-identity ...)"` command'
+    assert not re.search(r'(?m)^\s*test "\$\(git -C "\$LOCAL_REPO" rev-parse HEAD\)"', folded), \
+        "the recorded-HEAD check must gate the archive inside `if`, not run as a bare command"
 
 
 def _no_negated_echo(sec: str) -> None:
@@ -567,17 +630,22 @@ def test_platform_notes_source_materialization_fails_closed():
 def _materialization_harness(tmp_path, block: str, loaded_target: dict):
     """Fake `gh`/`git`/`python3` on PATH so the DOCUMENTED materialization block runs under `bash`
     without touching the network or a real repo: `python3 -c` parsing stays real, `-m crucible
-    materialize-target` records its invocation + honours MATERIALIZE_EXIT, and `-m crucible
-    repository-identity` echoes the recorded identity so the hard identity gate passes. Returns a
-    `run(**env)` callable that resets RUN, executes the block (deliberately NO `set -e`), and reports
-    (CompletedProcess, materialize_invoked, source_left, archive_left)."""
+    materialize-target` records its invocation + honours MATERIALIZE_EXIT, `-m crucible
+    repository-identity` echoes `${OBSERVED_IDENTITY:-$RECORDED_IDENTITY}` (so a wrong observed identity
+    can be injected), and `git ... rev-parse HEAD` echoes `${OBSERVED_HEAD:-$RECORDED_HEAD}` (so a wrong
+    observed head can be injected). `$LOCAL_REPO` points at a real directory so `test -d` passes on the
+    happy path. Returns a `run(**env)` callable that resets RUN, executes the block (deliberately NO
+    `set -e`), and reports (CompletedProcess, materialize_invoked, archive_left)."""
     import sys
 
     bindir = tmp_path / "bin"
     bindir.mkdir()
+    (tmp_path / "checkout").mkdir()          # $LOCAL_REPO is a real directory (so `test -d` passes)
     run_dir = tmp_path / "run"
     materialize_log = tmp_path / "materialize.log"
+    git_log = tmp_path / "git.log"           # every `git` invocation the block makes (rev-parse/archive)
     recorded_identity = loaded_target.get("repository", "")
+    recorded_head = loaded_target.get("head", {}).get("sha", "")
 
     gh = bindir / "gh"
     gh.write_text(
@@ -593,6 +661,10 @@ def _materialization_harness(tmp_path, block: str, loaded_target: dict):
     git = bindir / "git"
     git.write_text(
         "#!/usr/bin/env bash\n"
+        'printf "%s\\n" "$*" >> "$GIT_LOG"\n'         # record every git call (proves none run if repo missing)
+        'for a in "$@"; do\n'
+        '  if [ "$a" = "rev-parse" ]; then printf "%s\\n" "${OBSERVED_HEAD:-$RECORDED_HEAD}"; exit 0; fi\n'
+        "done\n"
         'out=""; prev=""\n'
         'for a in "$@"; do [ "$prev" = "--output" ] && out="$a"; prev="$a"; done\n'
         "[ -n \"$out\" ] && printf 'partial-tar-bytes' > \"$out\"\n"
@@ -608,7 +680,7 @@ def _materialization_harness(tmp_path, block: str, loaded_target: dict):
         '    printf "%s\\n" "$*" >> "$MATERIALIZE_LOG"\n'
         '    exit "${MATERIALIZE_EXIT:-0}" ;;\n'
         '  *"-m crucible repository-identity"*)\n'
-        '    printf "%s\\n" "$RECORDED_IDENTITY"\n'
+        '    printf "%s\\n" "${OBSERVED_IDENTITY:-$RECORDED_IDENTITY}"\n'
         "    exit 0 ;;\n"
         '  *) exec "$REAL_PYTHON" "$@" ;;\n'
         "esac\n"
@@ -625,6 +697,7 @@ def _materialization_harness(tmp_path, block: str, loaded_target: dict):
         run_dir.mkdir()
         (run_dir / "loaded-target.json").write_text(json.dumps(loaded_target))
         materialize_log.write_text("")
+        git_log.write_text("")
         env = dict(
             os.environ,
             PATH=f"{bindir}:{os.environ['PATH']}",
@@ -632,7 +705,9 @@ def _materialization_harness(tmp_path, block: str, loaded_target: dict):
             LOCAL_REPO=str(tmp_path / "checkout"),
             REAL_PYTHON=sys.executable,
             MATERIALIZE_LOG=str(materialize_log),
+            GIT_LOG=str(git_log),
             RECORDED_IDENTITY=recorded_identity,
+            RECORDED_HEAD=recorded_head,
         )
         env.update({k: str(v) for k, v in overrides.items()})
         proc = subprocess.run(
@@ -690,6 +765,55 @@ def test_platform_notes_source_materialization_local_failure_stays_patch_only(tm
     assert not archive_left, "a rejected archive must be discarded, not left behind"
     assert "SOURCE_AVAILABLE=no" in proc.stdout, "a rejected materialization stays source-unavailable"
 
+    proc, invoked, _ = run(GIT_ARCHIVE_EXIT="0", MATERIALIZE_EXIT="0")
+    assert proc.returncode == 0 and invoked, "the happy path must archive then materialize"
+    assert "SOURCE_AVAILABLE=yes" in proc.stdout, "a materialized snapshot marks the source available"
+
+
+def test_platform_notes_local_source_identity_gates_archive():
+    # Finding (Task 3, round 4): the local source block's `test -n`, repository-identity equality, and
+    # recorded-HEAD checks were BARE commands, so without a global `set -e` a mismatch was ignored and
+    # the archive/materialize still ran. platform-notes must gate the archive on ONE compound `if`.
+    _assert_local_source_identity_gates_archive(
+        _section(_read("platform-notes.md"), "Input normalization"))
+
+
+def test_platform_notes_local_source_identity_and_head_gate_archive(tmp_path):
+    # Behavioral proof (Task 3, round 4): run the DOCUMENTED local materialization block under `bash`
+    # with NO `set -e`. A wrong observed repository identity and a wrong observed HEAD must EACH
+    # short-circuit the compound gate so `git archive` never runs, `materialize-target` is never
+    # invoked, no source.tar is left, and the review stays patch-only (SOURCE_AVAILABLE=no, exit 0).
+    # The happy path (matching identity + head) still archives and materializes.
+    _gh, local = _source_materialization_blocks(
+        _section(_read("platform-notes.md"), "Input normalization"))
+    run = _materialization_harness(
+        tmp_path, local, {"repository": "github.com/octo/repo.git", "head": {"sha": "b" * 40}})
+
+    # Wrong repository identity: OBSERVED != RECORDED -> gate short-circuits before the archive.
+    proc, invoked, archive_left = run(OBSERVED_IDENTITY="evil.example/other.git")
+    assert proc.returncode == 0, f"an identity mismatch must be non-fatal (patch-only):\n{proc.stderr}"
+    assert not invoked, "a wrong repository identity must NEVER reach materialize-target"
+    assert not archive_left, "a wrong repository identity must not archive/leave a source.tar"
+    assert "SOURCE_AVAILABLE=no" in proc.stdout, "an identity mismatch stays source-unavailable"
+
+    # Wrong observed HEAD: identity matches but rev-parse HEAD != recorded head.sha -> short-circuits.
+    proc, invoked, archive_left = run(OBSERVED_HEAD="c" * 40)
+    assert proc.returncode == 0, f"a head mismatch must be non-fatal (patch-only):\n{proc.stderr}"
+    assert not invoked, "a wrong recorded HEAD must NEVER reach materialize-target"
+    assert not archive_left, "a wrong recorded HEAD must not archive/leave a source.tar"
+    assert "SOURCE_AVAILABLE=no" in proc.stdout, "a head mismatch stays source-unavailable"
+
+    # Missing $LOCAL_REPO: the `test -d` guard must skip the whole gate so NO git (rev-parse/archive)
+    # ever runs — never against an unrelated/ambient repo (e.g. the reviewer's own cwd).
+    proc, invoked, archive_left = run(LOCAL_REPO="")
+    assert proc.returncode == 0, f"a missing $LOCAL_REPO must be non-fatal (patch-only):\n{proc.stderr}"
+    assert not invoked, "a missing $LOCAL_REPO must NEVER reach materialize-target"
+    assert not archive_left, "a missing $LOCAL_REPO must not archive/leave a source.tar"
+    assert "SOURCE_AVAILABLE=no" in proc.stdout, "a missing $LOCAL_REPO stays source-unavailable"
+    assert (tmp_path / "git.log").read_text().strip() == "", \
+        "a missing $LOCAL_REPO must not run git (rev-parse/archive) in an unrelated/ambient repo"
+
+    # Happy path: matching identity + head -> archive then materialize -> source available.
     proc, invoked, _ = run(GIT_ARCHIVE_EXIT="0", MATERIALIZE_EXIT="0")
     assert proc.returncode == 0 and invoked, "the happy path must archive then materialize"
     assert "SOURCE_AVAILABLE=yes" in proc.stdout, "a materialized snapshot marks the source available"

@@ -157,8 +157,9 @@ def _assert_block_fails_closed(block: str, fetch: str, archive: str) -> None:
     assert first_rm.start() < first_fetch.start(), \
         "any stale archive must be removed BEFORE the fetch/archive"
 
-    assert re.search(rf"if\s+{fetch}", folded), \
-        "the fetch/archive must be explicitly checked (`if ...`), never unchecked"
+    assert re.search(rf"(?:if|&&)\s+{fetch}", folded), \
+        "the fetch/archive must be checked (`if ...` or the final `&&` conjunct of a compound if), " \
+        "never an unchecked bare command"
     assert not re.search(rf"(?m)^\s*{fetch}", folded), \
         "the fetch/archive must not be a bare unchecked command"
 
@@ -193,6 +194,68 @@ def _assert_source_materialization_fails_closed(section: str) -> None:
         "when source is unavailable, runtime-verified claims must be marked unverified"
     assert any(k in low for k in ("diff-file", "diff file", "diff mode")), \
         "the diff-file target must be covered (sets SOURCE_AVAILABLE=no, never archives)"
+
+
+def _assert_local_source_identity_gates_archive(section: str) -> None:
+    """Task 3, round 4: the local source block ran its `test -n`, repository-identity equality, and
+    recorded-HEAD checks as BARE commands. The snippets deliberately do NOT rely on a global `set -e`,
+    so a mismatch was ignored and `git archive` + `materialize-target` still succeeded. The archive
+    must instead be gated by ONE explicit compound `if`: parse `RECORDED_REPOSITORY_IDENTITY` +
+    `HEAD_SHA`, compute `OBSERVED_REPOSITORY` only when those parses (and a valid `$LOCAL_REPO`) hold,
+    then require — all `&&`-joined so any mismatch short-circuits past the archive — non-empty parses,
+    `OBSERVED_REPOSITORY == RECORDED_REPOSITORY_IDENTITY`, `git rev-parse HEAD == HEAD_SHA`, and finally
+    `git -C "$LOCAL_REPO" archive`. Reused verbatim by SKILL.md and platform-notes.md."""
+    blocks = _bash_blocks(section)
+    local = [b for b in blocks
+             if "materialize-target" in b and 'git -C "$LOCAL_REPO" archive' in b]
+    assert len(local) == 1, "exactly one executable local source-materialization block is required"
+    folded = re.sub(r"\\\n\s*", "", local[0])
+
+    # The recorded-identity variable is renamed to align with the execution gate; the old bare name is gone.
+    assert "RECORDED_REPOSITORY_IDENTITY=" in folded, \
+        "the local path must parse RECORDED_REPOSITORY_IDENTITY from the loaded manifest"
+    assert not re.search(r"RECORDED_REPOSITORY(?!_IDENTITY)", folded), \
+        "the old bare RECORDED_REPOSITORY name must be gone (use RECORDED_REPOSITORY_IDENTITY)"
+
+    # OBSERVED_REPOSITORY is initialized empty (safe under `set -u`) and only assigned under a guard —
+    # never an unconditional `repository-identity` that could run git against a missing/ambient repo.
+    assert re.search(r"(?m)^\s*OBSERVED_REPOSITORY=\s*$", folded), \
+        "OBSERVED_REPOSITORY must be initialized empty before the guarded computation (set -u safe)"
+    assert re.search(
+        r'(?m)^\s+OBSERVED_REPOSITORY=\$\(PYTHONPATH=\S+ python3 -m crucible '
+        r'repository-identity --repo "\$LOCAL_REPO"\)', folded), \
+        "OBSERVED_REPOSITORY must be computed via repository-identity inside a guard, not unconditionally"
+
+    # ONE compound `if` gates the archive: the non-empty parses, the identity equality, and the recorded
+    # HEAD equality are all `&&`-joined conjuncts ending in the archive, so any mismatch short-circuits.
+    assert re.search(
+        r'if\b[^\n]*?test -n "\$RECORDED_REPOSITORY_IDENTITY"[^\n]*?'
+        r'&&[^\n]*?test -n "\$HEAD_SHA"[^\n]*?'
+        r'&&[^\n]*?test "\$OBSERVED_REPOSITORY" = "\$RECORDED_REPOSITORY_IDENTITY"[^\n]*?'
+        r'&&[^\n]*?test "\$\(git -C "\$LOCAL_REPO" rev-parse HEAD\)" = "\$HEAD_SHA"[^\n]*?'
+        r'&&[^\n]*?git -C "\$LOCAL_REPO" archive', folded), \
+        "the archive must be gated by ONE compound `if` with the identity + recorded-HEAD checks " \
+        "&&-joined ahead of it (a mismatch must skip the archive/materialize)"
+
+    # $LOCAL_REPO directory validity is a conjunct of the gate, checked BEFORE any git runs against it,
+    # so a missing/empty $LOCAL_REPO never runs `git rev-parse`/archive in an unrelated/ambient repo.
+    assert 'test -d "$LOCAL_REPO"' in folded, \
+        "the gate must validate $LOCAL_REPO is a directory before running git against it"
+    gate = next((ln for ln in folded.splitlines()
+                 if 'git -C "$LOCAL_REPO" rev-parse HEAD' in ln), "")
+    assert 'test -d "$LOCAL_REPO"' in gate and \
+        gate.index('test -d "$LOCAL_REPO"') < gate.index('git -C "$LOCAL_REPO" rev-parse'), \
+        "the $LOCAL_REPO directory check must precede `git rev-parse HEAD` in the compound gate"
+
+    # The gated checks must NOT also appear as bare, ignorable standalone commands (the round-4 defect).
+    assert not re.search(r'(?m)^\s*test -n "\$RECORDED_REPOSITORY_IDENTITY"', folded), \
+        "the non-empty identity parse must gate the archive inside `if`, not run as a bare command"
+    assert not re.search(r'(?m)^\s*test "\$OBSERVED_REPOSITORY" = "\$RECORDED_REPOSITORY_IDENTITY"', folded), \
+        "the identity-equality check must gate the archive inside `if`, not run as a bare command"
+    assert not re.search(r'(?m)^\s*test "\$\([^\n]*repository-identity', folded), \
+        'the identity check must not be a bare inline `test "$(... repository-identity ...)"` command'
+    assert not re.search(r'(?m)^\s*test "\$\(git -C "\$LOCAL_REPO" rev-parse HEAD\)"', folded), \
+        "the recorded-HEAD check must gate the archive inside `if`, not run as a bare command"
 
 
 def _no_negated_echo(sec: str) -> None:
@@ -515,6 +578,16 @@ def test_skill_source_materialization_fails_closed():
     # if-checked, partial archive discarded on failure, yes only on success; the review continues
     # patch-only with source explicitly unavailable.
     _assert_source_materialization_fails_closed(
+        _section(SKILL.read_text(), "Normalize the input"))
+
+
+def test_skill_local_source_identity_gates_archive():
+    # Finding (Task 3, round 4): the local source block ran `test -n`, the repository-identity equality,
+    # and the recorded-HEAD check as BARE commands. Without a global `set -e` a mismatch was ignored and
+    # `git archive` + materialize still ran. The archive must be gated by ONE compound `if` whose
+    # &&-joined conjuncts (non-empty parses, OBSERVED == RECORDED identity, rev-parse HEAD == HEAD_SHA)
+    # short-circuit past the archive on any mismatch.
+    _assert_local_source_identity_gates_archive(
         _section(SKILL.read_text(), "Normalize the input"))
 
 

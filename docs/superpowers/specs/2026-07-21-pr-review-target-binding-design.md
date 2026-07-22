@@ -373,20 +373,30 @@ Fork heads use `head.repository` from the manifest. Unsafe archive members are n
 ### Local range
 
 Static review uses an archive of the exact local head commit under `RUN/source`, not ambient files.
-Read the recorded repository identity + head SHA from the authoritative manifest, prove the caller's
-`$LOCAL_REPO` is that same repository **before** touching it (these stay hard gates), remove any stale
-archive, then archive the exact head with an explicit `git -C "$LOCAL_REPO"` (never ambient git) and
-materialize the uncompressed tar — each step explicitly checked:
+Read the recorded repository identity + head SHA from the authoritative manifest, then gate the archive
+on **one** explicit compound `if`: the parses are non-empty, `$LOCAL_REPO` is a directory whose
+`repository-identity` **equals** the recorded identity, and its `git rev-parse HEAD` **equals** the
+recorded head SHA — every check `&&`-joined so a mismatch **short-circuits past** the archive (the
+snippets do not rely on a global `set -e`). Only then does an explicit `git -C "$LOCAL_REPO" archive`
+run (never ambient git; never `rev-parse`/archive in an unrelated repo when `$LOCAL_REPO` is missing)
+and materialize the uncompressed tar; any parse/identity/head/archive failure removes `source.tar`,
+keeps `SOURCE_AVAILABLE=no`, and never invokes materialize:
 
 ```bash
 PYTHONPATH=scripts python3 -m crucible show-target --run "$RUN" > "$RUN/loaded-target.json"
-RECORDED_REPOSITORY=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["repository"])' "$RUN/loaded-target.json")
+RECORDED_REPOSITORY_IDENTITY=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["repository"])' "$RUN/loaded-target.json")
 HEAD_SHA=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["head"]["sha"])' "$RUN/loaded-target.json")
-test -n "$RECORDED_REPOSITORY" && test -n "$HEAD_SHA"
-test "$(PYTHONPATH=scripts python3 -m crucible repository-identity --repo "$LOCAL_REPO")" = "$RECORDED_REPOSITORY"
+OBSERVED_REPOSITORY=
+if test -n "$RECORDED_REPOSITORY_IDENTITY" && test -n "$HEAD_SHA" && test -d "$LOCAL_REPO"
+then
+  OBSERVED_REPOSITORY=$(PYTHONPATH=scripts python3 -m crucible repository-identity --repo "$LOCAL_REPO")
+fi
 rm -f "$RUN/source.tar"
 SOURCE_AVAILABLE=no
-if git -C "$LOCAL_REPO" archive --format=tar --output "$RUN/source.tar" "$HEAD_SHA"
+if test -n "$RECORDED_REPOSITORY_IDENTITY" && test -n "$HEAD_SHA" && test -d "$LOCAL_REPO" \
+  && test "$OBSERVED_REPOSITORY" = "$RECORDED_REPOSITORY_IDENTITY" \
+  && test "$(git -C "$LOCAL_REPO" rev-parse HEAD)" = "$HEAD_SHA" \
+  && git -C "$LOCAL_REPO" archive --format=tar --output "$RUN/source.tar" "$HEAD_SHA"
 then
   if PYTHONPATH=scripts python3 -m crucible materialize-target \
     --run "$RUN" --archive "$RUN/source.tar"
@@ -441,6 +451,14 @@ and diff-file targets remain non-executable regardless of archive availability.
   `SOURCE_AVAILABLE=no`, the review continues **patch-only** with source context unavailable: do not read
   ambient files, do not pre-create/read a partial `RUN/source`, hand both peers the identical status, and
   treat runtime-verified claims as **unverified**.
+- Local source identity/head gate: for the `local-range` path the recorded-identity equality
+  (`repository-identity --repo "$LOCAL_REPO"` equal to the recorded `repository`) and the recorded-HEAD
+  equality (`git -C "$LOCAL_REPO" rev-parse HEAD` equal to `head.sha`) are **checked conditions in the
+  same `if`** that gates the archive — all `&&`-joined and computed against a validated `$LOCAL_REPO`
+  (a directory), **never bare commands** that a missing global `set -e` would ignore, and **never**
+  running `git rev-parse`/`archive` in an unrelated/ambient repo when `$LOCAL_REPO` is missing. Any
+  parse/identity/head mismatch **short-circuits** past the archive, keeps `SOURCE_AVAILABLE=no`, never
+  invokes `materialize-target`, and continues **patch-only** with source unavailable.
 - Local ref missing or ambiguous: reject before `load-target`.
 - Local base/head have no merge base: reject.
 - Manifest/path/hash mismatch: reject without appending.

@@ -122,19 +122,30 @@ else
 fi
 ```
 
-**Local range** — parse the recorded repository identity + head SHA, prove the caller's `$LOCAL_REPO`
-is that same repository **before** touching it (these stay hard gates), remove any stale archive, then
-archive the exact head with an explicit `git -C "$LOCAL_REPO"` (never ambient git) and materialize
-exactly that uncompressed `source.tar`, each step checked:
+**Local range** — parse the recorded repository identity + head SHA, then gate the archive on **one**
+explicit compound `if`: the parses are non-empty, `$LOCAL_REPO` is a directory whose `repository-identity`
+**equals** the recorded identity, and its `git rev-parse HEAD` **equals** the recorded head SHA — every
+check `&&`-joined so a mismatch **short-circuits past** the archive (the snippets don't rely on a global
+`set -e`). Only then does an explicit `git -C "$LOCAL_REPO" archive` run (never ambient git; never
+`rev-parse`/archive in an unrelated repo when `$LOCAL_REPO` is missing), and only a successful archive
+**and** materialize set `SOURCE_AVAILABLE=yes`. Any parse/identity/head/archive failure removes
+`source.tar`, keeps `SOURCE_AVAILABLE=no`, never invokes materialize, and leaves the review **patch-only**
+with source unavailable:
 
 ```bash
-RECORDED_REPOSITORY=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["repository"])' "$RUN"/loaded-target.json)
+RECORDED_REPOSITORY_IDENTITY=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["repository"])' "$RUN"/loaded-target.json)
 HEAD_SHA=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["head"]["sha"])' "$RUN"/loaded-target.json)
-test -n "$RECORDED_REPOSITORY" && test -n "$HEAD_SHA"
-test "$(PYTHONPATH=scripts python3 -m crucible repository-identity --repo "$LOCAL_REPO")" = "$RECORDED_REPOSITORY"
+OBSERVED_REPOSITORY=
+if test -n "$RECORDED_REPOSITORY_IDENTITY" && test -n "$HEAD_SHA" && test -d "$LOCAL_REPO"
+then
+  OBSERVED_REPOSITORY=$(PYTHONPATH=scripts python3 -m crucible repository-identity --repo "$LOCAL_REPO")
+fi
 rm -f "$RUN"/source.tar
 SOURCE_AVAILABLE=no
-if git -C "$LOCAL_REPO" archive --format=tar --output "$RUN"/source.tar "$HEAD_SHA"
+if test -n "$RECORDED_REPOSITORY_IDENTITY" && test -n "$HEAD_SHA" && test -d "$LOCAL_REPO" \
+  && test "$OBSERVED_REPOSITORY" = "$RECORDED_REPOSITORY_IDENTITY" \
+  && test "$(git -C "$LOCAL_REPO" rev-parse HEAD)" = "$HEAD_SHA" \
+  && git -C "$LOCAL_REPO" archive --format=tar --output "$RUN"/source.tar "$HEAD_SHA"
 then
   if PYTHONPATH=scripts python3 -m crucible materialize-target --run "$RUN" --archive "$RUN"/source.tar
   then

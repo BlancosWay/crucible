@@ -705,23 +705,34 @@ partial archive and leaves `SOURCE_AVAILABLE=no`, and only a clean fetch and mat
 `SOURCE_AVAILABLE=yes`.
 
 Local mode materializes on its own executable path: read the recorded `repository`/`head.sha` from the
-same authoritative manifest, prove the caller's `$LOCAL_REPO` is that recorded repository before any
-archive, then archive the exact head with an explicit `git -C "$LOCAL_REPO"` (never ambient git) and
-materialize exactly that uncompressed `source.tar` — never the GitHub `source.tar.gz`:
+same authoritative manifest, then gate the archive on **one** explicit compound `if` — the parses are
+non-empty, `$LOCAL_REPO` is a directory whose `repository-identity` **equals** the recorded identity, and
+its `git rev-parse HEAD` **equals** the recorded head SHA, every check `&&`-joined so a mismatch
+**short-circuits past** the archive (no reliance on a global `set -e`; never `rev-parse`/archive in an
+unrelated repo when `$LOCAL_REPO` is missing). Only then does an explicit `git -C "$LOCAL_REPO"` archive
+(never ambient git) and materialize exactly that uncompressed `source.tar` — never the GitHub
+`source.tar.gz`:
 
 ```bash
 PYTHONPATH=scripts python3 -m crucible show-target --run "$RUN" > "$RUN/loaded-target.json"
-RECORDED_REPOSITORY=$(/Users/sri/personal/crucible/.venv/bin/python -c \
+RECORDED_REPOSITORY_IDENTITY=$(/Users/sri/personal/crucible/.venv/bin/python -c \
   'import json,sys; print(json.load(open(sys.argv[1]))["repository"])' \
   "$RUN/loaded-target.json")
 HEAD_SHA=$(/Users/sri/personal/crucible/.venv/bin/python -c \
   'import json,sys; print(json.load(open(sys.argv[1]))["head"]["sha"])' \
   "$RUN/loaded-target.json")
-test -n "$RECORDED_REPOSITORY" && test -n "$HEAD_SHA"
-test "$(PYTHONPATH=scripts python3 -m crucible repository-identity --repo "$LOCAL_REPO")" = "$RECORDED_REPOSITORY"
+OBSERVED_REPOSITORY=
+if test -n "$RECORDED_REPOSITORY_IDENTITY" && test -n "$HEAD_SHA" && test -d "$LOCAL_REPO"
+then
+  OBSERVED_REPOSITORY=$(PYTHONPATH=scripts python3 -m crucible repository-identity \
+    --repo "$LOCAL_REPO")
+fi
 rm -f "$RUN/source.tar"
 SOURCE_AVAILABLE=no
-if git -C "$LOCAL_REPO" archive --format=tar --output "$RUN/source.tar" "$HEAD_SHA"
+if test -n "$RECORDED_REPOSITORY_IDENTITY" && test -n "$HEAD_SHA" && test -d "$LOCAL_REPO" \
+  && test "$OBSERVED_REPOSITORY" = "$RECORDED_REPOSITORY_IDENTITY" \
+  && test "$(git -C "$LOCAL_REPO" rev-parse HEAD)" = "$HEAD_SHA" \
+  && git -C "$LOCAL_REPO" archive --format=tar --output "$RUN/source.tar" "$HEAD_SHA"
 then
   if PYTHONPATH=scripts python3 -m crucible materialize-target \
     --run "$RUN" --archive "$RUN/source.tar"
@@ -738,10 +749,12 @@ fi
 Document local and diff modes with the corresponding `normalize-target` subcommands. Local mode uses
 the single `--range BASE..HEAD|BASE...HEAD` option, rejects separate base/head flags, always records
 merge base, and emits the same patch for either spelling. Local materialization mirrors the same
-fail-closed, non-fatal flow (identity/head checks stay hard gates; a failed archive or rejected
-materialization discards the partial `source.tar` and leaves `SOURCE_AVAILABLE=no`). Diff mode sets
-`SOURCE_AVAILABLE=no` and has no source materialization. Whenever `SOURCE_AVAILABLE=no`, both peers get
-the same status and the review continues patch-only with runtime-verified claims treated as unverified.
+fail-closed, non-fatal flow: the identity/head checks are `&&`-joined conjuncts of the one `if` that
+gates the archive (a parse/identity/head mismatch short-circuits past the archive, never invokes
+materialize, and leaves `SOURCE_AVAILABLE=no`), and a failed archive or rejected materialization discards
+the partial `source.tar` and leaves `SOURCE_AVAILABLE=no`. Diff mode sets `SOURCE_AVAILABLE=no` and has no
+source materialization. Whenever `SOURCE_AVAILABLE=no`, both peers get the same status and the review
+continues patch-only with runtime-verified claims treated as unverified.
 
 - [ ] **Step 4: Update peer and execution protocols**
 
