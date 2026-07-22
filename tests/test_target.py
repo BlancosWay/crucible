@@ -1325,7 +1325,7 @@ def test_extract_github_style_strips_top_level(tmp_path):
     # staging is gone after the atomic rename
     assert not (tmp_path / "source.staging").exists()
     # extraction NEVER writes Crucible metadata into the reviewed source, nor an adjacent receipt
-    assert list(p.name for p in dest.iterdir()) == sorted(["README.md", "src"])
+    assert sorted(p.name for p in dest.iterdir()) == ["README.md", "src"]
     assert not source_receipt_path(dest).exists()
 
 
