@@ -693,6 +693,62 @@ def test_local_target_records_all_three_shas(tmp_path):
     assert target.base.repository is None and target.head.repository is None
 
 
+def test_local_normalization_neutralizes_ext_diff_driver(tmp_path):
+    """F1a: a repo-configured external diff driver must NOT execute during normalization, and the
+    recorded patch/diff_sha256 must be the real content diff, not the driver's output."""
+    repo = _init_repo(tmp_path / "repo")
+    sentinel = tmp_path / "driver_ran"
+    driver = tmp_path / "drv.sh"
+    driver.write_text(f"#!/bin/sh\ntouch {sentinel}\necho 'FORGED DRIVER OUTPUT'\n")
+    driver.chmod(0o755)
+    _git(repo, "config", "diff.forge.command", str(driver))
+    (repo / "code.txt").write_text("v1\n")
+    (repo / ".gitattributes").write_text("code.txt diff=forge\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "base")
+    _git(repo, "checkout", "-q", "-b", "feature")
+    (repo / "code.txt").write_text("v2-real-change\n")
+    _git(repo, "commit", "-qam", "change code")
+    target, patch = normalize_local_target(repo, "main..feature", {"title": "t", "body": "b"})
+    assert not sentinel.exists(), "external diff driver executed during normalization"
+    assert b"FORGED DRIVER OUTPUT" not in patch
+    assert b"v2-real-change" in patch
+    real = subprocess.run(
+        ["git", "-C", str(repo), "-c", "core.autocrlf=false", "diff", "--no-ext-diff",
+         "--no-textconv", "--binary", f"{target.merge_base_sha}..{target.head.sha}"],
+        check=True, capture_output=True).stdout
+    assert target.diff_sha256 == hashlib.sha256(real).hexdigest()
+
+
+def test_local_normalization_accepts_non_ascii_filename(tmp_path):
+    """F1b: a changed file with a non-ASCII name is recorded with its exact UTF-8 path, not rejected
+    for git C-quoting."""
+    repo = _init_repo(tmp_path / "repo")
+    (repo / "base.txt").write_text("x\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "base")
+    _git(repo, "checkout", "-q", "-b", "feature")
+    (repo / "caf\u00e9.py").write_text("y\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "add cafe")
+    target, _ = normalize_local_target(repo, "main..feature", {"title": "t", "body": "b"})
+    assert target.changed_files == ("caf\u00e9.py",)
+
+
+def test_local_normalization_ascii_change_unchanged(tmp_path):
+    """Regression: hardening must not change the recorded patch/changed_files for an ordinary ASCII,
+    driver-free change."""
+    repo = init_diverged_repo(tmp_path)
+    target, patch = normalize_local_target(repo, "main..feature", {"title": "t", "body": "b"})
+    assert target.changed_files == ("app.py",)
+    real = subprocess.run(
+        ["git", "-C", str(repo), "diff", "--no-ext-diff", "--no-textconv", "--binary",
+         f"{target.merge_base_sha}..{target.head.sha}"],
+        check=True, capture_output=True).stdout
+    assert patch == real
+    assert b"feature change" in patch
+
+
 def test_parse_range_rejects_bad_inputs():
     from crucible.target import parse_range
     assert parse_range("main..feature") == ("main", "feature")
@@ -1271,6 +1327,98 @@ def test_diff_normalization_empty_patch_has_no_changed_files():
     assert target.diff_sha256 == hashlib.sha256(b"").hexdigest()
 
 
+def _diff_changed(diff: bytes):
+    return normalize_diff_target(diff, {"title": "t", "body": "b"}).changed_files
+
+
+def test_diff_changed_files_modified_non_ascii():
+    # git C-quotes a non-ASCII path: cafe + U+00E9 -> \303\251 (UTF-8 octal).
+    diff = (b'diff --git "a/caf\\303\\251.py" "b/caf\\303\\251.py"\n'
+            b'index 111..222 100644\n'
+            b'--- "a/caf\\303\\251.py"\n'
+            b'+++ "b/caf\\303\\251.py"\n'
+            b'@@ -1 +1 @@\n-old\n+new\n')
+    assert _diff_changed(diff) == ("caf\u00e9.py",)
+
+
+def test_diff_changed_files_deleted_non_ascii():
+    # A deletion: +++ is /dev/null, so the path must come from --- (or the header), not +++.
+    diff = (b'diff --git "a/caf\\303\\251.py" "b/caf\\303\\251.py"\n'
+            b'deleted file mode 100644\nindex 111..0000000\n'
+            b'--- "a/caf\\303\\251.py"\n+++ /dev/null\n'
+            b'@@ -1 +0,0 @@\n-gone\n')
+    assert _diff_changed(diff) == ("caf\u00e9.py",)
+
+
+def test_diff_changed_files_added_non_ascii():
+    # An addition: --- is /dev/null, path comes from +++.
+    diff = (b'diff --git "a/caf\\303\\251.py" "b/caf\\303\\251.py"\n'
+            b'new file mode 100644\nindex 0000000..111\n'
+            b'--- /dev/null\n+++ "b/caf\\303\\251.py"\n'
+            b'@@ -0,0 +1 @@\n+hi\n')
+    assert _diff_changed(diff) == ("caf\u00e9.py",)
+
+
+def test_diff_changed_files_path_with_space_unquoted():
+    # git does NOT quote a space; the header is unquoted and --- / +++ carry the path.
+    diff = (b'diff --git a/my file.py b/my file.py\n'
+            b'index 1..2 100644\n--- a/my file.py\n+++ b/my file.py\n@@ -1 +1 @@\n-a\n+b\n')
+    assert _diff_changed(diff) == ("my file.py",)
+
+
+def test_diff_changed_files_path_with_tab_quoted():
+    diff = (b'diff --git "a/a\\tb.py" "b/a\\tb.py"\n'
+            b'index 1..2 100644\n--- "a/a\\tb.py"\n+++ "b/a\\tb.py"\n@@ -1 +1 @@\n-a\n+b\n')
+    assert _diff_changed(diff) == ("a\tb.py",)
+
+
+def test_diff_changed_files_mode_only_path_with_b_slash():
+    # A pure mode change has NO ---/+++ lines; the only path source is the (unquoted, ambiguous)
+    # header. Path 'a b/x' literally contains ' b/', so a naive first-' b/' split corrupts it.
+    diff = (b'diff --git a/a b/x b/a b/x\nold mode 100644\nnew mode 100755\n')
+    assert _diff_changed(diff) == ("a b/x",)
+
+
+def test_diff_changed_files_rename_non_ascii():
+    diff = (b'diff --git "a/old\\303\\251.py" "b/new\\303\\251.py"\n'
+            b'similarity index 100%\n'
+            b'rename from "old\\303\\251.py"\n'
+            b'rename to "new\\303\\251.py"\n')
+    assert _diff_changed(diff) == ("new\u00e9.py", "old\u00e9.py")
+
+
+def test_diff_changed_files_ascii_unchanged():
+    diff = (b"diff --git a/src/app.py b/src/app.py\n"
+            b"index 1..2 100644\n--- a/src/app.py\n+++ b/src/app.py\n@@ -1 +1 @@\n-x\n+y\n")
+    assert _diff_changed(diff) == ("src/app.py",)
+
+
+def test_diff_changed_files_malformed_header_does_not_raise():
+    diff = b"diff --git bogusheader with no valid paths\nnot a real diff body\n"
+    # best-effort: must not raise; yields no bogus entry
+    assert _diff_changed(diff) == ()
+
+
+def test_diff_changed_files_raw_hunk_content_not_parsed_as_header():
+    # A raw patch (no 'diff --git') whose hunk BODY contains lines that look like file headers
+    # (`--- a/x` / `+++ b/x`) must NOT be recorded — they are removed/added CONTENT, not headers.
+    diff = (b"--- a/real.txt\n+++ b/real.txt\n"
+            b"@@ -1,3 +1,3 @@\n"
+            b" context line\n"
+            b"--- a/injected.txt\n"
+            b"+++ b/injected.txt\n"
+            b" tail context\n")
+    assert _diff_changed(diff) == ("real.txt",)
+
+
+def test_diff_changed_files_raw_multi_file_patch():
+    # A raw multi-file patch: both file headers (delimited only by ---/+++ pairs, no 'diff --git')
+    # must be captured once each hunk body is consumed.
+    diff = (b"--- a/file1.txt\n+++ b/file1.txt\n@@ -1 +1 @@\n-a\n+b\n"
+            b"--- a/file2.txt\n+++ b/file2.txt\n@@ -1 +1 @@\n-c\n+d\n")
+    assert _diff_changed(diff) == ("file1.txt", "file2.txt")
+
+
 # --------------------------------------------------------------------------------------
 # Confined source materialization (real tarfile fixtures; limits shrunk, not exhausted)
 # --------------------------------------------------------------------------------------
@@ -1534,6 +1682,43 @@ def test_extract_rejects_duplicate_after_strip(tmp_path):
     archive = _write_tar(tmp_path / "dup.tar", build)
     with pytest.raises(ValueError, match="duplicate"):
         safe_extract_source_archive(archive, tmp_path / "source", strip_wrapper=True)
+    assert not (tmp_path / "source").exists()
+
+
+def test_extract_rejects_case_colliding_parent_dir(tmp_path):
+    # The confirmed collapse: Foo/a.txt + foo/b.txt have DISTINCT full paths but share a parent
+    # directory in differing case (Foo vs foo). On a case-insensitive filesystem they silently merge
+    # under one casing; rejected deterministically on EVERY platform, even with no explicit directory
+    # members in the tar.
+    def build(tar):
+        _add_file(tar, "Foo/a.txt", b"1")
+        _add_file(tar, "foo/b.txt", b"2")
+    archive = _write_tar(tmp_path / "case.tar", build)
+    with pytest.raises(ValueError, match="filesystem-ambiguous"):
+        safe_extract_source_archive(archive, tmp_path / "source", strip_wrapper=False)
+    assert not (tmp_path / "source").exists()
+
+
+def test_extract_allows_same_cased_directory(tmp_path):
+    # Reusing a directory with the SAME casing is fine; both files extract.
+    def build(tar):
+        _add_file(tar, "Foo/a.txt", b"1")
+        _add_file(tar, "Foo/b.txt", b"2")
+    archive = _write_tar(tmp_path / "ok.tar", build)
+    safe_extract_source_archive(archive, tmp_path / "source", strip_wrapper=False)
+    assert (tmp_path / "source" / "Foo" / "a.txt").read_bytes() == b"1"
+    assert (tmp_path / "source" / "Foo" / "b.txt").read_bytes() == b"2"
+
+
+def test_extract_rejects_case_colliding_same_basename(tmp_path):
+    # A same-basename case collision (previously an extraction-time FileExistsError) is now caught
+    # deterministically at validation as a filesystem-ambiguous path.
+    def build(tar):
+        _add_file(tar, "Foo/x.txt", b"1")
+        _add_file(tar, "foo/x.txt", b"2")
+    archive = _write_tar(tmp_path / "case2.tar", build)
+    with pytest.raises(ValueError, match="filesystem-ambiguous"):
+        safe_extract_source_archive(archive, tmp_path / "source", strip_wrapper=False)
     assert not (tmp_path / "source").exists()
 
 

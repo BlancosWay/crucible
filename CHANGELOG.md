@@ -7,6 +7,30 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
 
 ## [Unreleased]
 
+### Fixed
+- **Local-range target normalization is hardened against ambient/hostile git configuration.**
+  `crucible normalize-target local` now derives the recorded patch and changed-file set with
+  `--no-ext-diff --no-textconv --no-color` and neutralized global/system git config and attributes,
+  so an attribute-driven `diff.<driver>` can no longer execute during normalization or replace the
+  recorded patch and its `diff_sha256`, and a non-ASCII changed-file name is read NUL-delimited
+  (`--name-only -z`) instead of being rejected for git C-quoting.
+- **Diff-file target changed-file parsing handles git C-quoted, deleted, renamed, and mode-only
+  paths.** `crucible normalize-target diff` now un-quotes git's C-style path quoting and reads paths
+  from `---`/`+++` hunk headers and `rename from`/`rename to` lines (falling back to the `diff --git`
+  header only for pure mode-only/binary changes), so a plain `git diff` touching a non-ASCII path — or
+  deleting/renaming one — is accepted with the correct paths instead of failing with a misleading
+  "must use POSIX separators" error.
+- **Source archives with case-insensitively colliding member paths are rejected deterministically.**
+  `safe_extract_source_archive` now rejects an archive whose members — or a shared parent directory —
+  differ only in letter case (e.g. `Foo/a.txt` + `foo/b.txt`), which on a case-insensitive filesystem
+  (macOS/Windows) would otherwise silently collapse and diverge the extracted snapshot (and its
+  `diff_sha256`) from the archive. The accept/reject decision is now the same on every platform.
+- **The run report cautions when a github-pr review has an empty content diff.** Because a PR's patch
+  and changed-file set are derived solely from the base/head archives (which omit submodule pointer
+  OIDs), the report now flags a github-pr target whose content diff is empty, noting that submodule
+  pointer bumps or other non-content changes are not captured and must be verified from the PR's file
+  list.
+
 ## [0.19.0] - 2026-07-22
 
 ### Added

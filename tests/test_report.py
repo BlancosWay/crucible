@@ -1744,6 +1744,41 @@ def test_report_renders_snapshot_derived_changed_files(tmp_path):
     assert "src/new.py" in target and "src/old.py" in target
 
 
+_EMPTY_PATCH_SHA = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+
+def test_report_cautions_on_empty_github_content_diff(tmp_path):
+    # F2: a github-pr review with a genuinely empty content diff surfaces a caution that submodule
+    # pointer bumps / non-content changes are not captured (they are invisible to archive diffing).
+    manifest = dict(_GITHUB_TARGET, changed_files=[], diff_sha256=_EMPTY_PATCH_SHA)
+    run, _ = _pr_review_with_target(tmp_path, manifest)
+    target = _section(render_markdown(run), "Review target")
+    assert "Empty content diff" in target
+    assert "submodule" in target
+
+
+def test_report_no_caution_when_github_has_changed_files(tmp_path):
+    run, _ = _pr_review_with_target(tmp_path, _GITHUB_TARGET)  # changed_files=["src/a.py"]
+    target = _section(render_markdown(run), "Review target")
+    assert "Empty content diff" not in target
+
+
+def test_report_no_caution_when_github_empty_files_but_nonempty_patch(tmp_path):
+    # Precise trigger: empty changed_files beside a NON-empty patch hash -> no caution.
+    manifest = dict(_GITHUB_TARGET, changed_files=[], diff_sha256="a" * 64)
+    run, _ = _pr_review_with_target(tmp_path, manifest)
+    target = _section(render_markdown(run), "Review target")
+    assert "Empty content diff" not in target
+
+
+def test_report_no_github_caution_for_diff_file_target(tmp_path):
+    # The caution is github-pr specific: a diff-file target with an empty content diff gets none.
+    manifest = dict(_DIFF_TARGET, changed_files=[], diff_sha256=_EMPTY_PATCH_SHA)
+    run, _ = _pr_review_with_target(tmp_path, manifest)
+    target = _section(render_markdown(run), "Review target")
+    assert "Empty content diff" not in target
+
+
 def test_report_renders_local_range_target(tmp_path):
     run, _ = _pr_review_with_target(tmp_path, _LOCAL_TARGET)
     target = _section(render_markdown(run), "Review target")

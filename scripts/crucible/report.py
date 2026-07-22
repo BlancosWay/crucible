@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from typing import Any
@@ -629,6 +630,16 @@ def _review_target_lines(events: list[dict[str, Any]], workflow: str | None) -> 
     files = target.changed_files
     listed = ", ".join(_san(f) for f in files) if files else "(none)"
     lines.append(f"**Changed files ({len(files)}):** {listed}")
+    # F2: a github-pr review derives its patch/changed-files SOLELY from the base/head archives, which
+    # omit submodule pointer (gitlink) OIDs. A genuinely empty content diff for a github-pr therefore
+    # cannot distinguish "nothing changed" from "only a submodule pointer / other non-content change" —
+    # surface that blind spot explicitly rather than silently showing zero changes.
+    if (target.kind == "github-pr" and not files
+            and target.diff_sha256 == hashlib.sha256(b"").hexdigest()):
+        lines.append(
+            "**\u26a0 Empty content diff:** this pull request's derived patch is empty; any submodule "
+            "pointer changes or other non-content changes are not captured by content diffing — "
+            "verify them from the PR's file list on GitHub.")
     lines.append(f"**Patch hash:** `{_san(target.diff_sha256)}`")
     lines.append(f"**Target hash:** `{_san(sha)}`")
     snapshot = _source_snapshot_line(events, workflow)
