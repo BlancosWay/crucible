@@ -151,6 +151,51 @@ def _no_plain_verdict(text: str) -> None:
                 f"symmetric-verdict takes no --resolutions: {line!r}"
 
 
+def _github_acquisition_block(section: str) -> str:
+    """The single executable GitHub before/diff/after acquisition loop in `section`."""
+    blocks = [b for b in _bash_blocks(section)
+              if "normalize-target github" in b and "gh pr diff" in b]
+    assert len(blocks) == 1, \
+        "exactly one executable GitHub before/diff/after acquisition block is required"
+    return blocks[0]
+
+
+def _assert_github_acquisition_fails_closed(block: str) -> None:
+    """The GitHub before/diff/after acquisition must fail CLOSED without a global `set -e` (Task 3,
+    round 2): bounded 3-attempt retry, EACH gh read explicitly error-checked, `normalize-target` only
+    after all three succeed, EVERY partial before/after/diff/target artifact discarded on any failure,
+    a clear non-zero halt on exhaustion, and the metadata-drift retry preserved."""
+    joined = re.sub(r"\\\n\s*", "", block)
+    flat = " ".join(joined.split())
+
+    assert "for ATTEMPT in 1 2 3" in flat, "acquisition must retry within a bounded 3-attempt loop"
+    assert "ok=1" in flat, "each attempt must reset the success flag before the gh reads"
+
+    gh_lines = [ln.strip() for ln in joined.splitlines()
+                if "gh pr view" in ln or "gh pr diff" in ln]
+    assert len(gh_lines) == 3, f"expected exactly 3 gh acquisition commands, found {len(gh_lines)}"
+    for ln in gh_lines:
+        assert "|| ok=0" in ln, \
+            f"each gh command must record failure explicitly (|| ok=0), never rely on set -e: {ln!r}"
+
+    assert re.search(
+        r'\[\s*"\$ok"\s*=\s*1\s*\]\s*&&\s*PYTHONPATH=\S+ python3 -m crucible normalize-target github',
+        flat), \
+        "normalize-target github must be guarded by the success flag — run only after all three reads"
+    assert re.search(r"normalize-target github.*?then\s+break", flat), \
+        "normalize-target must gate the loop break so metadata drift (non-zero exit) retries"
+
+    rm = re.search(r"rm -f [^\n]*", joined)
+    assert rm, "acquisition must clean up partial artifacts on failure"
+    for name in ("pr-before.json", "pr-after.json", "pr.diff", "target.json", "target.diff"):
+        assert name in rm.group(0), f"cleanup must remove the partial {name} on any failure"
+
+    assert re.search(r'\[\s*"\$ATTEMPT"\s*-lt\s*3\s*\][^\n]*exit 1', joined), \
+        "after the 3rd attempt the acquisition must halt clearly (exit non-zero)"
+    assert re.search(r"echo[^\n]*(fail|abort|halt)", joined, re.I), \
+        "the halt must announce the acquisition failure"
+
+
 def test_skill_exists_with_frontmatter():
     text = SKILL.read_text()
     assert text.startswith("---")
@@ -365,6 +410,14 @@ def test_skill_normalizes_target_into_immutable_manifest_before_plan():
     assert "--range" in setup
     assert "git diff <range>" not in setup
     assert "gh pr view <n> --json title,body,files" not in setup
+
+
+def test_skill_github_acquisition_fails_closed():
+    # Finding (Task 3, round 2): the SKILL's `gh pr view`/`gh pr diff` reads were unchecked, so a failed
+    # command left an empty/truncated artifact that stable before/after metadata still let
+    # `normalize-target` hash into a target. The live skill's acquisition loop must fail closed.
+    section = _section(SKILL.read_text(), "Normalize the input")
+    _assert_github_acquisition_fails_closed(_github_acquisition_block(section))
 
 
 def test_skill_peer_attestation_binds_target_sha256():

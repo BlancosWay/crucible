@@ -24,19 +24,24 @@ metadata; the base/head commit **OIDs** and repository identities are authoritat
 immutable — correcting it needs a **fresh run**.
 
 **GitHub PR** (`--goal` names a PR number/URL). Read the metadata **before and after** `gh pr diff`
-and reject the target if any identity field moved between the two reads (retry the whole acquisition,
-≤3 attempts). The stable before/after title/body supplies the intent directly:
+and fail **closed** without relying on a global `set -e`: error-check each of the three `gh` reads and
+run `normalize-target` **only after all three succeed** (a failed read otherwise leaves an
+empty/truncated artifact that stable before/after metadata would still normalize). Any failure — a
+non-zero `gh` read, or a metadata drift between the two reads (an identity field moved) — discards
+**every** partial before/after/diff/target artifact and retries (≤3 attempts, halting clearly on
+exhaustion). The stable before/after title/body supplies the intent directly:
 
 ```bash
 for ATTEMPT in 1 2 3; do
-  gh pr view "$PR" --json number,url,title,body,files,baseRefName,baseRefOid,headRefName,headRefOid,headRepository,headRepositoryOwner,isCrossRepository > "$RUN"/pr-before.json
-  gh pr diff "$PR" > "$RUN"/pr.diff
-  gh pr view "$PR" --json number,url,title,body,files,baseRefName,baseRefOid,headRefName,headRefOid,headRepository,headRepositoryOwner,isCrossRepository > "$RUN"/pr-after.json
-  if PYTHONPATH=scripts python3 -m crucible normalize-target github --metadata-before "$RUN"/pr-before.json --metadata-after "$RUN"/pr-after.json --diff "$RUN"/pr.diff --output "$RUN"/target.json --diff-output "$RUN"/target.diff; then
+  ok=1
+  gh pr view "$PR" --json number,url,title,body,files,baseRefName,baseRefOid,headRefName,headRefOid,headRepository,headRepositoryOwner,isCrossRepository > "$RUN"/pr-before.json || ok=0
+  [ "$ok" = 1 ] && { gh pr diff "$PR" > "$RUN"/pr.diff || ok=0; }
+  [ "$ok" = 1 ] && { gh pr view "$PR" --json number,url,title,body,files,baseRefName,baseRefOid,headRefName,headRefOid,headRepository,headRepositoryOwner,isCrossRepository > "$RUN"/pr-after.json || ok=0; }
+  if [ "$ok" = 1 ] && PYTHONPATH=scripts python3 -m crucible normalize-target github --metadata-before "$RUN"/pr-before.json --metadata-after "$RUN"/pr-after.json --diff "$RUN"/pr.diff --output "$RUN"/target.json --diff-output "$RUN"/target.diff; then
     break
   fi
-  rm -f "$RUN"/pr-before.json "$RUN"/pr-after.json "$RUN"/pr.diff
-  [ "$ATTEMPT" -lt 3 ] || exit 1
+  rm -f "$RUN"/pr-before.json "$RUN"/pr-after.json "$RUN"/pr.diff "$RUN"/target.json "$RUN"/target.diff
+  [ "$ATTEMPT" -lt 3 ] || { echo "pr-review: GitHub target acquisition failed after 3 attempts" >&2; exit 1; }
 done
 ```
 

@@ -15,8 +15,10 @@
 - Exactly one canonical `target_loaded` event is allowed, before `load-dag`, PLAN output, or protocol events.
 - Every pr-review PLAN/thread/FINAL binding and peer attestation includes exact `target_sha256`.
 - GitHub PR metadata records base/head repository identity plus immutable base/head OIDs and fork status.
-- GitHub metadata is read before and after `gh pr diff`; every identity field must match or the whole
-  acquisition is retried, at most three times.
+- GitHub metadata is read before and after `gh pr diff`; the acquisition fails closed (each of the
+  three `gh` reads is error-checked, `normalize-target` runs only after all three succeed), and any
+  failed read or drifted identity field discards every partial artifact and retries, at most three
+  times, halting clearly on exhaustion.
 - Local range normalization always diffs `merge_base_sha..head_sha`, regardless of input spelling `..` or `...`.
 - Diff-file targets are patch-bound only (`revision_bound: false`) and never borrow ambient source context.
 - GitHub PR and diff-file targets never execute locally.
@@ -651,21 +653,22 @@ Document this exact GitHub flow:
 
 ```bash
 for ATTEMPT in 1 2 3; do
+  ok=1
   gh pr view "$PR" --json \
   number,url,title,body,files,baseRefName,baseRefOid,headRefName,headRefOid,\
-headRepository,headRepositoryOwner,isCrossRepository > "$RUN/pr-before.json"
-  gh pr diff "$PR" > "$RUN/pr.diff"
-  gh pr view "$PR" --json \
+headRepository,headRepositoryOwner,isCrossRepository > "$RUN/pr-before.json" || ok=0
+  [ "$ok" = 1 ] && { gh pr diff "$PR" > "$RUN/pr.diff" || ok=0; }
+  [ "$ok" = 1 ] && { gh pr view "$PR" --json \
   number,url,title,body,files,baseRefName,baseRefOid,headRefName,headRefOid,\
-headRepository,headRepositoryOwner,isCrossRepository > "$RUN/pr-after.json"
-  if PYTHONPATH=scripts python3 -m crucible normalize-target github \
+headRepository,headRepositoryOwner,isCrossRepository > "$RUN/pr-after.json" || ok=0; }
+  if [ "$ok" = 1 ] && PYTHONPATH=scripts python3 -m crucible normalize-target github \
     --metadata-before "$RUN/pr-before.json" --metadata-after "$RUN/pr-after.json" \
     --diff "$RUN/pr.diff" \
     --output "$RUN/target.json" --diff-output "$RUN/target.diff"; then
     break
   fi
-  rm -f "$RUN/pr-before.json" "$RUN/pr-after.json" "$RUN/pr.diff"
-  [ "$ATTEMPT" -lt 3 ] || exit 1
+  rm -f "$RUN/pr-before.json" "$RUN/pr-after.json" "$RUN/pr.diff" "$RUN/target.json" "$RUN/target.diff"
+  [ "$ATTEMPT" -lt 3 ] || { echo "pr-review: GitHub target acquisition failed after 3 attempts" >&2; exit 1; }
 done
 PYTHONPATH=scripts python3 -m crucible load-target \
   --run "$RUN" --file "$RUN/target.json" --diff "$RUN/target.diff"

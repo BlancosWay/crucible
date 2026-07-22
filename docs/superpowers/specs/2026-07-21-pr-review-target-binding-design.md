@@ -149,7 +149,11 @@ The orchestrator resolves these values with `gh pr view` fields including `baseR
 `headRefOid`, `headRepository`, `headRepositoryOwner`, and `isCrossRepository`, read **before and
 after** `gh pr diff`; a change in any immutable identity field between the two reads rejects the target
 so the whole acquisition can be retried. Branch names are display metadata; SHAs and repository
-identities are authoritative, and intent comes from the stable before/after title/body.
+identities are authoritative, and intent comes from the stable before/after title/body. Because
+`normalize-target` hashes whatever diff bytes it is handed, the acquisition must fail **closed** (see
+[Error handling](#error-handling)): each `gh` read is error-checked and normalization proceeds only
+after all three succeed, so a failed `gh pr diff` can never feed an empty/truncated patch that stable
+metadata would still normalize.
 
 ### Local range variant
 
@@ -393,6 +397,12 @@ and diff-file targets remain non-executable regardless of archive availability.
 ## Error handling
 
 - PR metadata without immutable SHAs/repository identity: halt normalization.
+- GitHub before/diff/after acquisition fails **closed**, never relying on a global `set -e`: each of
+  the three `gh pr view`/`gh pr diff` reads is explicitly error-checked and `normalize-target` runs
+  only after **all three** succeed. A failed read leaves an **empty or truncated** artifact that stable
+  before/after metadata would otherwise let `normalize-target` hash into a target, so any failure — a
+  non-zero `gh` read or a drifted identity field — discards every partial before/after/diff/target
+  artifact and retries, bounded to three attempts and halting clearly on exhaustion.
 - Head archive unavailable or unsafe: continue patch-only only after clearly marking source context
   unavailable; do not read ambient files.
 - Local ref missing or ambiguous: reject before `load-target`.

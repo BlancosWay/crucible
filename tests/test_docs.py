@@ -112,6 +112,51 @@ def _bash_blocks(text: str) -> list[str]:
     return re.findall(r"```bash\n(.*?)```", text, re.DOTALL)
 
 
+def _github_acquisition_block(text: str) -> str:
+    """The single executable GitHub before/diff/after acquisition loop in `text`."""
+    blocks = [b for b in _bash_blocks(text)
+              if "normalize-target github" in b and "gh pr diff" in b]
+    assert len(blocks) == 1, \
+        "exactly one executable GitHub before/diff/after acquisition block is required"
+    return blocks[0]
+
+
+def _assert_github_acquisition_fails_closed(block: str) -> None:
+    """The GitHub before/diff/after acquisition must fail CLOSED without a global `set -e` (Task 3,
+    round 2): bounded 3-attempt retry, EACH gh read explicitly error-checked, `normalize-target` only
+    after all three succeed, EVERY partial before/after/diff/target artifact discarded on any failure,
+    a clear non-zero halt on exhaustion, and the metadata-drift retry preserved."""
+    joined = re.sub(r"\\\n\s*", "", block)
+    flat = " ".join(joined.split())
+
+    assert "for ATTEMPT in 1 2 3" in flat, "acquisition must retry within a bounded 3-attempt loop"
+    assert "ok=1" in flat, "each attempt must reset the success flag before the gh reads"
+
+    gh_lines = [ln.strip() for ln in joined.splitlines()
+                if "gh pr view" in ln or "gh pr diff" in ln]
+    assert len(gh_lines) == 3, f"expected exactly 3 gh acquisition commands, found {len(gh_lines)}"
+    for ln in gh_lines:
+        assert "|| ok=0" in ln, \
+            f"each gh command must record failure explicitly (|| ok=0), never rely on set -e: {ln!r}"
+
+    assert re.search(
+        r'\[\s*"\$ok"\s*=\s*1\s*\]\s*&&\s*PYTHONPATH=\S+ python3 -m crucible normalize-target github',
+        flat), \
+        "normalize-target github must be guarded by the success flag — run only after all three reads"
+    assert re.search(r"normalize-target github.*?then\s+break", flat), \
+        "normalize-target must gate the loop break so metadata drift (non-zero exit) retries"
+
+    rm = re.search(r"rm -f [^\n]*", joined)
+    assert rm, "acquisition must clean up partial artifacts on failure"
+    for name in ("pr-before.json", "pr-after.json", "pr.diff", "target.json", "target.diff"):
+        assert name in rm.group(0), f"cleanup must remove the partial {name} on any failure"
+
+    assert re.search(r'\[\s*"\$ATTEMPT"\s*-lt\s*3\s*\][^\n]*exit 1', joined), \
+        "after the 3rd attempt the acquisition must halt clearly (exit non-zero)"
+    assert re.search(r"echo[^\n]*(fail|abort|halt)", joined, re.I), \
+        "the halt must announce the acquisition failure"
+
+
 def test_no_hardcoded_round_cap_override_in_workflow_examples():
     # The cap must come from run config; workflow command examples must not pass the
     # override. (The argv test form '"--max-rounds", "5"' is intentionally different and ok.)
@@ -439,6 +484,45 @@ def test_target_binding_design_source_snapshots_are_executable_per_kind():
         'local design block must archive via `git -C "$LOCAL_REPO" archive` (never ambient)'
     assert '--archive "$RUN/source.tar"' in local
     assert "source.tar.gz" not in local, "local path must not feed the GitHub source.tar.gz to materialize"
+
+
+TARGET_BINDING_PLAN = (ROOT / "docs" / "superpowers" / "plans"
+                       / "2026-07-21-pr-review-target-binding.md")
+TARGET_BINDING_DESIGN = (ROOT / "docs" / "superpowers" / "specs"
+                         / "2026-07-21-pr-review-target-binding-design.md")
+
+
+def test_target_binding_plan_github_acquisition_fails_closed():
+    # Finding (Task 3, round 2): the plan's Step-3 `gh pr view`/`gh pr diff` reads were unchecked, so a
+    # failed command left an empty/truncated artifact that stable before/after metadata still let
+    # `normalize-target` hash into a target. The plan's executable loop must fail closed.
+    _assert_github_acquisition_fails_closed(
+        _github_acquisition_block(TARGET_BINDING_PLAN.read_text()))
+
+
+def test_target_binding_design_github_acquisition_is_fail_closed():
+    # Finding (Task 3, round 2): the design must state the fail-closed acquisition contract — each of the
+    # three `gh` reads is checked (not only metadata drift), any failure discards the partial artifacts,
+    # retries are bounded, exhaustion halts, and normalize runs only after all three succeed — because
+    # `normalize-target` will hash whatever (possibly empty/truncated) diff bytes it is handed.
+    design = TARGET_BINDING_DESIGN.read_text()
+    errors = _flat(_section(design, "Error handling"))
+    assert "gh pr view" in errors and "gh pr diff" in errors, \
+        "error handling must scope the fail-closed rule to the gh acquisition commands"
+    assert "empty" in errors or "truncat" in errors, \
+        "error handling must name the empty/truncated-artifact hazard"
+    assert "all three" in errors or "each" in errors, \
+        "error handling must require every gh read to succeed, not only stable metadata"
+    assert "discard" in errors or "clean" in errors or "remove" in errors, \
+        "error handling must discard partial artifacts on failure"
+    assert "set -e" in errors, "error handling must warn against relying on a global set -e"
+    assert re.search(r"3 attempt|three attempt|bounded", errors), \
+        "error handling must bound the retries"
+    assert "halt" in errors, "error handling must halt clearly once attempts are exhausted"
+
+    variant = _flat(_section(design, "GitHub PR variant"))
+    assert "fail" in variant and "closed" in variant, \
+        "the GitHub PR variant prose must state the acquisition fails closed"
 
 
 

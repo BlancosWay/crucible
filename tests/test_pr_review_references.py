@@ -1,8 +1,11 @@
 import json
+import os
 import re
+import subprocess
 from pathlib import Path
 
-REF = Path(__file__).resolve().parents[1] / "skills" / "pr-review" / "references"
+ROOT = Path(__file__).resolve().parents[1]
+REF = ROOT / "skills" / "pr-review" / "references"
 
 
 def _read(name: str) -> str:
@@ -123,6 +126,56 @@ def _assert_source_materialization_is_executable_per_kind(section: str) -> None:
 def _no_negated_echo(sec: str) -> None:
     assert not re.search(r"\b(?:do not|don't|never|not)\s+echo\b", sec), \
         "each peer attestation must be required to echo the bindings, not negated"
+
+
+def _github_acquisition_block(section: str) -> str:
+    """The single executable GitHub before/diff/after acquisition loop in `section`."""
+    blocks = [b for b in _bash_blocks(section)
+              if "normalize-target github" in b and "gh pr diff" in b]
+    assert len(blocks) == 1, \
+        "exactly one executable GitHub before/diff/after acquisition block is required"
+    return blocks[0]
+
+
+def assert_github_acquisition_fails_closed(block: str) -> None:
+    """The GitHub before/diff/after acquisition must fail CLOSED without relying on a global `set -e`.
+
+    Finding (Task 3, round 2): the examples ran `gh pr view`/`gh pr diff` unchecked, so a failed command
+    left an empty/truncated artifact that stable before/after metadata still let `normalize-target`
+    hash into a target. The loop must instead: bound retries to 3; explicitly error-check EACH of the
+    three `gh` reads; run `normalize-target` ONLY after all three succeed; discard EVERY partial
+    before/after/diff/target artifact on any failure; halt clearly once the attempts are exhausted; and
+    preserve the metadata-drift retry (a non-zero `normalize-target` exit re-enters the loop)."""
+    joined = re.sub(r"\\\n\s*", "", block)          # fold shell line-continuations to logical lines
+    flat = " ".join(joined.split())
+
+    assert "for ATTEMPT in 1 2 3" in flat, "acquisition must retry within a bounded 3-attempt loop"
+    assert "ok=1" in flat, "each attempt must reset the success flag before the gh reads"
+
+    gh_lines = [ln.strip() for ln in joined.splitlines()
+                if "gh pr view" in ln or "gh pr diff" in ln]
+    assert len(gh_lines) == 3, f"expected exactly 3 gh acquisition commands, found {len(gh_lines)}"
+    for ln in gh_lines:
+        assert "|| ok=0" in ln, \
+            f"each gh command must record failure explicitly (|| ok=0), never rely on set -e: {ln!r}"
+
+    assert re.search(
+        r'\[\s*"\$ok"\s*=\s*1\s*\]\s*&&\s*PYTHONPATH=\S+ python3 -m crucible normalize-target github',
+        flat), \
+        "normalize-target github must be guarded by the success flag — run only after all three reads"
+
+    assert re.search(r"normalize-target github.*?then\s+break", flat), \
+        "normalize-target must gate the loop break so metadata drift (non-zero exit) retries"
+
+    rm = re.search(r"rm -f [^\n]*", joined)
+    assert rm, "acquisition must clean up partial artifacts on failure"
+    for name in ("pr-before.json", "pr-after.json", "pr.diff", "target.json", "target.diff"):
+        assert name in rm.group(0), f"cleanup must remove the partial {name} on any failure"
+
+    assert re.search(r'\[\s*"\$ATTEMPT"\s*-lt\s*3\s*\][^\n]*exit 1', joined), \
+        "after the 3rd attempt the acquisition must halt clearly (exit non-zero)"
+    assert re.search(r"echo[^\n]*(fail|abort|halt)", joined, re.I), \
+        "the halt must announce the acquisition failure"
 
 
 def test_reference_files_exist():
@@ -367,6 +420,66 @@ def test_platform_notes_normalizes_gh_or_local_diff_input():
         assert field in low, f"platform-notes must request the {field} field"
     assert "--range" in low
     assert "git diff <range>" not in low
+
+
+def test_platform_notes_github_acquisition_fails_closed():
+    # Finding (Task 3, round 2): the documented `gh pr view`/`gh pr diff` reads were unchecked, so a
+    # failed command left an empty/truncated artifact that stable before/after metadata still let
+    # `normalize-target` hash into a target. The acquisition loop must fail closed (section-scoped).
+    section = _section(_read("platform-notes.md"), "Input normalization")
+    assert_github_acquisition_fails_closed(_github_acquisition_block(section))
+
+
+def test_platform_notes_github_acquisition_never_normalizes_after_failed_step(tmp_path):
+    # Behavioral proof: run the DOCUMENTED loop with a `gh` that fails on `gh pr diff`. Because a failed
+    # read never reaches `normalize-target`, no target is written and the loop halts non-zero — while the
+    # identical loop with a `gh` that succeeds does reach normalize and writes the target. No `set -e`.
+    section = _section(_read("platform-notes.md"), "Input normalization")
+    loop = _github_acquisition_block(section)
+
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    stable_json = json.dumps({
+        "number": 1, "url": "https://github.com/o/r/pull/1", "title": "t", "body": "b",
+        "files": [{"path": "src/a.py"}], "baseRefName": "main", "baseRefOid": "1" * 40,
+        "headRefName": "feat", "headRefOid": "2" * 40,
+        "headRepository": {"nameWithOwner": "o/r"}, "headRepositoryOwner": {"login": "o"},
+        "isCrossRepository": False,
+    })
+    gh = bindir / "gh"
+    gh.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [ "$1 $2" = "pr view" ]; then\n'
+        f"  printf '%s\\n' '{stable_json}'\n"
+        "  exit 0\n"
+        'elif [ "$1 $2" = "pr diff" ]; then\n'
+        "  echo 'diff --git a/src/a.py b/src/a.py'\n"
+        '  exit "${GH_DIFF_EXIT:-0}"\n'
+        "fi\n"
+        "exit 0\n"
+    )
+    gh.chmod(0o755)
+
+    def _run(diff_exit: str) -> subprocess.CompletedProcess:
+        for stale in ("target.json", "target.diff", "pr.diff", "pr-before.json", "pr-after.json"):
+            (tmp_path / stale).unlink(missing_ok=True)
+        env = dict(os.environ, PATH=f"{bindir}:{os.environ['PATH']}",
+                   PR="1", RUN=str(tmp_path), GH_DIFF_EXIT=diff_exit)
+        # Deliberately NO `set -e`: the loop must fail closed on its own explicit checks.
+        return subprocess.run(["bash", "-c", "set -u\n" + loop], cwd=ROOT, env=env,
+                              capture_output=True, text=True)
+
+    fail = _run("1")
+    assert fail.returncode != 0, f"a failed gh pr diff must halt non-zero:\n{fail.stderr}"
+    assert not (tmp_path / "target.json").exists(), \
+        "no target may be normalized after a failed diff step"
+    assert not (tmp_path / "target.diff").exists(), \
+        "no target patch may be written after a failed diff step"
+
+    ok = _run("0")
+    assert ok.returncode == 0, f"the happy path must succeed:\n{ok.stderr}"
+    assert (tmp_path / "target.json").exists(), "the happy path must normalize a target"
+    assert (tmp_path / "target.diff").exists(), "the happy path must write the target patch"
 
 
 def test_platform_notes_materializes_pinned_source_per_kind():

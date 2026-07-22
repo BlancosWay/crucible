@@ -60,15 +60,27 @@ authoritative. Do all of this **before** `load-dag`/PLAN (a target is immutable 
 a **fresh run**). Full per-source commands live in the "Input normalization" section of
 `references/platform-notes.md`.
 
-- **GitHub PR** — read the PR metadata **before and after** `gh pr diff` (any identity field that
-  differs between the two reads means the PR moved mid-acquisition: discard the artifacts and retry),
-  requesting the immutable OIDs + fork identity, then normalize:
+- **GitHub PR** — read the PR metadata **before and after** `gh pr diff`, requesting the immutable
+  OIDs + fork identity. The acquisition **fails closed** without relying on a global `set -e`: each of
+  the three `gh` reads is error-checked, and `normalize-target` runs **only after all three succeed**
+  (a failed read otherwise leaves an empty/truncated artifact that stable before/after metadata would
+  still normalize). Any failure — a non-zero `gh` read, or a metadata drift between the two reads (an
+  identity field moved, i.e. the PR changed mid-acquisition) — discards **every** partial
+  `pr-before`/`pr-after`/`pr.diff`/`target` artifact and retries, and exhausting the three attempts
+  halts clearly:
 
   ```bash
-  gh pr view "$PR" --json number,url,title,body,files,baseRefName,baseRefOid,headRefName,headRefOid,headRepository,headRepositoryOwner,isCrossRepository > "$RUN"/pr-before.json
-  gh pr diff "$PR" > "$RUN"/pr.diff
-  gh pr view "$PR" --json number,url,title,body,files,baseRefName,baseRefOid,headRefName,headRefOid,headRepository,headRepositoryOwner,isCrossRepository > "$RUN"/pr-after.json
-  PYTHONPATH=scripts python3 -m crucible normalize-target github --metadata-before "$RUN"/pr-before.json --metadata-after "$RUN"/pr-after.json --diff "$RUN"/pr.diff --output "$RUN"/target.json --diff-output "$RUN"/target.diff
+  for ATTEMPT in 1 2 3; do
+    ok=1
+    gh pr view "$PR" --json number,url,title,body,files,baseRefName,baseRefOid,headRefName,headRefOid,headRepository,headRepositoryOwner,isCrossRepository > "$RUN"/pr-before.json || ok=0
+    [ "$ok" = 1 ] && { gh pr diff "$PR" > "$RUN"/pr.diff || ok=0; }
+    [ "$ok" = 1 ] && { gh pr view "$PR" --json number,url,title,body,files,baseRefName,baseRefOid,headRefName,headRefOid,headRepository,headRepositoryOwner,isCrossRepository > "$RUN"/pr-after.json || ok=0; }
+    if [ "$ok" = 1 ] && PYTHONPATH=scripts python3 -m crucible normalize-target github --metadata-before "$RUN"/pr-before.json --metadata-after "$RUN"/pr-after.json --diff "$RUN"/pr.diff --output "$RUN"/target.json --diff-output "$RUN"/target.diff; then
+      break
+    fi
+    rm -f "$RUN"/pr-before.json "$RUN"/pr-after.json "$RUN"/pr.diff "$RUN"/target.json "$RUN"/target.diff
+    [ "$ATTEMPT" -lt 3 ] || { echo "pr-review: GitHub target acquisition failed after 3 attempts" >&2; exit 1; }
+  done
   ```
 - **Local range** — one merge-base `--range` (never a raw two-dot tip diff, and no separate base/head
   flags): `PYTHONPATH=scripts python3 -m crucible normalize-target local --repo "$REPO" --range BASE..HEAD --intent "$RUN"/intent.json --output "$RUN"/target.json --diff-output "$RUN"/target.diff`. `BASE..HEAD` and `BASE...HEAD` both normalize to `merge_base..head`, so a base-only commit never appears as a reverse change.
