@@ -1142,3 +1142,82 @@ def test_extract_rejects_duplicate_after_normalization_in_both_modes(tmp_path, s
     with pytest.raises(ValueError, match="duplicate"):
         safe_extract_source_archive(archive, tmp_path / "source", strip_wrapper=strip_wrapper)
     assert not (tmp_path / "source").exists()
+
+
+# --------------------------------------------------------------------------------------
+# Behavioral: the documented local pr-review protocol path (real CLI + run-log events)
+# --------------------------------------------------------------------------------------
+
+def _cli(capsys, *args):
+    """Run ``crucible.cli.main`` in-process, assert success, and return its captured stdout."""
+    from crucible.cli import main
+    rc = main(list(args))
+    assert rc == 0, f"crucible {args!r} exited {rc}"
+    return capsys.readouterr().out
+
+
+def test_documented_local_protocol_binds_and_reports_target(tmp_path, capsys):
+    """Drive the documented local normalization path end-to-end through the real CLI and assert the
+    manifest SHAs, the feature-only patch, `target_sha256` in the PLAN bindings, and a report
+    `## Review target` section that matches the manifest — the behavioral guard the token-scoped
+    protocol tests cannot regress past."""
+    from crucible.runlog import RunLog
+
+    repo = init_diverged_repo(tmp_path)
+    intent = tmp_path / "intent.json"
+    intent.write_text(json.dumps({"title": "Local range review", "body": "feature change"}))
+
+    # init-run (pr-review) -> RUN path (last non-empty stdout line)
+    out = _cli(capsys, "init-run", "--goal", "review main..feature",
+               "--workflow", "pr-review", "--base-dir", str(tmp_path / "runs"))
+    run = [ln.strip() for ln in out.splitlines() if ln.strip()][-1]
+
+    # normalize-target local --range (single merge-base range) -> manifest + exact patch
+    target_json = tmp_path / "target.json"
+    target_diff = tmp_path / "target.diff"
+    _cli(capsys, "normalize-target", "local", "--repo", str(repo),
+         "--range", "main..feature", "--intent", str(intent),
+         "--output", str(target_json), "--diff-output", str(target_diff))
+
+    # load-target records the one immutable target_loaded event before any DAG/PLAN work
+    _cli(capsys, "load-target", "--run", run,
+         "--file", str(target_json), "--diff", str(target_diff))
+
+    # Manifest base/head/merge-base SHAs match the real divergent repo
+    manifest = json.loads(target_json.read_text())
+    base_sha = _git(repo, "rev-parse", "--verify", "main^{commit}").strip()
+    head_sha = _git(repo, "rev-parse", "--verify", "feature^{commit}").strip()
+    merge_base = _git(repo, "merge-base", base_sha, head_sha).strip()
+    assert manifest["base"]["sha"] == base_sha
+    assert manifest["head"]["sha"] == head_sha
+    assert manifest["merge_base_sha"] == merge_base
+    assert manifest["changed_files"] == ["app.py"]
+
+    # The patch is merge-base..head: only the feature change, never the base-only reverse change
+    patch = target_diff.read_text()
+    assert "app.py" in patch
+    assert "main-only.py" not in patch
+
+    # The loaded target hash appears in the PLAN bindings (recomputed from the real run-log events)
+    dag = tmp_path / "dag.json"
+    dag.write_text(json.dumps({"nodes": [{
+        "id": "review", "title": "Review app.py",
+        "description": "review the feature change to app.py against its callers",
+        "files": ["app.py"],
+        "test_plan": "static evidence (always allowed): rg -n feature app.py",
+        "status": "pending"}], "edges": []}))
+    _cli(capsys, "load-dag", "--run", run, "--file", str(dag))
+    plan = tmp_path / "plan.md"
+    plan.write_text("review plan: interrogate app.py's feature change and its callers\n")
+    _cli(capsys, "log", "--run", run, "--event", "builder_output",
+         "--gate", "plan", "--round", "1", "--file", str(plan))
+    bindings = json.loads(_cli(capsys, "bindings", "--run", run, "--gate", "plan", "--round", "1"))
+    expected_hash = target_sha256(target_from_events(RunLog(run).read_events()))
+    assert bindings["target_sha256"] == expected_hash
+
+    # The report renders a ## Review target section that matches the manifest identity
+    report = _cli(capsys, "report", "--run", run)
+    assert "## Review target" in report
+    assert base_sha in report and head_sha in report and merge_base in report
+    assert manifest["diff_sha256"] in report
+    assert expected_hash in report

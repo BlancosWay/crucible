@@ -29,17 +29,6 @@ Run from the crucible repo (or with `scripts/` on `PYTHONPATH`). Both peers run 
 graph schema is `references/review-thread.md`; per-platform peer dispatch, input normalization, and
 optional posting are in `references/platform-notes.md`.
 
-### Normalize the input first
-
-Resolve the review target into one triple — `diff`, `changed-files`, `intent` — before planning (see
-the "Input normalization" section of `references/platform-notes.md`):
-
-- **GitHub PR:** `gh pr view <n> --json title,body,files` + `gh pr diff <n>`.
-- **Local diff:** a `base..head` range (`git diff <range>`) or a diff file.
-
-Give **both** peers the same normalized triple, and have both read the surrounding real code — not
-just the patch hunks.
-
 ### Start a run — the goal names the PR / diff under review
 
 ```bash
@@ -60,6 +49,44 @@ values live in `config.defaults.json`, but the run's `config.json` governs this 
 `candidate.json`, `peer-a.json`, `peer-b.json`) under `"$RUN"/` — never in the target repo. Runs default to
 `~/.crucible/runs`, so a review of someone else's PR writes nothing into their tree; the review is
 read-only over the target (the deliverable is findings).
+
+### Normalize the input into an immutable target (before PLAN)
+
+Resolve the review target to a deterministic **manifest + exact patch** through the CLI (never
+eyeballed), load it as the run's one immutable `target_loaded` event, and — for a revision-bound
+GitHub/local target — materialize a **pinned, read-only source snapshot** of the exact head commit.
+Branch names are display metadata; the base/head commit **OIDs** and repository identities are
+authoritative. Do all of this **before** `load-dag`/PLAN (a target is immutable — correcting it needs
+a **fresh run**). Full per-source commands live in the "Input normalization" section of
+`references/platform-notes.md`.
+
+- **GitHub PR** — read the PR metadata **before and after** `gh pr diff` (any identity field that
+  differs between the two reads means the PR moved mid-acquisition: discard the artifacts and retry),
+  requesting the immutable OIDs + fork identity, then normalize:
+
+  ```bash
+  gh pr view "$PR" --json number,url,title,body,files,baseRefName,baseRefOid,headRefName,headRefOid,headRepository,headRepositoryOwner,isCrossRepository > "$RUN"/pr-before.json
+  gh pr diff "$PR" > "$RUN"/pr.diff
+  gh pr view "$PR" --json number,url,title,body,files,baseRefName,baseRefOid,headRefName,headRefOid,headRepository,headRepositoryOwner,isCrossRepository > "$RUN"/pr-after.json
+  PYTHONPATH=scripts python3 -m crucible normalize-target github --metadata-before "$RUN"/pr-before.json --metadata-after "$RUN"/pr-after.json --diff "$RUN"/pr.diff --output "$RUN"/target.json --diff-output "$RUN"/target.diff
+  ```
+- **Local range** — one merge-base `--range` (never a raw two-dot tip diff, and no separate base/head
+  flags): `PYTHONPATH=scripts python3 -m crucible normalize-target local --repo "$REPO" --range BASE..HEAD --intent "$RUN"/intent.json --output "$RUN"/target.json --diff-output "$RUN"/target.diff`. `BASE..HEAD` and `BASE...HEAD` both normalize to `merge_base..head`, so a base-only commit never appears as a reverse change.
+- **Diff file** — patch identity only: `PYTHONPATH=scripts python3 -m crucible normalize-target diff --diff "$PATCH" --intent "$RUN"/intent.json --output "$RUN"/target.json --diff-output "$RUN"/target.diff`. A diff-file target is `revision_bound: false`, has **no source snapshot**, and never borrows ambient checkout files.
+
+Load the target, then — GitHub/local only — materialize the pinned snapshot from an archive of the
+**exact head commit**. The head repository/SHA come **only** from `show-target`'s authoritative event
+payload (`gh api "repos/$HEAD_REPOSITORY/tarball/$HEAD_SHA"`, or `git archive` at the local head SHA):
+
+```bash
+PYTHONPATH=scripts python3 -m crucible load-target --run "$RUN" --file "$RUN"/target.json --diff "$RUN"/target.diff
+PYTHONPATH=scripts python3 -m crucible materialize-target --run "$RUN" --archive "$RUN"/source.tar.gz
+```
+
+Give **both** peers the same `RUN/target.diff` and the pinned `RUN/source` snapshot — **never ambient**
+checkout files (which may be a different revision or lack files the change introduces). A diff-file
+target stays patch-only; if the head archive is unavailable or rejected, the review continues
+patch-only with source context explicitly marked unavailable.
 
 ## The symmetric round (how consensus stays equal)
 
@@ -106,13 +133,14 @@ keyed by `(source_gate, id)`, with `source_gate` the exact `dep:<thread>` (or `f
 }
 ```
 
-Each peer's **attestation** echoes the gate's bindings (below) and lists its objections (a
-`dep:<thread>` gate carries all three hashes; PLAN/FINAL omit `node_sha256`):
+Each peer's **attestation** echoes the gate's bindings (below) and lists its objections. Every
+pr-review gate also binds the immutable review `target_sha256`; a `dep:<thread>` gate carries the
+artifact/DAG/node hashes, PLAN/FINAL omit `node_sha256`:
 
 ```json
 {"peer": "A", "gate": "dep:auth", "round": 1, "verdict": "APPROVE",
  "summary": "The candidate set is complete and grounded.", "objections": [],
- "artifact_sha256": "…", "dag_sha256": "…", "node_sha256": "…"}
+ "artifact_sha256": "…", "dag_sha256": "…", "node_sha256": "…", "target_sha256": "…"}
 ```
 
 ## Binding handshake (every gate)
@@ -126,11 +154,13 @@ BINDINGS=$(PYTHONPATH=scripts python3 -m crucible bindings --run "$RUN" --gate "
 ```
 
 - `$BINDINGS` is the exact `crucible bindings` JSON — `artifact_sha256` plus the gate-specific
-  `dag_sha256` (PLAN / FINAL / `dep:`) and `node_sha256` (`dep:` only). Seed **Peer B** with it as
-  **trusted CLI metadata** — **not content copied from the reviewed (untrusted) artifact**.
+  `dag_sha256` (PLAN / FINAL / `dep:`) and `node_sha256` (`dep:` only), and — for pr-review — the
+  immutable `target_sha256` on **every** gate. Seed **Peer B** with it as **trusted CLI metadata** —
+  **not content copied from the reviewed (untrusted) artifact**.
 - **Each peer attestation echoes it.** Both `peer-a.json` and `peer-b.json` copy those
-  `artifact_sha256` / `dag_sha256` / `node_sha256` fields verbatim; `crucible symmetric-verdict`
-  rejects a missing or mismatched binding in **either** file **before** recording any decision.
+  `artifact_sha256` / `dag_sha256` / `node_sha256` / `target_sha256` fields verbatim; `crucible
+  symmetric-verdict` rejects a missing or mismatched binding in **either** file **before** recording
+  any decision.
 - The accepted review plan/graph and each reviewed thread are then immutable — any change requires a
   **fresh run**. A legacy, pre-schema-2 run is read-only and reports `LEGACY / UNVERIFIED`, never
   `CLEAN`.
@@ -150,7 +180,7 @@ Size it adaptively — a single node for a small PR, thread-per-concern for a la
 3. **Both peers independently attest** to the plan + graph (dispatch Peer B per
    `references/platform-notes.md`, seeding `$BINDINGS` as **trusted CLI metadata**; Peer A attests
    directly). Each writes its own `"$RUN"/peer-a.json` / `"$RUN"/peer-b.json`, **echoing**
-   `artifact_sha256` + `dag_sha256` from `$BINDINGS` (PLAN carries no node hash).
+   `artifact_sha256` + `dag_sha256` + `target_sha256` from `$BINDINGS` (PLAN carries no node hash).
 4. Decide: `PYTHONPATH=scripts python3 -m crucible symmetric-verdict --run "$RUN" --gate plan --round N --peer-a "$RUN"/peer-a.json --peer-b "$RUN"/peer-b.json`.
    - `CONSENSUS` -> proceed to Stage 2.
    - `CHANGES` -> revise as Peer A, increment N, re-emit the graph, re-run `load-dag`, re-log, re-decide.
@@ -182,9 +212,27 @@ Classify the target:
 - **GitHub PR number/URL** → static review + **existing CI** evidence (read-only `gh pr checks` / the
   PR's already-produced checks); **never execute locally**.
 - **Diff file** → static evidence only; **never execute locally**.
-- **Local checkout/range** → static by default; execution requires explicit **trusted-local** consent.
+- **Local checkout/range** → static by default; execution requires explicit **trusted-local** consent
+  **and** proof the checkout is the exact recorded head revision.
 
-For a local checkout, collect every execution candidate from the approved DAG. Show the **exact
+For a **local checkout/range**, before showing any command for consent, prove the checkout is the
+**exact recorded head revision** (a GitHub-PR or diff-file target never reaches this step). Read the
+recorded identity from `show-target` (`.repository`, `.head.sha`), then:
+
+```bash
+OBSERVED_REPOSITORY=$(PYTHONPATH=scripts python3 -m crucible repository-identity --repo "$LOCAL_REPO")
+test "$OBSERVED_REPOSITORY" = "$RECORDED_REPOSITORY_IDENTITY"          # same repository identity
+test -z "$(git -C "$LOCAL_REPO" status --porcelain)"                  # clean working tree
+test "$(git -C "$LOCAL_REPO" rev-parse HEAD)" = "$RECORDED_HEAD_SHA"  # exact recorded head.sha
+```
+
+If **any** check fails, **do not run commands**: offer static-only continuation, or an exact
+**detached worktree-at-SHA** command set (`git worktree add --detach <path> "$RECORDED_HEAD_SHA"`)
+that itself requires **fresh consent**. Save the observed repository identity, head SHA, clean status,
+and the approved command list in the execution evidence handed to both peers and rendered in the
+review provenance.
+
+Once the checkout verifies, collect every execution candidate from the approved DAG. Show the **exact
 commands** and warn that they execute **arbitrary code** with the current user's file, credential,
 environment, and network access. Ask the human to approve that exact command set, continue without
 execution, or cancel the review.
@@ -212,7 +260,8 @@ For each `$NODE`:
 
 1. `PYTHONPATH=scripts python3 -m crucible set-status --run "$RUN" --node "$NODE" --status in_progress`.
 2. **Both peers review the thread's slice independently** against the actual code — read the changed
-   files and their callers/callees, gather the thread's **static evidence**, run **only** the
+   files and their callers/callees **in the pinned `RUN/source` snapshot** (plus `RUN/target.diff`),
+   never ambient checkout files, gather the thread's **static evidence**, run **only** the
    execution candidates the Execution Safety Gate approved for this run (none unless
    `LOCAL_EXECUTION_APPROVED: yes` names the exact command), apply the lenses. When in doubt, go to
    the source.
@@ -220,11 +269,11 @@ For each `$NODE`:
    peers' findings for this thread, every finding's `source_gate` set to `dep:$NODE` — and logs it:
    `PYTHONPATH=scripts python3 -m crucible log --run "$RUN" --event builder_output --gate "dep:$NODE" --round N --file "$RUN"/candidate.json`,
    then compute the **bindings**: `BINDINGS=$(PYTHONPATH=scripts python3 -m crucible bindings --run "$RUN" --gate "dep:$NODE" --round N)`
-   (`artifact_sha256` + `dag_sha256` + `node_sha256`).
+   (`artifact_sha256` + `dag_sha256` + `node_sha256` + `target_sha256`).
 4. **Both peers independently attest** to that candidate every round (dispatch Peer B per
    `references/platform-notes.md`, seeding `$BINDINGS` as **trusted CLI metadata**); each writes its
    own `"$RUN"/peer-a.json` / `"$RUN"/peer-b.json`, **echoing** `artifact_sha256` + `dag_sha256` +
-   `node_sha256` from `$BINDINGS`.
+   `node_sha256` + `target_sha256` from `$BINDINGS`.
 5. `PYTHONPATH=scripts python3 -m crucible symmetric-verdict --run "$RUN" --gate "dep:$NODE" --round N --peer-a "$RUN"/peer-a.json --peer-b "$RUN"/peer-b.json`.
    - `CONSENSUS` -> `set-status --node "$NODE" --status done`; continue.
    - `CHANGES` -> return to the cited source, correct/withdraw the disputed claim, increment N, repeat
@@ -256,7 +305,7 @@ with `source_gate: final` — the CLI rejects a FINAL candidate that drops or al
 dependency finding. Log that finding set, then run the **binding handshake** (artifact + DAG, like
 PLAN — no node hash at FINAL): `BINDINGS=$(PYTHONPATH=scripts python3 -m crucible bindings --run "$RUN" --gate final --round N)`,
 seed **Peer B** with `$BINDINGS` as **trusted CLI metadata**, and have **both peers attest** in their
-own `"$RUN"/peer-a.json` / `"$RUN"/peer-b.json`, each **echoing** `artifact_sha256` + `dag_sha256`.
+own `"$RUN"/peer-a.json` / `"$RUN"/peer-b.json`, each **echoing** `artifact_sha256` + `dag_sha256` + `target_sha256`.
 Then decide `PYTHONPATH=scripts python3 -m crucible symmetric-verdict --run "$RUN" --gate final --round N --peer-a "$RUN"/peer-a.json --peer-b "$RUN"/peer-b.json`
 and loop like a thread gate: `CONSENSUS` -> finish; `CHANGES` -> return to source and revise; `CAPPED`
 (`on_cap: halt`) -> surface and stop; `PROCEED_WITH_FLAGS` (`on_cap: proceed_with_flags`) -> finish

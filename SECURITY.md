@@ -52,6 +52,15 @@ agent behavior:
   Code, and Codex, so a "sandboxed" guarantee is intentionally not claimed). Execution consent is
   separate from posting consent, and a new or changed command needs fresh consent. See
   [`docs/superpowers/specs/2026-07-18-pr-review-execution-safety-design.md`](docs/superpowers/specs/2026-07-18-pr-review-execution-safety-design.md).
+- **Pinned review target and static source snapshot.** Every `pr-review` input is pinned to an
+  immutable target (a GitHub PR's base/head **OIDs** + fork identity, a local **merge-base** range, or
+  a patch-only diff file), bound into every gate by `target_sha256`. For a GitHub/local target, review
+  reads a **static, read-only source snapshot** of the exact head commit, materialized once by a
+  **confined archive** extractor that rejects path **traversal** (`..` / absolute paths), symlinks /
+  hardlinks / devices, duplicate paths, and over-cap member counts / byte sizes — and that snapshot is
+  **never executed**. Trusted-local execution additionally runs only at the **recorded head** commit (a
+  clean checkout whose `rev-parse HEAD` equals the recorded `head.sha`), else it refuses and offers a
+  detached worktree-at-SHA that needs fresh consent.
 - **No writes to `main`/`master` without consent.** Implementation happens in an isolated
   worktree/branch (`superpowers:using-git-worktrees`), never directly on a protected branch.
 - **No secret exfiltration.** Prompts, diffs, and reports must not include credentials, tokens,

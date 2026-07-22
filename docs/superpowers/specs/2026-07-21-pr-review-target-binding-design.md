@@ -1,8 +1,19 @@
 # PR Review Target Binding Design
 
-**Status:** Approved
+**Status:** Implemented
 **Date:** 2026-07-21
 **Finding:** Audit finding #4 - PR/local input normalization does not establish the reviewed revision
+**Companion plan:** [`docs/superpowers/plans/2026-07-21-pr-review-target-binding.md`](../plans/2026-07-21-pr-review-target-binding.md)
+
+> **Implemented (2026-07-21).** Shipped in `scripts/crucible/target.py` (schema, normalization,
+> identity, confined materialization), the `normalize-target` / `repository-identity` / `load-target` /
+> `show-target` / `materialize-target` CLI commands, `target_sha256` on every pr-review binding and
+> peer attestation, the report `## Review target` section, and the migrated `pr-review` skill/reference/
+> command/public docs. The command shapes below are the **as-built** interface: GitHub normalization
+> takes stable **before/after** metadata (`--metadata-before` / `--metadata-after`), local normalization
+> takes a single `--range`, archive identity is read from `show-target`, materialization is one-shot
+> immediately after `load-target`, and every pr-review mutation/certification command shares one
+> loaded-target guard. Guarded by `tests/test_target.py` and the skill/reference/docs guards.
 
 ## Problem
 
@@ -135,8 +146,10 @@ Rules:
 ```
 
 The orchestrator resolves these values with `gh pr view` fields including `baseRefOid`,
-`headRefOid`, `headRepository`, `headRepositoryOwner`, and `isCrossRepository`. Branch names are
-display metadata; SHAs and repository identities are authoritative.
+`headRefOid`, `headRepository`, `headRepositoryOwner`, and `isCrossRepository`, read **before and
+after** `gh pr diff`; a change in any immutable identity field between the two reads rejects the target
+so the whole acquisition can be retried. Branch names are display metadata; SHAs and repository
+identities are authoritative, and intent comes from the stable before/after title/body.
 
 ### Local range variant
 
@@ -159,18 +172,20 @@ Repository identity must never persist credentials from a remote URL. Normalize 
 with userinfo, query, and fragment removed; if no safe remote identity exists, use
 `local:<sha256(real repository path)>`. Reports do not expose the local path.
 
-The orchestrator parses either `base..head` or `base...head` only as two ref names, then resolves:
+`normalize-target local` takes a single `--range` (`base..head` or `base...head`, both normalized
+identically as two ref names) and resolves, with argument-vector `git` subprocesses (never
+`shell=True`):
 
 ```bash
 BASE_SHA=$(git rev-parse --verify "$BASE^{commit}")
 HEAD_SHA=$(git rev-parse --verify "$HEAD^{commit}")
 MERGE_BASE_SHA=$(git merge-base "$BASE_SHA" "$HEAD_SHA")
-git diff "$MERGE_BASE_SHA..$HEAD_SHA"
+git diff --binary "$MERGE_BASE_SHA..$HEAD_SHA"
 git diff --name-only "$MERGE_BASE_SHA..$HEAD_SHA"
-git log "$MERGE_BASE_SHA..$HEAD_SHA"
 ```
 
-The generated review set therefore always matches PR-style three-dot semantics.
+The generated review set therefore always matches PR-style three-dot semantics; intent comes from
+`--intent`, not commit messages.
 
 ### Diff-file variant
 
@@ -206,25 +221,32 @@ Add `scripts/crucible/target.py` as the single owner of:
 Add:
 
 ```bash
-crucible normalize-target github --metadata PR.json --diff PR.diff \
-  --output TARGET.json --diff-output TARGET.diff
-crucible normalize-target local --repo REPO --base BASE --head HEAD --intent INTENT.json \
+crucible normalize-target github --metadata-before PR-BEFORE.json --metadata-after PR-AFTER.json \
+  --diff PR.diff --output TARGET.json --diff-output TARGET.diff
+crucible normalize-target local --repo REPO --range BASE..HEAD --intent INTENT.json \
   --output TARGET.json --diff-output TARGET.diff
 crucible normalize-target diff --diff PATCH --intent INTENT.json \
   --output TARGET.json --diff-output TARGET.diff
+crucible repository-identity --repo REPO
 crucible load-target --run RUN --file TARGET.json --diff TARGET.diff
+crucible show-target --run RUN
 crucible materialize-target --run RUN --archive SOURCE.tar.gz
 ```
 
 `normalize-target` does not mutate a run:
 
-- `github` consumes the exact JSON emitted by the documented `gh pr view --json ...` command plus
-  the exact `gh pr diff` bytes;
-- `local` resolves refs and merge base with argument-vector `git` subprocesses (never `shell=True`)
-  and emits the merge-base-to-head patch;
+- `github` consumes the exact JSON emitted by the documented `gh pr view --json ...` command read
+  **before and after** `gh pr diff`; every immutable identity field must match between the two reads
+  or the target is rejected so the orchestrator can retry;
+- `local` takes one `--range BASE..HEAD|BASE...HEAD` (never separate base/head flags), resolves refs
+  and merge base with argument-vector `git` subprocesses (never `shell=True`), and emits the
+  merge-base-to-head patch;
 - `diff` hashes the supplied patch and marks it revision-unbound.
 
-This command makes normalization behavior executable and directly testable rather than prose-only.
+`repository-identity --repo` prints the credential-free identity local normalization records, and
+`show-target` prints the authoritative loaded target (from the `target_loaded` event, never the
+scratch file). These make normalization and identity comparison executable and directly testable
+rather than prose-only.
 
 The command is valid only for schema-v2 `pr-review` runs and rejects:
 
@@ -233,9 +255,13 @@ The command is valid only for schema-v2 `pr-review` runs and rejects:
 - manifest/diff hash disagreement;
 - target events in `build` or `deep-dive` runs.
 
-For `pr-review`, `load-dag`, `log`, `bindings`, verdict/result commands, and approval require a valid
-loaded target. Read-only report/status commands remain usable and render the run `INVALID` or
-`IN PROGRESS` rather than crashing.
+For `pr-review`, `load-dag`, `log`, `bindings`, verdict/result commands, and approval share **one**
+loaded-target guard (`_require_pr_review_target`): each requires a single valid loaded target. Read-only
+report/status commands remain usable and render the run `INVALID` or `IN PROGRESS` rather than crashing.
+Source-materialization integrity is validated centrally (`validate_source_materialization`) so a
+missing/duplicate/late/wrong-kind/hash-mismatched `source_materialized` fails the run closed, and
+`scripts/check.py` runs its own repo checks under an **isolated Git environment** so target-normalization
+`git` subprocesses in tests cannot mutate the developer's branch or index.
 
 `materialize-target` uses a confined Python archive reader. It rejects absolute paths, `..` path
 escapes, symlinks, hard links, devices, FIFOs, duplicate normalized paths, more than 100,000 members,
@@ -299,12 +325,17 @@ All untrusted labels and intent text use existing sanitization.
 
 ## Source snapshots
 
+Materialization is **one-shot**, immediately after `load-target` and before any DAG/PLAN/review work,
+into the **absent** `RUN/source` (the CLI refuses a pre-existing destination). The head repository/SHA
+come **only** from `show-target`'s authoritative event payload — never an ambient archive variable —
+and wrapper stripping is derived from the target *kind*, not a caller flag.
+
 ### GitHub PR
 
 After loading the target, download a GitHub-generated archive for the exact head SHA:
 
 ```bash
-mkdir -p "$RUN/source"
+# HEAD_REPOSITORY / HEAD_SHA read from `crucible show-target` (authoritative), never ambient
 gh api "repos/$HEAD_REPOSITORY/tarball/$HEAD_SHA" > "$RUN/source.tar.gz"
 PYTHONPATH=scripts python3 -m crucible materialize-target \
   --run "$RUN" --archive "$RUN/source.tar.gz"
@@ -315,10 +346,10 @@ Fork heads use `head.repository` from the manifest. Unsafe archive members are n
 
 ### Local range
 
-Static review uses an archive of the exact local head commit under `RUN/source`, not ambient files:
+Static review uses an archive of the exact local head commit under `RUN/source`, not ambient files
+(`HEAD_SHA` from `show-target`):
 
 ```bash
-mkdir -p "$RUN/source"
 git archive --format=tar --output "$RUN/source.tar" "$HEAD_SHA"
 PYTHONPATH=scripts python3 -m crucible materialize-target \
   --run "$RUN" --archive "$RUN/source.tar"
@@ -333,16 +364,19 @@ range, which becomes a separate `local-range` target.
 
 Execution remains available only for `local-range`.
 
-After PLAN consensus and exact-command consent:
+Before showing any command for consent (after PLAN consensus):
 
-1. verify the source repository is the manifest repository;
-2. verify the execution checkout is clean;
+1. verify the source repository is the manifest repository with
+   `crucible repository-identity --repo REPO` equal to the recorded `repository` identity;
+2. verify the execution checkout is clean (`git status --porcelain` empty);
 3. verify `git rev-parse HEAD == target.head.sha`;
-4. otherwise refuse execution and offer static-only continuation or creation of a detached worktree
-   at the recorded head SHA followed by fresh exact-command consent;
-5. record the observed head SHA with execution evidence.
+4. otherwise refuse execution and offer static-only continuation or an exact detached
+   worktree-at-SHA command set followed by fresh exact-command consent;
+5. record the observed repository identity, head SHA, clean status, and approved command list in the
+   execution evidence handed to both peers and rendered in the review provenance.
 
-GitHub PR and diff-file targets remain non-executable regardless of archive availability.
+Exact-command consent (and its arbitrary-code warning) stays separate from posting consent. GitHub PR
+and diff-file targets remain non-executable regardless of archive availability.
 
 ## Error handling
 
@@ -379,6 +413,12 @@ Create a temporary Git repository where `main` and `feature` diverge:
 - input spelled with two or three dots resolves to the same manifest and patch.
 
 Add fixtures for cross-repository GitHub metadata and assert fork head repository/SHA are preserved.
+
+An end-to-end **documented-path** test drives the divergent fixture through the real CLI (`init-run`
+→ `normalize-target local --range` → `load-target` → `load-dag` → `log` plan → `bindings` → `report`)
+and asserts the manifest base/head/merge-base SHAs, a feature-only patch, `target_sha256` present in
+the PLAN bindings, and a report `## Review target` section matching the manifest — so the protocol
+tests cannot regress to token-only assertions.
 
 ### Protocol tests
 

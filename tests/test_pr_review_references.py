@@ -289,10 +289,52 @@ def test_consensus_rubric_records_binding_handshake():
 
 
 def test_platform_notes_normalizes_gh_or_local_diff_input():
-    low = _read("platform-notes.md").lower()
-    assert "normaliz" in low                 # input normalization step
-    assert "gh pr diff" in low               # GitHub PR path
-    assert "git diff" in low                 # local diff path
+    # Input is resolved to an immutable target via the CLI target pipeline (normalize -> load ->
+    # materialize), not a bare diff/triple. GitHub requests immutable OIDs + fork identity; local uses
+    # a single merge-base `--range`, never a raw two-dot `git diff <range>`.
+    low = _norm("platform-notes.md")
+    assert "normalize-target" in low
+    assert "load-target" in low
+    assert "materialize-target" in low
+    assert "gh pr diff" in low                # GitHub PR path still snapshots the patch via gh pr diff
+    for field in ("baserefoid", "headrefoid", "headrepository",
+                  "headrepositoryowner", "iscrossrepository"):
+        assert field in low, f"platform-notes must request the {field} field"
+    assert "--range" in low
+    assert "git diff <range>" not in low
+
+
+def test_platform_notes_execution_verifies_repository_identity_and_head():
+    # Trusted-local execution proves the checkout is the recorded head revision before consent:
+    # repository identity + clean tree + exact head sha; a mismatch is static-only or a detached
+    # worktree-at-SHA requiring fresh consent.
+    low = _flat(_section(_read("platform-notes.md"), "Execution Safety Gate"))
+    assert "repository-identity" in low
+    assert "rev-parse head" in low
+    assert "status --porcelain" in low
+    assert "recorded" in low and "head" in low
+    assert "worktree" in low
+    assert "fresh consent" in low
+
+
+def test_peer_prompt_attestation_binds_target_sha256():
+    attest = next((b for b in _json_blocks(_read("peer-prompt.md"))
+                   if isinstance(b, dict) and b.get("peer") in ("A", "B")), None)
+    assert attest is not None, "peer-prompt must show a peer attestation JSON example"
+    assert "target_sha256" in attest, "pr-review peer attestation must echo target_sha256"
+
+
+def test_peer_prompt_reads_pinned_source_not_ambient():
+    low = _norm("peer-prompt.md")
+    assert "run/source" in low
+    assert "target.diff" in low
+    assert "never ambient" in low or "not ambient" in low or "never the ambient" in low
+
+
+def test_review_thread_gathers_evidence_from_pinned_source():
+    low = _norm("review-thread.md")
+    assert "run/source" in low
+    assert "target.diff" in low or "patch" in low
 
 
 def test_platform_notes_posting_is_readonly_by_default_and_consented():

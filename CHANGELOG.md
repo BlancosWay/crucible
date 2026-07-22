@@ -62,6 +62,22 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
   `tests/test_pr_review_references.py` + `tests/test_pr_review_skill.py`, registered additively in
   `tests/validate_structure.py` and the `tests/test_docs.py` guards. Design:
   `docs/superpowers/specs/2026-07-17-pr-review-skill-design.md`.
+- **Immutable `pr-review` target binding (audit finding #4).** Every `pr-review` input is now pinned to
+  an immutable review target before PLAN. New `normalize-target github|local|diff` commands emit a
+  canonical manifest + exact patch — GitHub base/head **OIDs** + fork identity read stably **before and
+  after** `gh pr diff`, a local single `--range` recorded with `merge_base..head` **merge-base**
+  semantics (no raw two-dot tip diff), or a diff file as patch identity only (`revision_bound: false`).
+  `load-target` records the one `target_loaded` event and `target_sha256`; `show-target` prints the
+  authoritative target; `repository-identity` fingerprints a local checkout credential-free; and
+  `materialize-target` extracts a pinned, read-only `RUN/source` snapshot of the exact head commit
+  through a confined archive reader (rejects path traversal, links, special files, duplicate paths, and
+  member/byte caps — and is never executed). Every `pr-review` gate binding and peer attestation now
+  carries `target_sha256`, the report renders a `## Review target` section, and trusted-local execution
+  runs only at the recorded head commit (clean checkout at `head.sha`). `build`/`deep-dive` runs are
+  unchanged (no target). Design:
+  `docs/superpowers/specs/2026-07-21-pr-review-target-binding-design.md`; plan:
+  `docs/superpowers/plans/2026-07-21-pr-review-target-binding.md`. Guarded by `tests/test_target.py`
+  and the skill/reference/docs guards.
 
 ### Changed
 - **Builder prompt: human-style code comments.** The "Writing code comments" guidance now bans

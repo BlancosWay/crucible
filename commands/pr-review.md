@@ -11,8 +11,11 @@ Usage: `/pr-review <pr-or-diff>` — e.g. `/pr-review #123`, `/pr-review https:/
 or `/pr-review main..my-branch`.
 
 Follow `skills/pr-review/SKILL.md` exactly: init the run with `--workflow pr-review` and normalize the
-input (a GitHub PR via `gh`, or a local `base..head` range / diff file) into a diff + changed-files +
-intent triple -> PLAN gate (review plan + review graph, both peers attest to consensus) -> one THREAD
+input (a GitHub PR via `gh`, a local merge-base `--range`, or a diff file) into an **immutable review
+target** — pinned base/head commit OIDs + fork identity (GitHub), a merge-base range (local), or
+patch-only for a diff file — loaded once with `crucible load-target` and, for GitHub/local, materialized
+into a pinned read-only `RUN/source` snapshot of the exact head commit before PLAN -> PLAN gate (review
+plan + review graph, both peers attest to consensus) -> one THREAD
 gate per review concern (both peers review that slice independently against the real code, both attest
 to the candidate finding set, loop to consensus or cap) -> optional FINAL gate (assembled from
 `crucible accepted-findings`) -> `crucible review-result` (findings + derived recommendation) + run
@@ -21,9 +24,10 @@ attest** in their own `peer-a.json` / `peer-b.json` and `crucible symmetric-verd
 decides — never the build-only `verdict` — and consensus is grounded in re-verifiable citations, never
 a vote or an average. Resolve models, effort, caps, and policies from the `RUN/config.json` written by
 `init-run`; shipped values live in `config.defaults.json`. Every **gate decision is bound to the
-exact** candidate both peers reviewed (**schema v2**): the CLI hashes it into SHA-256 **bindings** that
-**each peer attestation must echo**, and the accepted review plan/graph is frozen (a legacy
-pre-schema-2 run is read-only, `LEGACY / UNVERIFIED`).
+exact** candidate both peers reviewed (**schema v2**) and — for pr-review — the immutable review
+`target_sha256`: the CLI hashes it into SHA-256 **bindings** that **each peer attestation must echo**,
+and the accepted review plan/graph is frozen (a legacy pre-schema-2 run is read-only, `LEGACY /
+UNVERIFIED`).
 
 **Engineering tool — never advance a gate without consensus unless `on_cap: proceed_with_flags`, and
 never clear a blocking peer objection with a rebuttal; resolve it against the cited source or flag both

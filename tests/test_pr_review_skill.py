@@ -271,12 +271,59 @@ def test_skill_does_not_modify_crucible_skill_paths():
     assert "skills/crucible/references" not in SKILL.read_text()
 
 
-def test_skill_normalizes_gh_or_local_diff_input():
+def test_skill_normalizes_target_into_immutable_manifest_before_plan():
+    # The input is resolved to a deterministic target MANIFEST + exact patch through the CLI, loaded as
+    # the run's one immutable target, and (github/local) materialized into a pinned source snapshot —
+    # before PLAN. Scope to the normalization section and assert the executable command shapes, not
+    # keywords; reject the old branch-name-only `gh pr view` and the raw two-dot `git diff <range>`.
+    setup = _flat(_section(SKILL.read_text(), "Normalize the input"))
+    assert "normalize-target github" in setup
+    assert "normalize-target local" in setup
+    assert "normalize-target diff" in setup
+    assert "load-target --run" in setup
+    assert "materialize-target --run" in setup
+    # GitHub immutable OIDs + fork identity, read stably before AND after the diff.
+    for field in ("baserefoid", "headrefoid", "headrepository",
+                  "headrepositoryowner", "iscrossrepository"):
+        assert field in setup, f"github normalization must request the {field} field"
+    assert "--metadata-before" in setup and "--metadata-after" in setup
+    # Local: one merge-base `--range`, never a raw two-dot tip diff or the old branch-name-only view.
+    assert "--range" in setup
+    assert "git diff <range>" not in setup
+    assert "gh pr view <n> --json title,body,files" not in setup
+
+
+def test_skill_peer_attestation_binds_target_sha256():
+    # Every pr-review gate binds the immutable review target, so the peer attestation example must echo
+    # target_sha256 alongside the artifact/DAG/node hashes.
+    attest = next((b for b in _json_blocks(SKILL.read_text())
+                   if isinstance(b, dict) and b.get("peer") in ("A", "B")), None)
+    assert attest is not None, "SKILL.md must show a peer attestation JSON example"
+    assert "target_sha256" in attest, "pr-review peer attestation must echo target_sha256"
+
+
+def test_skill_reads_pinned_source_not_ambient_checkout():
+    # Both peers read the pinned snapshot (`RUN/source`) + the exact `RUN/target.diff`, never ambient
+    # checkout files that may be a different revision.
     low = _norm(SKILL)
-    assert "normaliz" in low                       # input-normalization step
-    assert "gh pr diff" in low or "gh pr view" in low
-    assert "git diff" in low
-    assert "diff, changed-files, intent" in low or "changed-files" in low
+    assert "run/source" in low
+    assert "target.diff" in low
+    assert "never ambient" in low or "not ambient" in low or "never the ambient" in low
+
+
+def test_skill_execution_verifies_exact_head_at_recorded_sha():
+    # Trusted-local execution must prove the checkout is the recorded head revision (repository
+    # identity + clean tree + exact head sha) before any consent; a mismatch falls back to static-only
+    # or a detached worktree-at-SHA that itself needs fresh consent. Remote/diff targets never execute.
+    low = _flat(_section(SKILL.read_text(), "Execution Safety Gate"))
+    assert "repository-identity" in low
+    assert "rev-parse head" in low
+    assert "status --porcelain" in low
+    assert "recorded head" in low or "head.sha" in low or "recorded head sha" in low
+    assert "worktree" in low
+    assert "fresh consent" in low
+    assert "github pr" in low and "never execute locally" in low
+    assert "diff file" in low or "diff-file" in low
 
 
 def test_skill_derives_recommendation_from_review_result_and_gates_posting_on_consent():

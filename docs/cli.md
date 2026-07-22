@@ -119,6 +119,27 @@ records each slot's configured model/effort. It **does not cryptographically pro
 model *processes* produced the files — runtime peer independence is a platform/orchestrator property,
 not a CLI guarantee.
 
+## Target binding (pr-review)
+
+A `pr-review` run pins its input to one **immutable review target** before PLAN, and every gate binds
+its `target_sha256` (a `build`/`deep-dive` run has no target). The orchestrator prepares the manifest +
+exact patch, loads it once, and — for a revision-bound target — materializes a pinned, read-only
+**source snapshot**; only `load-target` / `materialize-target` mutate a run.
+
+| Command | Arguments | Behavior |
+|---------|-----------|----------|
+| `normalize-target github` | `--metadata-before FILE`, `--metadata-after FILE`, `--diff FILE`, `--output FILE`, `--diff-output FILE` | Normalize a GitHub PR into a `github-pr` manifest + exact patch **without** mutating a run. Consumes the `gh pr view --json …` documents captured **before and after** `gh pr diff`; every immutable identity field (number/url/title/body/files, base/head repository + `baseRefOid`/`headRefOid`, `isCrossRepository`) must match between the two reads or the target is rejected (retry the acquisition). Branch names are display metadata; OIDs and repository identities are authoritative. |
+| `normalize-target local` | `--repo DIR`, `--range BASE..HEAD`, `--intent FILE`, `--output FILE`, `--diff-output FILE` | Normalize a local Git range into a `local-range` manifest + patch. One `--range` (`BASE..HEAD` or `BASE...HEAD`, both normalize to `merge_base..head`) — no separate base/head flags — records base/head/**merge-base** SHAs and a credential-free `repository` identity, and always diffs merge-base..head so a base-only commit is never a reverse change. |
+| `normalize-target diff` | `--diff FILE`, `--intent FILE`, `--output FILE`, `--diff-output FILE` | Normalize a bare patch into a `diff-file` manifest (`revision_bound: false`) — **patch identity only**, no repository/base/head and no source snapshot. |
+| `repository-identity` | `--repo DIR` | Print the credential-free repository identity local normalization would record (sanitized remote URL, else `local:<sha256(real path)>`), so a checkout can be compared to a recorded local-range identity without exposing credentials or a local path. |
+| `load-target` | `--run RUN`, `--file FILE`, `--diff FILE` | Record the one immutable `target_loaded` event for a `pr-review` run: validate the manifest, verify `--diff` bytes hash to the manifest `diff_sha256`, and append the canonical payload + `target_sha256`. Valid **once**, before `load-dag`/PLAN/any review event; a correction requires a **fresh run**. |
+| `show-target` | `--run RUN` | Print the authoritative loaded target (from the `target_loaded` event, never the scratch file) as canonical JSON. Fails closed when none is loaded or the event is duplicate/malformed/hash-mismatched. |
+| `materialize-target` | `--run RUN`, `--archive FILE` | Extract a pinned, read-only source snapshot into an absent `RUN/source`, one-shot, for a revision-bound target immediately after `load-target`. Confined extraction rejects absolute/`..`/backslash paths, symlinks/hardlinks/devices/FIFOs, duplicate normalized paths, and archives over the 100 000-member / 1 GiB caps; wrapper stripping is derived from the target **kind** (github-pr strips its codeload wrapper; local-range preserves paths). A diff-file target has no snapshot. |
+
+Every `pr-review` gate's `crucible bindings` output therefore also carries `target_sha256`, which each
+peer attestation echoes and `symmetric-verdict` verifies. The report renders a `## Review target`
+section (base/head/merge-base SHAs, or the revision-unbound diff-file status) from the same event.
+
 ## Report statuses
 
 For a schema-2 run, `report` derives its status from the run's resolved configuration and the

@@ -339,6 +339,66 @@ def test_symmetric_design_marked_implemented_and_links_plan():
     assert "2026-07-20-symmetric-consensus.md" in design, "design must link its implementation plan"
 
 
+# --- pr-review target-binding documentation guards ------------------------------------------------
+# Finding #4: every pr-review input is pinned to an immutable review target (base/head OIDs, local
+# merge-base, or patch-only), bound into every gate, materialized into a pinned static source
+# snapshot, and executed only at the recorded head. The public docs must document the target commands,
+# manifest variants, provenance, and safe-source/exact-head execution — with command/schema shape.
+
+def test_cli_docs_document_target_commands_and_manifest_variants():
+    text = (ROOT / "docs" / "cli.md").read_text()
+    sec = _flat(_section(text, "Target binding"))
+    for cmd in ("normalize-target", "load-target", "show-target",
+                "materialize-target", "repository-identity"):
+        assert cmd in sec, f"docs/cli.md Target-binding section omits {cmd}"
+    # the three manifest kinds
+    assert "github-pr" in sec and "local-range" in sec and "diff-file" in sec
+    # immutable identity bound into every gate + merge-base local semantics + patch-only diff-file
+    assert "target_sha256" in sec
+    assert "merge-base" in sec or "merge_base" in sec
+    assert "revision_bound" in sec or "revision-unbound" in sec or "patch identity" in sec
+    # safe, one-shot source materialization into a pinned snapshot
+    assert "run/source" in sec or "source snapshot" in sec
+
+
+def test_readme_documents_immutable_target_provenance():
+    sec = _flat(_section((ROOT / "README.md").read_text(), "Companion skill: `pr-review`"))
+    assert "target" in sec
+    assert "immutable" in sec or "pinned" in sec
+    # base/head commit identity (not branch names) + local merge-base + patch-only diff-file
+    assert "baserefoid" in sec or "head sha" in sec or "base/head" in sec or "commit" in sec
+    assert "merge-base" in sec or "merge base" in sec
+    assert "diff-file" in sec or "diff file" in sec
+
+
+def test_security_documents_pinned_source_and_exact_head_execution():
+    bullet = _flat(_bullet((ROOT / "SECURITY.md").read_text(), "Pinned review target"))
+    # a static, read-only source snapshot that is never executed, extracted via a confined archive path
+    assert "snapshot" in bullet
+    assert "archive" in bullet
+    assert "traversal" in bullet or "symlink" in bullet
+    assert "never execute" in bullet or "not executed" in bullet or "never executed" in bullet
+    # trusted-local execution runs only at the recorded head commit
+    assert "recorded head" in bullet or "head commit" in bullet or "exact head" in bullet
+
+
+def test_changelog_records_target_binding_finding4():
+    unreleased = _flat(_section((ROOT / "CHANGELOG.md").read_text(), "[Unreleased]"))
+    assert "normalize-target" in unreleased
+    assert "load-target" in unreleased
+    assert "materialize-target" in unreleased
+    assert "target_sha256" in unreleased
+    assert "merge-base" in unreleased or "merge base" in unreleased
+
+
+def test_target_binding_design_marked_implemented_and_links_plan():
+    design = (ROOT / "docs" / "superpowers" / "specs"
+              / "2026-07-21-pr-review-target-binding-design.md").read_text()
+    assert re.search(r"\*\*Status:\*\*\s*implemented", design, re.IGNORECASE), \
+        "the 2026-07-21 pr-review-target-binding design must be marked implemented"
+    assert "2026-07-21-pr-review-target-binding.md" in design, "design must link its implementation plan"
+
+
 # --- Companion runtime-guidance guards (docs/cli.md Conventions, AGENTS.md, CLAUDE.md) -------------
 # The three top-level runtime-guidance surfaces must teach the CURRENT symmetric two-peer protocol —
 # `--workflow` init, separate Peer A / Peer B attestation files settled by `symmetric-verdict`,
