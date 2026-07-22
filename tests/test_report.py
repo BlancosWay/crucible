@@ -107,6 +107,102 @@ def test_report_sanitizes_markdown_injection(tmp_path):
     assert "Outcome:** CONSENSUS" not in md
 
 
+def test_report_shows_effective_gate_policy(tmp_path):
+    # F5: the report surfaces the effective round cap + on_cap recorded on each gate outcome line, so
+    # a --max-rounds-driven decision is reconstructable from the report itself.
+    from crucible.report import render_markdown
+    cfg = Config.from_dict({})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    run.save_dag({"nodes": [], "edges": []})
+    run.append("critic_verdict", gate="plan", round=2, payload={"verdict": "APPROVE", "summary": "s"})
+    run.append("gate_consensus", gate="plan", round=2, max_rounds=3, on_cap="halt")
+    md = render_markdown(run)
+    assert "CONSENSUS at round 2 (round cap 3, on_cap halt)" in md
+
+
+def test_report_gate_policy_absent_on_legacy_terminal(tmp_path):
+    # F5: a legacy terminal event without the policy fields renders no suffix (still readable).
+    from crucible.report import render_markdown
+    cfg = Config.from_dict({})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    run.save_dag({"nodes": [], "edges": []})
+    run.append("critic_verdict", gate="plan", round=1, payload={"verdict": "APPROVE", "summary": "s"})
+    run.append("gate_consensus", gate="plan", round=1)   # no max_rounds/on_cap (pre-F5)
+    md = render_markdown(run)
+    assert "CONSENSUS at round 1" in md
+    assert "CONSENSUS at round 1 (round cap" not in md   # no policy suffix for a legacy terminal
+
+
+def test_san_neutralizes_markdown_image_and_link():
+    from crucible.report import _san
+    # F6: Markdown image/link syntax must be neutralized — an ![](url) renders an ACTIVE <img> request
+    # (tracking pixel / content injection) in report.md even with no HTML. Escaping the link/image
+    # brackets makes both ![…](…) and […](…) inert (Markdown won't parse a bracket-escaped link).
+    out = _san("![pwn](https://evil.example/track.png)")
+    assert "\\[" in out and "\\]" in out            # brackets escaped -> image cannot render
+    assert "![pwn]" not in out                       # the unescaped image opener is gone
+    assert "pwn" in out and "evil.example" in out    # content preserved, just inert
+    assert "\\[click\\]" in _san("[click](https://evil.example)")  # link text brackets escaped
+    # existing neutralizations still hold
+    assert _san("<b>") == "&lt;b&gt;"
+    assert _san("a`b") == "a\\`b"
+    assert _san("a|b") == "a\\|b"
+
+
+def test_report_dependency_table_id_is_injection_safe(tmp_path):
+    # F6: an untrusted node id in the dependency table must be plain _san text (never a backtick code
+    # span a backtick could break out of), and any Markdown image/link syntax in it must be inert so
+    # report.md cannot emit an active <img> tracking request.
+    from crucible.report import render_markdown, _san
+    cfg = Config.from_dict({})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    nid = "a`![x](http://tracker/p.png)"
+    run.save_dag({"nodes": [_node(nid)], "edges": []})
+    md = render_markdown(run)
+    # the SANITIZED id is rendered as plain text, NOT wrapped in a code span (re-adding the wrapper
+    # around _san(id) would make this fail — the raw-id check the reviewer flagged would not).
+    assert _san(nid) in md
+    assert f"`{_san(nid)}`" not in md
+    assert "![x](http://tracker/p.png)" not in md     # active image opener gone
+    assert "\\[x\\]" in md                            # rendered with escaped brackets (inert)
+
+
+def test_report_gate_finding_id_is_injection_safe(tmp_path):
+    # F6: an untrusted finding id in the Gates section must not be code-span-wrapped (backtick
+    # breakout) nor carry live image syntax.
+    from crucible.report import render_markdown, _san
+    cfg = Config.from_dict({})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    run.save_dag({"nodes": [], "edges": []})
+    bad_id = "F1`![i](http://t/p.png)"
+    run.append("critic_verdict", gate="plan", round=1, payload={
+        "verdict": "REQUEST_CHANGES", "summary": "s",
+        "findings": [{"id": bad_id, "severity": "major", "location": "x",
+                      "claim": "c", "suggestion": "s"}],
+    })
+    md = render_markdown(run)
+    assert _san(bad_id) in md
+    assert f"`{_san(bad_id)}`" not in md               # finding id not code-span-wrapped
+    assert "![i](http://t/p.png)" not in md            # active image opener gone
+    assert "\\[i\\]" in md                            # escaped brackets (inert)
+
+
+def test_report_gate_header_is_injection_safe(tmp_path):
+    # F6: the `### Gate:` header renders the gate id (untrusted — a dep:<node-id> derives from a
+    # model-authored id). It must be plain _san text, never a code span, and image syntax must be inert.
+    from crucible.report import render_markdown, _san
+    cfg = Config.from_dict({})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    run.save_dag({"nodes": [], "edges": []})
+    gate = "dep:a`![g](http://t/g.png)"
+    run.append("gate_capped", gate=gate, round=5, open_findings=["Fx"])
+    md = render_markdown(run)
+    assert f"### Gate: {_san(gate)}" in md             # header rendered as plain _san text
+    assert f"### Gate: `{_san(gate)}`" not in md       # ...never wrapped in a code span
+    assert "![g](http://t/g.png)" not in md            # active image opener gone
+    assert "\\[g\\]" in md
+
+
 def test_report_renders_proceeded_with_flags(tmp_path):
     cfg = Config.from_dict({"on_cap": "proceed_with_flags"})
     run = init_run("g", cfg, base_dir=tmp_path)

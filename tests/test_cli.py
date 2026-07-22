@@ -1038,8 +1038,21 @@ def test_load_dag_echoes_tree_with_non_ascii_title_under_ascii_locale(tmp_path):
 
 # --- clean: delete a finished run's directory --------------------------------
 
-def test_clean_removes_run_dir(tmp_path):
+def _finished_run(tmp_path):
+    """A genuinely FINISHED run: DAG loaded, and PLAN + the single node + FINAL all concluded (the
+    default config has final_review=true), so `clean` may remove it without --force."""
     run_dir = _init(tmp_path)
+    df = Path(tmp_path) / "d.json"; df.write_text(json.dumps(_two_node_dag()))
+    _run(["load-dag", "--run", run_dir, "--file", str(df)])
+    _settle_plan(run_dir, tmp_path)
+    _run(["set-status", "--run", run_dir, "--node", "a", "--status", "done", "--force",
+          "--rationale", "test scaffolding"])
+    assert _run_bound_verdict(tmp_path, run_dir, "final", 1, "APPROVE").stdout.strip() == "CONSENSUS"
+    return run_dir
+
+
+def test_clean_removes_run_dir(tmp_path):
+    run_dir = _finished_run(tmp_path)
     assert Path(run_dir).is_dir()
     r = _run(["clean", "--run", run_dir])
     assert r.returncode == 0, r.stderr
@@ -1080,16 +1093,70 @@ def test_clean_force_removes_in_progress_run(tmp_path):
     assert not Path(run_dir).exists()
 
 
-def test_clean_allows_finished_run(tmp_path):
+def test_clean_refuses_active_run_with_no_dag(tmp_path):
+    # F9: a run still in REPRODUCE/PLAN (no dag.json yet, plan not concluded) must NOT be deleted
+    # without --force — the old guard treated a missing DAG as "nothing in progress, safe to remove".
+    run_dir = _init(tmp_path)
+    r = _run(["clean", "--run", run_dir])
+    assert r.returncode != 0
+    assert "force" in r.stderr.lower()
+    assert Path(run_dir).exists()
+    # --force still overrides
+    assert _run(["clean", "--run", run_dir, "--force"]).returncode == 0
+    assert not Path(run_dir).exists()
+
+
+def test_clean_refuses_final_pending_run(tmp_path):
+    # F9: all nodes done + PLAN consensus but FINAL not yet run (default final_review=true) is still
+    # active — the old guard deleted it because every DAG node was done.
     run_dir = _init(tmp_path)
     df = Path(tmp_path) / "d.json"; df.write_text(json.dumps(_two_node_dag()))
     _run(["load-dag", "--run", run_dir, "--file", str(df)])
     _settle_plan(run_dir, tmp_path)
     _run(["set-status", "--run", run_dir, "--node", "a", "--status", "done", "--force",
           "--rationale", "test scaffolding"])
-    r = _run(["clean", "--run", run_dir])
-    assert r.returncode == 0, r.stderr
+    r = _run(["clean", "--run", run_dir])   # FINAL still pending
+    assert r.returncode != 0
+    assert "force" in r.stderr.lower()
+    assert Path(run_dir).exists()
+    # once FINAL concludes, clean succeeds without --force
+    assert _run_bound_verdict(tmp_path, run_dir, "final", 1, "APPROVE").stdout.strip() == "CONSENSUS"
+    assert _run(["clean", "--run", run_dir]).returncode == 0
     assert not Path(run_dir).exists()
+
+
+def test_clean_refuses_run_with_partial_config(tmp_path):
+    # F9: a partial/corrupt config.json must not merge-fill defaults into a "finished" verdict — e.g.
+    # a bare {"final_review": false} could otherwise hide a pending FINAL and let clean delete an
+    # active run. `clean` requires the COMPLETE resolved config shape and fails closed (preserves).
+    run_dir = _init(tmp_path)
+    df = Path(tmp_path) / "d.json"; df.write_text(json.dumps(_two_node_dag()))
+    _run(["load-dag", "--run", run_dir, "--file", str(df)])
+    _settle_plan(run_dir, tmp_path)
+    _run(["set-status", "--run", run_dir, "--node", "a", "--status", "done", "--force",
+          "--rationale", "test scaffolding"])
+    # FINAL still pending; overwrite the resolved config with a partial one that would disable the check
+    (Path(run_dir) / "config.json").write_text(json.dumps({"final_review": False}))
+    r = _run(["clean", "--run", run_dir])
+    assert r.returncode != 0                      # partial config -> not provably finished -> preserved
+    assert Path(run_dir).exists()
+    assert _run(["clean", "--run", run_dir, "--force"]).returncode == 0   # --force still overrides
+    assert not Path(run_dir).exists()
+
+
+def test_verdict_records_effective_gate_policy(tmp_path):
+    # F5: the terminal event records the EFFECTIVE round cap (a --max-rounds override, not just the
+    # config default) and on_cap, so a decision made under an override is reconstructable from
+    # provenance rather than re-derived from the (possibly overridden) run config.
+    run_dir = _init(tmp_path)
+    df = Path(tmp_path) / "d.json"; df.write_text(json.dumps(_two_node_dag()))
+    _run(["load-dag", "--run", run_dir, "--file", str(df)])
+    assert _run_bound_verdict(tmp_path, run_dir, "plan", 1, "APPROVE",
+                              max_rounds=3).stdout.strip() == "CONSENSUS"
+    term = [e for e in _events(run_dir)
+            if e["event"] == "gate_consensus" and e.get("gate") == "plan"][-1]
+    assert term["max_rounds"] == 3      # the --max-rounds override, NOT the config default (5)
+    assert term["on_cap"] == "halt"     # effective on_cap recorded on the terminal too
 
 
 def test_set_status_force_requires_rationale(tmp_path):
@@ -1323,6 +1390,27 @@ def test_reproduce_gate_halts_even_with_proceed_with_flags(tmp_path):
     assert r.returncode == 0, r.stderr
     assert r.stdout.strip() == "CAPPED"
     assert not any(e["event"] == "gate_proceeded_with_flags" for e in _events(run_dir))
+
+
+def test_reproduce_gate_terminal_records_effective_halt_on_cap(tmp_path):
+    # F5: the reproduce gate ALWAYS halts (always_halt) regardless of on_cap, so its terminal must
+    # record the EFFECTIVE on_cap = "halt" — never the configured proceed_with_flags, which would
+    # mislabel the decision on the report's outcome line.
+    cfg = Path(tmp_path) / "c.json"
+    cfg.write_text(json.dumps({"reproduce_gate": True, "on_cap": "proceed_with_flags",
+                               "max_rounds_plan": 1}))
+    run_dir = _run(["init-run", "--goal", "g", "--base-dir", str(tmp_path),
+                    "--config", str(cfg)]).stdout.strip()
+    r = _run_bound_verdict(
+        tmp_path, run_dir, "reproduce", 1, "REQUEST_CHANGES", payload="no repro",
+        findings=[{"id": "F1", "severity": "blocker", "location": "x", "claim": "c",
+                   "suggestion": "s"}],
+    )
+    assert r.stdout.strip() == "CAPPED"
+    term = [e for e in _events(run_dir)
+            if e["event"] == "gate_capped" and e.get("gate") == "reproduce"][-1]
+    assert term["on_cap"] == "halt"     # EFFECTIVE, not the configured proceed_with_flags
+    assert term["max_rounds"] == 1      # effective cap recorded too
 
 
 def test_verdict_accepts_final_gate(tmp_path):

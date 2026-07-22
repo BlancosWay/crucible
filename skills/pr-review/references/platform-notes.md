@@ -264,12 +264,17 @@ and approving posting never approves execution.
 
 By default the review is **read-only** over the target: the findings + the derived recommendation live
 in the run dir and your reply, and nothing is written to the PR or repo. **Only after** the review
-reaches consensus, and **only for the GitHub-PR input**, you may offer to post the review via `gh`
-(`gh pr review <n> --comment` with the assembled summary, and inline comments) — and **only** with the
-human's explicit, per-run OK. What you post is the **deterministic recommendation and findings from
-`crucible review-result`**, never model prose. Posting is never automatic, never done for the
-local-diff input, and never done before consensus. Treat the human's decision as the gate; the peers
-do not decide to post.
+reaches consensus, and **only for the GitHub-PR input**, you may offer to post the review via `gh pr
+review` — and **only** with the human's explicit, per-run OK. What you post is the **deterministic
+recommendation and findings from `crucible review-result`**, never model prose: the assembled findings
+form the review **body** (`--body`/`--body-file`), and the derived recommendation selects the review
+**state** — `APPROVE` → `gh pr review <n> --approve`, `COMMENT` → `--comment`, `REQUEST_CHANGES` →
+`--request-changes` — so the posted GitHub review state reflects the recommendation rather than always
+a neutral comment. `gh pr review` posts one review as a body + state; it does **not** carry per-line
+inline comments, so never claim to post them (a line-anchored review would need the REST reviews API
+with commit-sha/path/line/side mappings, which this flow does not build). Posting is never automatic,
+never done for the local-diff input, and never done before consensus. Treat the human's decision as
+the gate; the peers do not decide to post.
 
 ## Report labels
 

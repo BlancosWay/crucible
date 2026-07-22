@@ -59,7 +59,7 @@ jobs:
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
           python3 scripts/changelog.py section "$version" > release-notes.md
-          test -s release-notes.md  # non-empty
+          test -s release-notes.md  # secondary guard; `changelog.py section` already fails closed on a no-content section
           echo "----- release notes -----"; cat release-notes.md
 
       - name: Create the GitHub Release

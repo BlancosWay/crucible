@@ -435,9 +435,12 @@ with the unresolved dispute carried as a flag.
    transcript, so paste the assembled `review-result` findings + the derived recommendation into your
    reply **in full** — never truncated via `head`/`tail`/`grep`/`sed`. The findings are the deliverable.
 5. **Optional posting (consented).** Only after consensus, only for the GitHub-PR input, and only on
-   the human's explicit OK, post the review via `gh pr review` (summary + inline comments) using the
-   **deterministic recommendation and findings from `crucible review-result`**, never model prose.
-   Never post automatically, before consensus, or for a local diff (see `references/platform-notes.md`).
+   the human's explicit OK, post the review via `gh pr review` using the **deterministic recommendation
+   and findings from `crucible review-result`**, never model prose: the findings form the review body
+   and the derived recommendation selects the review state — `APPROVE` → `--approve`, `COMMENT` →
+   `--comment`, `REQUEST_CHANGES` → `--request-changes`. `gh pr review` posts a body + state, not
+   per-line inline comments. Never post automatically, before consensus, or for a local diff (see
+   `references/platform-notes.md`).
 6. **Clean up:** once you've captured the findings, `PYTHONPATH=scripts python3 -m crucible clean --run "$RUN"`.
 
 ## Red flags

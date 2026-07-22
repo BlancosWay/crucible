@@ -37,20 +37,44 @@ def _html_escape(text: str) -> str:
 
 
 def _san(value: Any) -> str:
-    """Flatten untrusted text to a single line and neutralize Markdown table/heading AND
-    HTML breakers.
+    """Flatten untrusted text to a single line and neutralize Markdown table/heading, Markdown
+    image/link, AND HTML breakers.
 
-    Critic verdicts, goals, and DAG fields are untrusted data: a newline or a stray ``|``
-    could inject a fake heading/row/outcome line, and raw HTML (``<script>``,
-    ``<img onerror=…>``) would execute when ``report.md`` is opened in an HTML-permitting
-    Markdown renderer. So escape ``&``/``<``/``>`` (``&`` first) in addition to ``|`` and
-    backticks. The fenced raw provenance is handled separately — kept verbatim in Markdown
-    (code-fence content renders literally) and escaped by ``render_html``.
+    Critic verdicts, goals, DAG fields, and PR-derived text are untrusted data: a newline or a stray
+    ``|`` could inject a fake heading/row/outcome line; raw HTML (``<script>``, ``<img onerror=…>``)
+    would execute when ``report.md`` is opened in an HTML-permitting Markdown renderer; and Markdown
+    image/link syntax (``![alt](url)`` / ``[text](url)``) would render an **active** ``<img>`` request
+    (a tracking pixel / content injection) with no HTML at all. So escape ``&``/``<``/``>`` (``&``
+    first), ``|`` and backticks, AND the link/image brackets ``[``/``]`` (escaping the brackets breaks
+    both ``![…](…)`` and ``[…](…)`` — the ``!`` alone is inert once the brackets are escaped). The
+    fenced raw provenance is handled separately — kept verbatim in Markdown (code-fence content renders
+    literally) and escaped by ``render_html``.
+
+    Its output is safe in Markdown **running text**; it is NOT placed inside a backtick code span,
+    where a backtick in the value would break out (code spans ignore backslash escapes) — untrusted
+    ids are rendered as plain ``_san`` text, never ``` `…` ```.
     """
     text = str(value).replace("\r", " ").replace("\n", " ")
     text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     text = text.replace("|", "\\|").replace("`", "\\`")
+    text = text.replace("[", "\\[").replace("]", "\\]")
     return " ".join(text.split()).strip()
+
+
+def _gate_policy_suffix(terminal_event: dict[str, Any]) -> str:
+    """The effective per-gate policy recorded on a terminal event (F5) — the round cap actually used
+    (a ``--max-rounds`` override or the config default) and ``on_cap`` that produced the decision —
+    rendered as ``` (round cap N, on_cap X)```. A legacy terminal event that never recorded the policy
+    yields ``''`` (no suffix), so the report stays readable for pre-F5 runs. Surfacing this lets the
+    report reconstruct a ``--max-rounds``-driven decision that the run config alone cannot show."""
+    mr = terminal_event.get("max_rounds")
+    oc = terminal_event.get("on_cap")
+    parts = []
+    if mr is not None:
+        parts.append(f"round cap {_san(mr)}")
+    if oc is not None:
+        parts.append(f"on_cap {_san(oc)}")
+    return f" ({', '.join(parts)})" if parts else ""
 
 
 def _payload_text(payload: Any) -> str:
@@ -542,7 +566,7 @@ def _symmetric_result_lines(
         lines.append(f"- **{_san(gate)}**")
         for finding in groups[gate]:
             lines.append(
-                f"  - `{_san(finding.get('id'))}` [{_san(finding.get('severity'))}] "
+                f"  - {_san(finding.get('id'))} [{_san(finding.get('severity'))}] "
                 f"{_san(finding.get('location'))}: {_san(finding.get('claim'))} -> "
                 f"{_san(finding.get('suggestion'))}"
             )
@@ -708,14 +732,14 @@ def render_markdown(run: RunLog) -> str:
     lines.append("| Node | Title | Status |")
     lines.append("|------|-------|--------|")
     for n in dag.get("nodes", []):
-        lines.append(f"| `{_san(n.get('id', ''))}` | {_san(n.get('title', ''))} | {_san(n.get('status', ''))} |")
+        lines.append(f"| {_san(n.get('id', ''))} | {_san(n.get('title', ''))} | {_san(n.get('status', ''))} |")
     lines.append("")
 
     lines.append("## Gates")
     lines.append("")
     gates = _events_by_gate(events)
     for gate, gate_events in gates.items():
-        lines.append(f"### Gate: `{_san(gate)}`")
+        lines.append(f"### Gate: {_san(gate)}")
         lines.append("")
         for e in gate_events:
             ev = e.get("event")
@@ -729,7 +753,7 @@ def render_markdown(run: RunLog) -> str:
                 lines.append(f"- **Round {rnd}:** {_san(payload.get('verdict', '?'))} - {_san(payload.get('summary', ''))}")
                 for f in payload.get("findings", []):
                     lines.append(
-                        f"  - `{_san(f.get('id'))}` [{_san(f.get('severity'))}] {_san(f.get('location'))}: "
+                        f"  - {_san(f.get('id'))} [{_san(f.get('severity'))}] {_san(f.get('location'))}: "
                         f"{_san(f.get('claim'))} -> {_san(f.get('suggestion'))}"
                     )
                 raw = e.get("raw")
@@ -755,7 +779,7 @@ def render_markdown(run: RunLog) -> str:
                 for o in e.get("objections", []):
                     if isinstance(o, dict):
                         lines.append(
-                            f"  - `{_san(o.get('id'))}` [{_san(o.get('severity'))}] "
+                            f"  - {_san(o.get('id'))} [{_san(o.get('severity'))}] "
                             f"{_san(o.get('location'))}: {_san(o.get('claim'))} -> "
                             f"{_san(o.get('suggestion'))}"
                         )
@@ -769,7 +793,7 @@ def render_markdown(run: RunLog) -> str:
                         else:
                             res, rationale = info, ""
                         tail = f" — {_san(rationale)}" if rationale else ""
-                        lines.append(f"  - `{_san(fid)}` -> {_san(res)}{tail}")
+                        lines.append(f"  - {_san(fid)} -> {_san(res)}{tail}")
         # A gate ends in exactly one terminal event; if several were ever logged, the LAST in
         # log order is authoritative. Each interpolated value is sanitized individually.
         terminal = [e for e in gate_events
@@ -777,16 +801,17 @@ def render_markdown(run: RunLog) -> str:
         if terminal:
             last = terminal[-1]
             rnd = _san(last.get("round", "?"))
+            policy = _gate_policy_suffix(last)
             if last["event"] == "gate_consensus":
-                lines.append(f"- **Outcome:** CONSENSUS at round {rnd}")
+                lines.append(f"- **Outcome:** CONSENSUS at round {rnd}{policy}")
             elif last["event"] == "gate_proceeded_with_flags":
                 flags = last.get("open_findings", [])
                 ids = ", ".join(_san(i) for i in flags)
                 carried = f": {ids}" if ids else ""
-                lines.append(f"- **Outcome:** PROCEEDED WITH FLAGS at round {rnd} — "
+                lines.append(f"- **Outcome:** PROCEEDED WITH FLAGS at round {rnd}{policy} — "
                              f"{len(flags)} unresolved finding(s) carried{carried}")
             else:  # gate_capped
-                lines.append(f"- **Outcome:** CAPPED at round {rnd} (unresolved)")
+                lines.append(f"- **Outcome:** CAPPED at round {rnd}{policy} (unresolved)")
         lines.append("")
 
     return "\n".join(lines)

@@ -11,7 +11,7 @@ import sys
 import webbrowser
 from pathlib import Path
 
-from crucible.config import Config, load_config
+from crucible.config import Config, load_config, resolved_config_shape_error
 from crucible.dag import DAG, VALID_STATUSES
 from crucible.integrity import (
     current_bindings,
@@ -769,14 +769,21 @@ def cmd_verdict(args) -> int:
     # records exactly which artifact/DAG/node this decision was bound to.
     run.append("critic_verdict", gate=args.gate, round=args.round, payload=data, raw=raw_text,
                **bindings)
+    # F5: record the EFFECTIVE per-gate policy on the terminal event — the round cap actually used
+    # (a `--max-rounds` override or the config default) and `on_cap` — so the report can reconstruct
+    # the decision as made rather than re-deriving it from the (possibly overridden) run config. The
+    # reproduce gate ALWAYS halts (decide(always_halt=True) above) regardless of `cfg.on_cap`, so its
+    # effective `on_cap` is recorded as `halt`, not the configured value.
+    effective_on_cap = "halt" if args.gate == "reproduce" else cfg.on_cap
+    policy = {"max_rounds": max_rounds, "on_cap": effective_on_cap}
     if decision.outcome == "CONSENSUS":
-        run.append("gate_consensus", gate=args.gate, round=args.round, **bindings)
+        run.append("gate_consensus", gate=args.gate, round=args.round, **policy, **bindings)
     elif decision.outcome == "PROCEED_WITH_FLAGS":
         run.append("gate_proceeded_with_flags", gate=args.gate, round=args.round,
-                   open_findings=[f.id for f in decision.open_findings], **bindings)
+                   open_findings=[f.id for f in decision.open_findings], **policy, **bindings)
     elif decision.outcome == "CAPPED":
         run.append("gate_capped", gate=args.gate, round=args.round,
-                   open_findings=[f.id for f in decision.open_findings], **bindings)
+                   open_findings=[f.id for f in decision.open_findings], **policy, **bindings)
     elif decision.outcome != "CHANGES":  # CHANGES intentionally logs no terminal event
         raise SystemExit(f"unexpected decision outcome: {decision.outcome!r}")
     print(decision.outcome)
@@ -987,14 +994,16 @@ def cmd_symmetric_verdict(args) -> int:
         run.append("accepted_finding_set", **accepted_fields)
 
     # The standard terminal event is appended LAST with bindings (CHANGES logs none, staying in loop).
+    # F5: also record the effective per-gate policy (round cap actually used + on_cap) on the terminal.
+    policy = {"max_rounds": max_rounds, "on_cap": cfg.on_cap}
     if decision.outcome == "CONSENSUS":
-        run.append("gate_consensus", gate=args.gate, round=args.round, **bindings)
+        run.append("gate_consensus", gate=args.gate, round=args.round, **policy, **bindings)
     elif decision.outcome == "PROCEED_WITH_FLAGS":
         run.append("gate_proceeded_with_flags", gate=args.gate, round=args.round,
-                   open_findings=[o.id for o in decision.open_objections], **bindings)
+                   open_findings=[o.id for o in decision.open_objections], **policy, **bindings)
     elif decision.outcome == "CAPPED":
         run.append("gate_capped", gate=args.gate, round=args.round,
-                   open_findings=[o.id for o in decision.open_objections], **bindings)
+                   open_findings=[o.id for o in decision.open_objections], **policy, **bindings)
     elif decision.outcome != "CHANGES":  # CHANGES intentionally logs no terminal event
         raise SystemExit(f"unexpected decision outcome: {decision.outcome!r}")
 
@@ -1268,28 +1277,69 @@ def cmd_show_plan(args) -> int:
 
 
 def cmd_clean(args) -> int:
-    """Delete a finished run's directory (logs, report, and all scratch).
+    """Delete a FINISHED run's directory (logs, report, and all scratch).
 
     Refuses any path that is not a Crucible run dir — it must exist and contain a
     ``runlog.jsonl`` — so a typo/wrong path can never remove an unrelated directory. Also
-    refuses a run still in progress (any node not ``done``) unless ``--force`` is given.
+    refuses a run that is not **finished** (:func:`_run_is_finished`) unless ``--force`` is given:
+    completeness is judged over every CONFIGURED phase (PLAN, plus REPRODUCE / FINAL when enabled)
+    reaching consensus/proceeded and every DAG node ``done`` — not merely the DAG node tally — so a
+    run still in REPRODUCE/PLAN (no DAG yet) or one with all nodes done but FINAL pending is preserved,
+    not silently deleted.
     """
     run_dir = Path(args.run)
     if not run_dir.is_dir():
         raise SystemExit(f"crucible: not a run directory: {run_dir}")
     if not (run_dir / "runlog.jsonl").exists():
         raise SystemExit(f"crucible: refusing to delete {run_dir} — no runlog.jsonl (not a run dir)")
-    if not args.force:
-        try:
-            prog = DAG.from_dict(RunLog(args.run).load_dag()).progress()
-        except FileNotFoundError:
-            prog = None  # no DAG loaded yet — nothing in progress, safe to remove
-        if prog and prog["total"] and prog.get("done", 0) < prog["total"]:
-            raise SystemExit(f"crucible: refusing to delete {run_dir} — run is in progress "
-                             f"({prog.get('done', 0)}/{prog['total']} nodes done); pass --force to override")
+    if not args.force and not _run_is_finished(run_dir):
+        raise SystemExit(
+            f"crucible: refusing to delete {run_dir} — the run is not finished (a configured phase "
+            "has not concluded, or a node is not done); pass --force to override")
     shutil.rmtree(run_dir)
     print(f"removed {run_dir}")
     return 0
+
+
+def _run_is_finished(run_dir: Path) -> bool:
+    """True only when the run has POSITIVELY concluded every configured phase: the PLAN gate — and
+    REPRODUCE when ``reproduce_gate``, FINAL when ``final_review`` — each reached ``gate_consensus`` or
+    ``gate_proceeded_with_flags``, a DAG is loaded, and every node is ``done``.
+
+    Any uncertainty returns ``False`` so ``clean`` errs on preserving a run that is not provably
+    finished (``--force`` overrides): an unreadable config or DAG (still in REPRODUCE/PLAN, or a
+    corrupt/legacy run), an unconcluded configured phase (e.g. FINAL still pending), a node not
+    ``done``, or a gate that only ``gate_capped`` (halted with unresolved findings, not a clean
+    finish). Deliberately does NOT call :func:`_require_run_integrity` — ``clean`` must still be able
+    to remove a corrupt/legacy run *with* ``--force``.
+    """
+    run = RunLog(run_dir)
+    try:
+        data = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    # Require the COMPLETE resolved run-config shape (the same standard `report` applies) — never
+    # merge-fill an absent/partial config from defaults, which could otherwise silently disable a
+    # configured phase (e.g. a partial `{"final_review": false}` hiding a pending FINAL) and make an
+    # active run look finished.
+    if resolved_config_shape_error(data) is not None:
+        return False
+    cfg = Config.from_dict(data)
+    concluded = {e.get("gate") for e in run.read_events()
+                 if e.get("event") in ("gate_consensus", "gate_proceeded_with_flags")}
+    if cfg.reproduce_gate and "reproduce" not in concluded:
+        return False
+    if "plan" not in concluded:
+        return False
+    try:
+        dag = DAG.from_dict(run.load_dag())
+    except (OSError, ValueError, KeyError):
+        return False
+    if any(node.status != "done" for node in dag.nodes.values()):
+        return False
+    if cfg.final_review and "final" not in concluded:
+        return False
+    return True
 
 
 def cmd_report(args) -> int:

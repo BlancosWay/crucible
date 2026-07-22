@@ -1145,6 +1145,11 @@ def test_platform_notes_posting_is_readonly_by_default_and_consented():
     assert "review-result" in low            # posts the deterministic recommendation/findings
     # never automatic, never before consensus
     assert "never automatic" in low
+    # F7: the derived recommendation maps to the actual gh pr review STATE (not a hardcoded --comment)
+    assert "--approve" in low and "--comment" in low and "--request-changes" in low
+    # F7: the unbacked inline-comments promise is dropped (gh pr review posts a body + state only)
+    assert "and inline comments" not in low
+    assert "not" in low and "inline comments" in low   # explicitly disclaims per-line inline comments
 
 
 def test_platform_notes_requires_trusted_local_exact_command_consent():

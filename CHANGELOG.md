@@ -94,6 +94,60 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
   only; no CLI/behavior change. Guarded by `tests/test_references.py`.
 
 ### Fixed
+- **`pr-review` posting maps the recommendation to the GitHub review state (and drops the unbacked
+  inline-comments claim).** The optional consented posting flow documented `gh pr review <n> --comment`
+  "with inline comments", but `gh pr review` posts only a body + a single review state and cannot carry
+  per-line inline comments, and the hardcoded `--comment` meant a derived Approve/Request-changes
+  recommendation never reached the GitHub review state. The docs now map the deterministic
+  `review-result` recommendation to the state — `APPROVE` → `--approve`, `COMMENT` → `--comment`,
+  `REQUEST_CHANGES` → `--request-changes` (findings in the body) — under the same per-run posting
+  consent, and no longer promise inline comments the command cannot post. Guarded by
+  `tests/test_pr_review_references.py`.
+- **Gate decisions record the effective per-gate policy (round cap + on_cap).** A gate's terminal
+  event (`gate_consensus` / `gate_proceeded_with_flags` / `gate_capped`) recorded its bindings and
+  open findings but not the effective round cap actually used — so a `--max-rounds` override (which the
+  run config alone cannot show) left the report unable to reconstruct the decision as made. Both
+  `verdict` and `symmetric-verdict` now record the effective `max_rounds` and `on_cap` on the terminal
+  event (the always-halting reproduce gate records `on_cap: halt` regardless of the configured value),
+  and the report surfaces them on each gate's outcome line (a legacy terminal without them stays
+  readable). This is the in-scope provenance fix; defending against an operator who rewrites
+  `RUN/config.json` remains out of scope per `SECURITY.md`. Guarded by `tests/test_cli.py` and
+  `tests/test_report.py`.
+- **`crucible clean` refuses an unfinished run (not just an incomplete DAG).** The delete guard keyed
+  only on DAG node completion, so a run still in REPRODUCE/PLAN (no `dag.json` yet — classified as
+  "nothing in progress, safe to remove") and a run with all nodes done but FINAL still pending were
+  both deletable without `--force`, destroying active provenance. `clean` now refuses (without
+  `--force`) unless every configured phase has positively concluded — PLAN, plus REPRODUCE / FINAL
+  when enabled, with a DAG loaded and every node `done`; any uncertainty (unreadable config/DAG, an
+  unconcluded phase, a capped/halted gate) preserves the run. `--force` still removes anything.
+  Guarded by `tests/test_cli.py`.
+- **The run report neutralizes Markdown image/link injection and code-span id breakout.** Untrusted
+  fields (goals, Critic/peer finding ids and claims, DAG node ids/titles, gate names) are sanitized
+  before rendering, but `_san` previously escaped only HTML and table/heading breakers — a value like
+  `![](http://tracker)` still rendered an **active** `<img>` (a tracking pixel / content injection)
+  when `report.md` was opened in a Markdown renderer, and an untrusted id wrapped in a backtick code
+  span could break out of it (Markdown code spans ignore backslash escapes). `_san` now also escapes
+  the Markdown image/link brackets `[`/`]`, and every remaining untrusted id is rendered as plain
+  `_san` text rather than inside a code span (the dependency table, gate headers, and the
+  findings/objections/resolutions lists), matching the summary convention. Guarded by
+  `tests/test_report.py`.
+- **Release notes require real content, not a bare heading.** The release workflow published the
+  version's CHANGELOG section as the GitHub Release body, gated only by a non-empty check
+  (`changelog.py section` + `test -s`), so a heading-only body such as `### Added` passed even though
+  the changelog guard (`_content_lines`) counts it as no real entry. `changelog.py section` now fails
+  closed on a section with no real content, and the version-consistency guard checks real entries
+  (not just `body.strip()`), closing the inconsistency. Guarded by `tests/test_version_consistency.py`.
+- **The CHANGELOG guard now covers `config.defaults.json`.** A change to the shipped default config
+  (default Builder/Critic models, round caps, `on_cap`, severities) affects what every run resolves,
+  but `requires_changelog` matched only `scripts/`/`skills/`/`commands/` and so did not require a
+  CHANGELOG entry for it. `config.defaults.json` is now a recognized shipped runtime file. Guarded by
+  `tests/test_changelog.py`.
+- **`crucible load-dag` rejects a blank/whitespace or non-stripped node id.** A dependency-tree node
+  whose `id` was blank, whitespace-only, or carried surrounding whitespace previously passed
+  `DAG.from_dict` (only emptiness was checked) yet its `dep:<id>` gate was rejected by the gate
+  validator — so the node loaded and was scheduled by `next` but could never be reviewed, wedging the
+  run. `load-dag` now rejects such an id at load, matching the gate rule and the documented kebab-case
+  schema. Guarded by `tests/test_dag.py`.
 - **`pr-review` derives the GitHub snapshot patch from the exact archive bytes and modes (no
   attribute-driven rewriting).** The merge-base→head snapshot trees are now built from the **raw**
   archive bytes and archive-derived file modes with git plumbing that can never run a

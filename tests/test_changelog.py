@@ -3,7 +3,7 @@
 `pytest.ini` puts `scripts/` on the path, so `changelog` imports directly.
 """
 
-from changelog import added_changelog_entry
+from changelog import added_changelog_entry, requires_changelog
 
 UNREL = "# Changelog\n\n## [Unreleased]\n\n## [0.1.0] - 2026-06-22\n- initial\n"
 
@@ -15,6 +15,22 @@ def _with_unreleased(*lines: str) -> str:
 
 def test_no_change_is_not_an_entry():
     assert added_changelog_entry(UNREL, UNREL) is False
+
+
+def test_requires_changelog_covers_shipped_paths_and_config_defaults():
+    # F12: a change to the shipped default config affects what every run resolves and must be noted,
+    # but the guard previously matched only scripts/skills/commands. config.defaults.json is now a
+    # recognized shipped runtime file; unrelated root files / docs / tests / CI still do not trigger.
+    assert requires_changelog(["scripts/crucible/cli.py"]) is True
+    assert requires_changelog(["skills/pr-review/SKILL.md"]) is True
+    assert requires_changelog(["commands/anything.md"]) is True
+    assert requires_changelog(["config.defaults.json"]) is True
+    assert requires_changelog(["README.md"]) is False
+    assert requires_changelog(["tests/test_changelog.py"]) is False
+    assert requires_changelog(["docs/cli.md"]) is False
+    # any shipped path in a mixed set still triggers the guard
+    assert requires_changelog(["README.md", "config.defaults.json"]) is True
+    assert requires_changelog([]) is False
 
 
 def test_new_bullet_under_unreleased_counts():

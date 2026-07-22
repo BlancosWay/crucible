@@ -66,16 +66,42 @@ class TestVersionConsistency(unittest.TestCase):
 
     def test_current_version_section_is_nonempty(self):
         # The release workflow publishes the current version's section as the release
-        # notes; guard here (a REQUIRED check) that those notes are non-empty, so a
-        # version bump with an empty section can never reach a tag.
+        # notes; guard here (a REQUIRED check) that those notes contain REAL content, so a
+        # version bump with a heading-only or empty section can never reach a tag. Uses the
+        # same `_content_lines` standard as the changelog guard (a bare '### Added' does NOT count).
         version = _plugin_version()
         text = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
         body = _changelog.extract_section(text, version)
         self.assertTrue(
-            body.strip(),
-            f"CHANGELOG '## [{version}]' section is empty — add release notes "
+            _changelog._content_lines(body),
+            f"CHANGELOG '## [{version}]' section has no real entries — add release notes "
             f"(release.yml publishes this section as the GitHub Release body)",
         )
+
+    def test_section_command_requires_real_content(self):
+        # F11: `changelog.py section` must fail closed on a section whose body is only headings/blank
+        # lines (previously it passed any non-empty body, and the release step's `test -s` did too).
+        import contextlib
+        import io
+        import tempfile
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as d:
+            cl = Path(d) / "CHANGELOG.md"
+            with mock.patch.object(_changelog, "CHANGELOG", cl):
+                # heading-only section -> rejected
+                cl.write_text("# Changelog\n\n## [1.2.3] - 2026-01-01\n### Added\n\n"
+                              "## [1.0.0] - 2025-01-01\n- x\n")
+                self.assertEqual(_changelog.cmd_section("1.2.3"), 1)
+                # real content -> printed, exit 0
+                cl.write_text("# Changelog\n\n## [1.2.3] - 2026-01-01\n### Added\n- a real entry\n\n"
+                              "## [1.0.0] - 2025-01-01\n- x\n")
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = _changelog.cmd_section("1.2.3")
+                self.assertEqual(rc, 0)
+                self.assertIn("a real entry", buf.getvalue())
+                # missing section -> exit 1
+                self.assertEqual(_changelog.cmd_section("9.9.9"), 1)
 
 
 if __name__ == "__main__":
