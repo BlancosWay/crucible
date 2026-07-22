@@ -7,6 +7,8 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-07-22
+
 ### Added
 - **Symmetric two-peer consensus for the `deep-dive` / `pr-review` skills.** The symmetric skills now
   settle every gate from **two separately produced peer attestation files** via a new

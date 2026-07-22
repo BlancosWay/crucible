@@ -108,6 +108,16 @@ def _flat(s: str) -> str:
     return " ".join(s.lower().replace("*", "").replace("`", "").replace("#", " ").split())
 
 
+def _current_notes(text: str) -> str:
+    """The CHANGELOG body a one-time "this feature is documented" guard should scan. Returns the FULL
+    changelog: a feature entry is authored under ``[Unreleased]`` and then moved verbatim into its
+    dated ``## [x.y.z]`` section when the release is cut, so scoping such a guard to a single section
+    breaks either at release time (Unreleased emptied) or once a later cycle adds new Unreleased
+    entries. The feature documentation is permanent, so the guard checks the whole file — the specific,
+    long phrases each guard asserts keep it from matching the wrong entry."""
+    return text
+
+
 def _bash_blocks(text: str) -> list[str]:
     return re.findall(r"```bash\n(.*?)```", text, re.DOTALL)
 
@@ -426,9 +436,10 @@ def test_security_names_binding_and_phase_enforcement_without_overclaim():
 
 
 def test_changelog_records_workflow_integrity():
-    # Scope to the [Unreleased] section and assert the canonical workflow-integrity entry (bound
-    # artifact, schema v2, content bindings, legacy read-only, fresh run) — not isolated words.
-    unreleased = _flat(_section((ROOT / "CHANGELOG.md").read_text(), "[Unreleased]"))
+    # Assert the canonical workflow-integrity entry is documented in the CHANGELOG (bound artifact,
+    # schema v2, content bindings, legacy read-only, fresh run) — not isolated words. `_current_notes`
+    # scans the whole file so this keeps passing after the entry moves into its dated release section.
+    unreleased = _flat(_current_notes((ROOT / "CHANGELOG.md").read_text()))
     assert "every gate decision is bound to the exact reviewed artifact" in unreleased
     assert "schema_version: 2" in unreleased or "schema v2" in unreleased
     assert "content bindings" in unreleased
@@ -514,8 +525,8 @@ def test_security_documents_slot_proof_scope():
 
 
 def test_changelog_records_symmetric_two_peer():
-    # Scope to [Unreleased]: the symmetric two-peer migration is recorded with the new commands.
-    unreleased = _flat(_section((ROOT / "CHANGELOG.md").read_text(), "[Unreleased]"))
+    # The symmetric two-peer migration is documented in the CHANGELOG with the new commands.
+    unreleased = _flat(_current_notes((ROOT / "CHANGELOG.md").read_text()))
     assert "symmetric-verdict" in unreleased
     assert "two" in unreleased and "peer" in unreleased
     assert "accepted-findings" in unreleased and "review-result" in unreleased
@@ -527,7 +538,7 @@ def test_changelog_pr_review_entry_states_cli_extended_not_unmodified():
     # `accepted-findings` / `review-result` commands and the `--workflow` run metadata. It must state
     # the accurate scope (no CONFIG-SCHEMA change, but the CLI gained that workflow metadata + those
     # commands), positively, not merely ban a phrase. The historical release entries are out of scope.
-    unreleased = _section((ROOT / "CHANGELOG.md").read_text(), "[Unreleased]")
+    unreleased = _current_notes((ROOT / "CHANGELOG.md").read_text())
     bullet = _flat(_bullet(unreleased, "New independent `pr-review` skill"))
     # accurate positive wording (implemented reality)
     assert "no config-schema change" in bullet
@@ -593,7 +604,7 @@ def test_security_documents_pinned_source_and_exact_head_execution():
 
 
 def test_changelog_records_target_binding_finding4():
-    unreleased = _flat(_section((ROOT / "CHANGELOG.md").read_text(), "[Unreleased]"))
+    unreleased = _flat(_current_notes((ROOT / "CHANGELOG.md").read_text()))
     assert "normalize-target" in unreleased
     assert "load-target" in unreleased
     assert "materialize-target" in unreleased
