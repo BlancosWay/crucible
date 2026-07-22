@@ -1327,16 +1327,20 @@ def cmd_normalize_target(args) -> int:
     any run. The orchestrator then loads them with ``load-target``. This makes normalization behavior
     executable and directly testable rather than prose-only.
 
-    ``github`` derives its immutable patch from the two codeload snapshots (``--base-archive`` =
-    base.repository@baseRefOid, ``--head-archive`` = head.repository@headRefOid) — never from
-    ``gh pr diff`` or any caller-supplied patch — so the target is a pure function of the pinned OIDs.
+    ``github`` derives its immutable PR-style patch from the merge-base and head codeload snapshots
+    (``--merge-base-archive`` = base.repository@``merge_base_commit.sha``, ``--head-archive`` =
+    head.repository@headRefOid) — never from ``gh pr diff`` or any caller-supplied patch — so the target
+    is a pure function of the pinned merge-base/head OIDs and a base-only commit after the fork point can
+    never leak in. ``--compare-metadata`` is the base repo's ``compare/<baseRefOid>...<headRefOid>``
+    payload that pins the fork point and the changed-file view.
     """
     kind = args.target_kind
     if kind == "github":
         before = json.loads(Path(args.metadata_before).read_text(encoding="utf-8"))
         after = json.loads(Path(args.metadata_after).read_text(encoding="utf-8"))
+        compare = json.loads(Path(args.compare_metadata).read_text(encoding="utf-8"))
         target, diff_bytes = normalize_github_target(
-            before, after, args.base_archive, args.head_archive)
+            before, after, compare, args.merge_base_archive, args.head_archive)
     elif kind == "local":
         intent = json.loads(Path(args.intent).read_text(encoding="utf-8"))
         target, diff_bytes = normalize_local_target(args.repo, args.range, intent)
@@ -1651,9 +1655,12 @@ def build_parser() -> argparse.ArgumentParser:
     ng = normalize_sub.add_parser("github")
     ng.add_argument("--metadata-before", required=True)
     ng.add_argument("--metadata-after", required=True)
-    ng.add_argument("--base-archive", required=True,
-                    help="codeload tarball of base.repository@baseRefOid (snapshot the patch is "
-                         "derived from — never a caller-supplied diff)")
+    ng.add_argument("--compare-metadata", required=True,
+                    help="base repo's compare/<baseRefOid>...<headRefOid> payload (pins the merge base "
+                         "and the changed-file view; exact head OID, never a branch name)")
+    ng.add_argument("--merge-base-archive", required=True,
+                    help="codeload tarball of base.repository@merge_base_commit.sha (the fork-point "
+                         "snapshot the PR-style patch is derived from — never a caller-supplied diff)")
     ng.add_argument("--head-archive", required=True,
                     help="codeload tarball of head.repository@headRefOid (reused for materialize-target)")
     ng.add_argument("--output", required=True)

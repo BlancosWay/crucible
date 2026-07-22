@@ -1597,6 +1597,7 @@ _GITHUB_TARGET = {
     "pr_number": 7, "url": "https://github.com/base/repo/pull/7",
     "base": {"repository": "base/repo", "ref": "main", "sha": "1" * 40},
     "head": {"repository": "fork/repo", "ref": "feature", "sha": "2" * 40},
+    "merge_base_sha": "3" * 40,
     "is_cross_repository": True, "diff_sha256": "a" * 64, "changed_files": ["src/a.py"],
     "intent": {"title": "Fix A", "body": "Details"},
 }
@@ -1630,6 +1631,8 @@ def test_report_renders_github_target_identity(tmp_path):
     assert "1" * 40 in target
     assert "fork/repo" in target
     assert "2" * 40 in target
+    assert "3" * 40 in target  # the recorded PR merge base (fork point) is rendered
+    assert "Merge base" in target
     assert "cross-repository" in target
     assert sha in target  # the authoritative target hash is rendered
 

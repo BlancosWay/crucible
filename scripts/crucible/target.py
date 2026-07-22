@@ -10,7 +10,9 @@ runs.
 Three target kinds share a common core (exact ``diff_sha256`` patch identity, ``changed_files``, and
 untrusted ``intent`` text):
 
-- ``github-pr`` — a GitHub pull request pinned to base/head repository identity and immutable OIDs;
+- ``github-pr`` — a GitHub pull request pinned to base/head repository identity and immutable OIDs,
+  normalized to PR-style ``merge_base..head`` semantics via the base repo's exact-OID compare endpoint
+  (so a base-only commit after the fork point never leaks in as a reverse change);
 - ``local-range`` — a local Git range normalized to PR-style ``merge_base..head`` semantics, with a
   credential-free repository fingerprint;
 - ``diff-file`` — a bare patch that proves *patch bytes only* (``revision_bound: false``); it never
@@ -72,7 +74,8 @@ _COMMON_FIELDS = frozenset({
     "version", "kind", "revision_bound", "repository", "diff_sha256", "changed_files", "intent",
 })
 _VARIANT_FIELDS = {
-    "github-pr": frozenset({"pr_number", "url", "base", "head", "is_cross_repository"}),
+    "github-pr": frozenset({"pr_number", "url", "base", "head", "merge_base_sha",
+                            "is_cross_repository"}),
     "local-range": frozenset({"base", "head", "merge_base_sha"}),
     "diff-file": frozenset(),
 }
@@ -324,7 +327,7 @@ class ReviewTarget:
             head=_parse_revision(data["head"], require_repository=github)
             if kind != "diff-file" else None,
             merge_base_sha=(_required_hash(data, "merge_base_sha", SHA1_RE)
-                            if kind == "local-range" else None),
+                            if kind in ("local-range", "github-pr") else None),
             is_cross_repository=(_required_bool(data, "is_cross_repository") if github else None),
         )
         _validate_variant_relationships(target)
@@ -346,6 +349,7 @@ class ReviewTarget:
                 "url": self.url,
                 "base": self.base.to_dict(),
                 "head": self.head.to_dict(),
+                "merge_base_sha": self.merge_base_sha,
                 "is_cross_repository": self.is_cross_repository,
             })
         elif self.kind == "local-range":
@@ -746,10 +750,57 @@ def _github_identity(md: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _compare_files(compare: dict[str, Any]) -> list[str]:
+    """The sorted, de-duplicated destination paths from a GitHub compare payload's ``files`` list.
+
+    Each entry's ``filename`` is the file's destination path in the three-dot (merge-base) view — the
+    same view ``gh pr view --json files`` and the derived merge-base→head patch report — so the three
+    file sets can be cross-checked. A missing/malformed ``files`` list is rejected."""
+    files = compare.get("files")
+    if not isinstance(files, list):
+        raise ValueError("github compare metadata 'files' must be a list")
+    paths: list[str] = []
+    for entry in files:
+        if isinstance(entry, dict) and isinstance(entry.get("filename"), str) and entry["filename"]:
+            paths.append(entry["filename"])
+        else:
+            raise ValueError("each github compare file entry needs a non-empty string 'filename'")
+    return sorted(set(paths))
+
+
+def _parse_compare_metadata(compare: dict[str, Any], base_oid: str) -> tuple[str, list[str]]:
+    """Validate a GitHub ``repos/<base>/compare/<baseRefOid>...<headRefOid>`` payload and return
+    ``(merge_base_sha, compare_files)``.
+
+    The exact-OID compare is what turns a moving-branch PR into an immutable, PR-style merge-base view:
+    its ``base_commit.sha`` must equal the pinned ``baseRefOid`` (so the payload really describes the
+    recorded base), and its ``merge_base_commit.sha`` — the fork point — must be a valid 40 lowercase
+    hex OID. Both are validated fail-closed; the ``files`` destination-path list is returned for the
+    caller to cross-check against the metadata/derived file sets."""
+    if not isinstance(compare, dict):
+        raise ValueError("github compare metadata must be a JSON object")
+    base_commit = compare.get("base_commit")
+    if not isinstance(base_commit, dict) or not SHA1_RE.match(str(base_commit.get("sha") or "")):
+        raise ValueError("github compare metadata base_commit.sha must be a 40 lowercase hex OID")
+    if base_commit["sha"] != base_oid:
+        raise ValueError(
+            f"github compare base_commit.sha {base_commit['sha']!r} does not equal the pinned "
+            f"baseRefOid {base_oid!r}; the compare payload describes a different base — discard "
+            f"artifacts and retry the acquisition")
+    merge_base_commit = compare.get("merge_base_commit")
+    if (not isinstance(merge_base_commit, dict)
+            or not SHA1_RE.match(str(merge_base_commit.get("sha") or ""))):
+        raise ValueError(
+            "github compare metadata merge_base_commit.sha must be a 40 lowercase hex OID")
+    return merge_base_commit["sha"], _compare_files(compare)
+
+
 def normalize_github_target(metadata_before: dict[str, Any], metadata_after: dict[str, Any],
-                            base_archive: str | Path,
+                            compare_metadata: dict[str, Any],
+                            merge_base_archive: str | Path,
                             head_archive: str | Path) -> tuple["ReviewTarget", bytes]:
-    """Normalize a GitHub PR into a revision-bound ``github-pr`` target + its DERIVED exact patch.
+    """Normalize a GitHub PR into a revision-bound ``github-pr`` target + its DERIVED exact patch,
+    using immutable PR-style **merge-base** semantics.
 
     ``metadata_before``/``metadata_after`` are the JSON documents emitted by ``gh pr view --json ...``
     read around the archive fetches. Every field of the immutable identity tuple (PR number/URL/title/
@@ -758,12 +809,17 @@ def normalize_github_target(metadata_before: dict[str, Any], metadata_after: dic
     (before any archive is read) so the orchestrator can retry. Branch names are display metadata —
     SHAs and repository identities are authoritative.
 
-    The patch is **derived** from the two codeload snapshots (``base_archive`` = ``baseRefOid`` tree,
-    ``head_archive`` = ``headRefOid`` tree), never accepted from ``gh pr diff`` or any caller-supplied
-    bytes: this makes the target a pure function of the exact pinned OIDs and eliminates the PR-state
-    diff / ABA race (a server-side diff recomputed against a moved branch can no longer leak in). The
-    ``changed_files`` set is likewise derived from that patch; if it disagrees with the metadata
-    ``files`` the target is rejected rather than trusting the metadata. Returns ``(target, diff_bytes)``.
+    ``compare_metadata`` is the ``repos/<base>/compare/<baseRefOid>...<headRefOid>`` payload from the
+    base repository (exact head OID; cross-fork exact OIDs are supported — never branch names). Its
+    ``base_commit.sha`` must equal the recorded ``baseRefOid`` and its ``merge_base_commit.sha`` is the
+    PR fork point recorded as ``merge_base_sha``. This is what makes the target immutable **and** correct
+    when the base branch has advanced past the fork point: the patch is derived from the base repo's
+    ``merge_base`` snapshot (``merge_base_archive``) → the head repo's ``headRefOid`` snapshot
+    (``head_archive``) — a pure function of the pinned merge-base and head OIDs — so a base-only commit
+    made after the fork never appears as a reverse change, and a server-recomputed ``gh pr diff`` against
+    a moved branch can no longer leak in (the ABA race is eliminated). The ``changed_files`` set is
+    derived from that patch; if the derived set, the metadata ``files``, or the compare ``files`` list
+    disagree the target is rejected rather than trusting any single source. Returns ``(target, diff_bytes)``.
     """
     before, after = _github_identity(metadata_before), _github_identity(metadata_after)
     if before != after:
@@ -784,27 +840,35 @@ def normalize_github_target(metadata_before: dict[str, Any], metadata_after: dic
     is_cross = md.get("isCrossRepository")
     if not isinstance(is_cross, bool):
         raise ValueError("github metadata isCrossRepository must be a boolean")
+    if not isinstance(base_oid, str) or not SHA1_RE.match(base_oid):
+        raise ValueError("github metadata baseRefOid must be a 40 lowercase hex OID")
 
-    # Derive the immutable patch from the exact base/head OID snapshots (never a caller diff), then
-    # derive changed_files from that patch and reject a metadata file list that disagrees with it.
+    # Validate the compare payload and record the fork point BEFORE any archive is read: the compare
+    # base_commit must equal the pinned baseRefOid and the merge_base_commit is the fork point.
+    merge_base_sha, compare_files = _parse_compare_metadata(compare_metadata, base_oid)
+    metadata_files = tuple(_github_files(md))
+    if tuple(compare_files) != metadata_files:
+        raise ValueError(
+            f"github compare changed files {compare_files} disagree with the PR metadata files "
+            f"{list(metadata_files)}; the compare payload and PR metadata are inconsistent — discard "
+            f"artifacts and retry the acquisition")
+
+    # Derive the immutable patch from the merge-base and head OID snapshots (never a caller diff), then
+    # derive changed_files from that patch and reject a file set that disagrees with the metadata.
     #
     # The snapshots are historyless single-commit trees (codeload tarballs), so the patch is the
-    # deterministic two-dot content delta between `base@baseRefOid` and `head@headRefOid` — a pure
-    # function of the two pinned OIDs, which is exactly what eliminates the PR-state/ABA race. GitHub's
-    # own `files` list is a three-dot (merge-base) view, so if the base branch has advanced past the
-    # PR's fork point with changes to files the PR does not touch, the derived (two-dot) set is a strict
-    # superset and this fails CLOSED (retry/halt) rather than trusting the metadata or silently pinning
-    # a diff that does not match the recorded OIDs. This is deliberate: an immutable target must be the
-    # exact base→head content delta, never a server-recomputed view of a moving branch.
-    diff = _derive_github_patch(base_archive, head_archive)
+    # deterministic content delta between `base@merge_base_sha` and `head@headRefOid` — the PR-style
+    # three-dot (merge-base) view. Because the merge base is the fork point, a base-only commit made on
+    # the base branch after the fork exists in NEITHER snapshot and can never enter the patch, and the
+    # derived set now agrees with GitHub's own merge-base `files` view instead of being a strict
+    # superset. A disagreement still fails CLOSED (retry/halt) rather than trusting the metadata.
+    diff = _derive_github_patch(merge_base_archive, head_archive)
     derived_changed = tuple(_changed_files_from_diff(diff))
-    metadata_files = tuple(_github_files(md))
     if derived_changed != metadata_files:
         raise ValueError(
-            f"github PR changed files derived from the base/head snapshots {list(derived_changed)} "
+            f"github PR changed files derived from the merge-base/head snapshots {list(derived_changed)} "
             f"disagree with the PR metadata files {list(metadata_files)}; the snapshots and metadata "
-            f"are inconsistent (e.g. the base branch advanced past the merge base) — discard artifacts "
-            f"and retry the acquisition")
+            f"are inconsistent — discard artifacts and retry the acquisition")
 
     manifest = {
         "version": TARGET_VERSION,
@@ -815,6 +879,7 @@ def normalize_github_target(metadata_before: dict[str, Any], metadata_after: dic
         "url": md.get("url"),
         "base": {"repository": base_repo, "ref": base_ref, "sha": base_oid},
         "head": {"repository": head_repo, "ref": head_ref, "sha": head_oid},
+        "merge_base_sha": merge_base_sha,
         "is_cross_repository": is_cross,
         "diff_sha256": hashlib.sha256(diff).hexdigest(),
         "changed_files": list(derived_changed),
@@ -823,9 +888,9 @@ def normalize_github_target(metadata_before: dict[str, Any], metadata_after: dic
     return _build_target(manifest), diff
 
 
-def _derive_github_patch(base_archive: str | Path, head_archive: str | Path) -> bytes:
-    """The deterministic binary patch between two GitHub codeload snapshots, derived with no external
-    diff/textconv execution.
+def _derive_github_patch(merge_base_archive: str | Path, head_archive: str | Path) -> bytes:
+    """The deterministic binary patch between the merge-base and head GitHub codeload snapshots, derived
+    with no external diff/textconv execution.
 
     Both codeload archives are safely inspected/extracted (the same traversal/link/resource rules as
     ``safe_extract_source_archive``, stripping exactly one ``owner-repo-<sha>/`` wrapper) into confined
@@ -837,11 +902,11 @@ def _derive_github_patch(base_archive: str | Path, head_archive: str | Path) -> 
     """
     with tempfile.TemporaryDirectory(prefix="crucible-gh-diff-") as tmp:
         tmp_path = Path(tmp)
-        base_tree_dir = tmp_path / "base"
+        merge_base_tree_dir = tmp_path / "merge-base"
         head_tree_dir = tmp_path / "head"
-        safe_extract_source_archive(base_archive, base_tree_dir, strip_wrapper=True)
+        safe_extract_source_archive(merge_base_archive, merge_base_tree_dir, strip_wrapper=True)
         safe_extract_source_archive(head_archive, head_tree_dir, strip_wrapper=True)
-        return _git_snapshot_diff(tmp_path / "git", base_tree_dir, head_tree_dir)
+        return _git_snapshot_diff(tmp_path / "git", merge_base_tree_dir, head_tree_dir)
 
 
 def _git_snapshot_diff(git_dir: Path, base_tree_dir: Path, head_tree_dir: Path) -> bytes:

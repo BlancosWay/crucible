@@ -24,35 +24,44 @@ metadata; the base/head commit **OIDs** and repository identities are authoritat
 immutable — correcting it needs a **fresh run**.
 
 **GitHub PR** (`--goal` names a PR number/URL). Read the metadata **before and after** fetching the
-base/head **snapshots**, and fail **closed** without relying on a global `set -e`: error-check the
-first metadata read, the base/head repository+OID parses, **both** codeload archive fetches, and the
-second metadata read, and run `normalize-target` **only after all of them succeed**. The immutable
-patch is **derived** from the two snapshots — base `repository@baseRefOid` and head
-`repository@headRefOid` — **never** from a server-recomputed PR diff or any caller-supplied patch, so
-the target is a pure function of the pinned OIDs and no server-side diff recomputed against a moved
-(the ABA race is eliminated). Any failure — a non-zero `gh`/parse, or a metadata drift between the two
-reads (an identity field moved) — discards **every** partial before/after/archive/target artifact and
-retries (≤3 attempts, halting clearly on exhaustion). The stable before/after title/body supplies the
-intent directly, and the fetched **head** archive is reused for materialization (never re-fetched):
+compare metadata and the **merge-base/head snapshots**, and fail **closed** without relying on a global
+`set -e`: error-check the first metadata read, the base/head repository+OID parses, the exact-OID
+`compare` fetch, the `merge_base_commit.sha` parse, **both** codeload archive fetches (merge-base +
+head), and the second metadata read, and run `normalize-target` **only after all of them succeed**. The
+immutable patch is **derived** PR-style from the **merge-base** snapshot — base
+`repository@merge_base_commit.sha` (the fork point the base repo's exact-OID
+`compare/<baseRefOid>...<headRefOid>` endpoint reports) — and the head snapshot — head
+`repository@headRefOid` — **never** from a server-recomputed PR diff or any caller-supplied patch, so the
+target is a pure function of the pinned merge-base/head OIDs and a base-only commit made on the base
+branch **after** the fork point can never appear as a reverse change (and the ABA race is eliminated).
+Cross-fork exact head OIDs are supported by the compare endpoint — use the OIDs, never branch names. Any
+failure — a non-zero `gh`/parse, a malformed/mismatched compare payload (its `base_commit.sha` must equal
+`baseRefOid`), or a metadata drift between the two reads (an identity field moved) — discards **every**
+partial before/after/compare/merge-base/head/target artifact and retries (≤3 attempts, halting clearly on
+exhaustion). The stable before/after title/body supplies the intent directly, and the fetched **head**
+archive is reused for materialization (never re-fetched):
 
 ```bash
 GH_JSON=number,url,title,body,files,baseRefName,baseRefOid,headRefName,headRefOid,headRepository,headRepositoryOwner,isCrossRepository
 for ATTEMPT in 1 2 3; do
   ok=1
   gh pr view "$PR" --json "$GH_JSON" > "$RUN"/pr-before.json || ok=0
-  BASE_REPOSITORY=; BASE_OID=; HEAD_REPOSITORY=; HEAD_OID=
+  BASE_REPOSITORY=; BASE_OID=; HEAD_REPOSITORY=; HEAD_OID=; MERGE_BASE_OID=
   [ "$ok" = 1 ] && { BASE_REPOSITORY=$(python3 -c 'import json,sys,urllib.parse as u; print("/".join(u.urlsplit(json.load(open(sys.argv[1]))["url"]).path.strip("/").split("/")[:2]))' "$RUN"/pr-before.json) || ok=0; }
   [ "$ok" = 1 ] && { BASE_OID=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["baseRefOid"])' "$RUN"/pr-before.json) || ok=0; }
   [ "$ok" = 1 ] && { HEAD_REPOSITORY=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["headRepository"]["nameWithOwner"])' "$RUN"/pr-before.json) || ok=0; }
   [ "$ok" = 1 ] && { HEAD_OID=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["headRefOid"])' "$RUN"/pr-before.json) || ok=0; }
   [ "$ok" = 1 ] && { test -n "$BASE_REPOSITORY" && test -n "$BASE_OID" && test -n "$HEAD_REPOSITORY" && test -n "$HEAD_OID" || ok=0; }
-  [ "$ok" = 1 ] && { gh api "repos/$BASE_REPOSITORY/tarball/$BASE_OID" > "$RUN"/base.tar.gz || ok=0; }
+  [ "$ok" = 1 ] && { gh api "repos/$BASE_REPOSITORY/compare/$BASE_OID...$HEAD_OID" > "$RUN"/compare.json || ok=0; }
+  [ "$ok" = 1 ] && { MERGE_BASE_OID=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["merge_base_commit"]["sha"])' "$RUN"/compare.json) || ok=0; }
+  [ "$ok" = 1 ] && { test -n "$MERGE_BASE_OID" || ok=0; }
+  [ "$ok" = 1 ] && { gh api "repos/$BASE_REPOSITORY/tarball/$MERGE_BASE_OID" > "$RUN"/merge-base.tar.gz || ok=0; }
   [ "$ok" = 1 ] && { gh api "repos/$HEAD_REPOSITORY/tarball/$HEAD_OID" > "$RUN"/head.tar.gz || ok=0; }
   [ "$ok" = 1 ] && { gh pr view "$PR" --json "$GH_JSON" > "$RUN"/pr-after.json || ok=0; }
-  if [ "$ok" = 1 ] && PYTHONPATH=scripts python3 -m crucible normalize-target github --metadata-before "$RUN"/pr-before.json --metadata-after "$RUN"/pr-after.json --base-archive "$RUN"/base.tar.gz --head-archive "$RUN"/head.tar.gz --output "$RUN"/target.json --diff-output "$RUN"/target.diff; then
+  if [ "$ok" = 1 ] && PYTHONPATH=scripts python3 -m crucible normalize-target github --metadata-before "$RUN"/pr-before.json --metadata-after "$RUN"/pr-after.json --compare-metadata "$RUN"/compare.json --merge-base-archive "$RUN"/merge-base.tar.gz --head-archive "$RUN"/head.tar.gz --output "$RUN"/target.json --diff-output "$RUN"/target.diff; then
     break
   fi
-  rm -f "$RUN"/pr-before.json "$RUN"/pr-after.json "$RUN"/base.tar.gz "$RUN"/head.tar.gz "$RUN"/target.json "$RUN"/target.diff
+  rm -f "$RUN"/pr-before.json "$RUN"/pr-after.json "$RUN"/compare.json "$RUN"/merge-base.tar.gz "$RUN"/head.tar.gz "$RUN"/target.json "$RUN"/target.diff
   [ "$ATTEMPT" -lt 3 ] || { echo "pr-review: GitHub target acquisition failed after 3 attempts" >&2; exit 1; }
 done
 ```

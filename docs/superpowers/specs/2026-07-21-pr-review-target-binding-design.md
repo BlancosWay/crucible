@@ -138,6 +138,7 @@ Rules:
     "ref": "feature",
     "sha": "<40 lowercase hex>"
   },
+  "merge_base_sha": "<40 lowercase hex>",
   "is_cross_repository": true,
   "diff_sha256": "<64 lowercase hex>",
   "changed_files": ["src/a.py"],
@@ -147,17 +148,22 @@ Rules:
 
 The orchestrator resolves these values with `gh pr view` fields including `baseRefOid`,
 `headRefOid`, `headRepository`, `headRepositoryOwner`, and `isCrossRepository`, read **before and
-after** fetching the base/head **snapshots**; a change in any immutable identity field between the two
-reads rejects the target so the whole acquisition can be retried. Branch names are display metadata;
-SHAs and repository identities are authoritative, and intent comes from the stable before/after
-title/body. The immutable patch is **derived** from the two codeload snapshots (base
-`repository@baseRefOid`, head `repository@headRefOid`) — never accepted from a server-recomputed PR
-diff or any caller-supplied patch — so the target is a pure function of the pinned OIDs and the PR-state
-diff / ABA race is eliminated; `changed_files` is derived from that patch and a disagreeing metadata
-file list is rejected. The acquisition fails **closed** (see [Error handling](#error-handling)): each
-`gh` read and both archive fetches are error-checked and normalization proceeds only after all of them
-succeed, so a failed fetch can never feed an empty/truncated snapshot that stable metadata would still
-normalize.
+after** fetching the compare metadata and the merge-base/head **snapshots**; a change in any immutable
+identity field between the two reads rejects the target so the whole acquisition can be retried. Branch
+names are display metadata; SHAs and repository identities are authoritative, and intent comes from the
+stable before/after title/body. The immutable patch is **derived** PR-style from the base repo's
+exact-OID `compare/<baseRefOid>...<headRefOid>` endpoint: its `merge_base_commit.sha` (the fork point,
+recorded as `merge_base_sha`) names the base repo snapshot (`merge_base_archive`) that is diffed against
+the head `repository@headRefOid` snapshot (`head_archive`) — never accepted from a server-recomputed PR
+diff, a base-tip two-dot diff, or any caller-supplied patch — so the target is a pure function of the
+pinned merge-base/head OIDs, a base-only commit made on the base branch **after** the fork point can
+never appear as a reverse change, and the PR-state / ABA race is eliminated. Cross-fork exact head OIDs
+are supported by the compare endpoint (OIDs, never branch names). `changed_files` is derived from that
+patch, and a disagreeing metadata or compare file list is rejected. The acquisition fails **closed**
+(see [Error handling](#error-handling)): each `gh` read, the compare fetch, the merge-base parse, and
+both archive fetches are error-checked and normalization proceeds only after all of them succeed, so a
+failed fetch or a mismatched compare (its `base_commit.sha` must equal `baseRefOid`) can never feed an
+empty/truncated snapshot that stable metadata would still normalize.
 
 ### Local range variant
 
@@ -230,7 +236,8 @@ Add:
 
 ```bash
 crucible normalize-target github --metadata-before PR-BEFORE.json --metadata-after PR-AFTER.json \
-  --base-archive BASE.tar.gz --head-archive HEAD.tar.gz --output TARGET.json --diff-output TARGET.diff
+  --compare-metadata COMPARE.json --merge-base-archive MERGE-BASE.tar.gz --head-archive HEAD.tar.gz \
+  --output TARGET.json --diff-output TARGET.diff
 crucible normalize-target local --repo REPO --range BASE..HEAD --intent INTENT.json \
   --output TARGET.json --diff-output TARGET.diff
 crucible normalize-target diff --diff PATCH --intent INTENT.json \
@@ -244,11 +251,15 @@ crucible materialize-target --run RUN --archive SOURCE.tar.gz
 `normalize-target` does not mutate a run:
 
 - `github` consumes the exact JSON emitted by the documented `gh pr view --json ...` command read
-  **before and after** fetching the base/head snapshots, and **derives** the immutable patch from the
-  `--base-archive` (base `repository@baseRefOid`) and `--head-archive` (head `repository@headRefOid`)
-  codeload snapshots — never a caller-supplied diff; every immutable identity field must match between
-  the two reads or the target is rejected so the orchestrator can retry, and the derived `changed_files`
-  must agree with the metadata file list;
+  **before and after** fetching the compare metadata and the merge-base/head snapshots, and **derives**
+  the immutable PR-style patch from the `--merge-base-archive` (base
+  `repository@merge_base_commit.sha`, the fork point the base repo's exact-OID
+  `compare/<baseRefOid>...<headRefOid>` endpoint reports via `--compare-metadata`) and the
+  `--head-archive` (head `repository@headRefOid`) codeload snapshots — never a caller-supplied diff or a
+  base-tip two-dot diff, so a base-only commit after the fork never appears as a reverse change; every
+  immutable identity field must match between the two reads, the compare `base_commit.sha` must equal
+  `baseRefOid` with a valid `merge_base_commit.sha`, and the derived `changed_files` must agree with the
+  metadata/compare file lists or the target is rejected so the orchestrator can retry;
 - `local` takes one `--range BASE..HEAD|BASE...HEAD` (never separate base/head flags), resolves refs
   and merge base with argument-vector `git` subprocesses (never `shell=True`), and emits the
   merge-base-to-head patch;
@@ -328,7 +339,7 @@ because the append-only run-log permits only one `target_loaded` event.
 
 For `pr-review`, render a `## Review target` section before the workflow summary:
 
-- GitHub PR: URL, base repository/ref/SHA, head repository/ref/SHA, cross-repository flag, patch hash;
+- GitHub PR: URL, base repository/ref/SHA, head repository/ref/SHA, merge-base SHA, cross-repository flag, patch hash;
 - local range: repository identity, base/head/merge-base SHAs, patch hash;
 - diff file: patch hash and explicit revision-unbound status.
 
@@ -441,13 +452,17 @@ and diff-file targets remain non-executable regardless of archive availability.
 ## Error handling
 
 - PR metadata without immutable SHAs/repository identity: halt normalization.
-- GitHub before/base/head/after acquisition fails **closed**, never relying on a global `set -e`: the
-  two `gh pr view` reads (before/after) and the two `gh api .../tarball/...` base/head archive fetches
+- GitHub before/compare/merge-base/head/after acquisition fails **closed**, never relying on a global
+  `set -e`: the two `gh pr view` reads (before/after), the exact-OID `gh api .../compare/...` fetch, the
+  `merge_base_commit.sha` parse, and the two `gh api .../tarball/...` merge-base/head archive fetches
   are each explicitly error-checked and `normalize-target` runs only after **all** of them succeed —
-  there is no server-recomputed PR diff (the patch is derived from the two snapshots). A failed read/fetch leaves an
+  there is no server-recomputed PR diff and no base-tip two-dot diff (the patch is derived PR-style from
+  the merge-base and head snapshots). A failed read/fetch leaves an
   **empty or truncated** artifact that stable before/after metadata would otherwise let
-  `normalize-target` derive a target from, so any failure — a non-zero `gh`/fetch or a drifted identity
-  field — discards every partial before/after/base/head/target artifact and retries, bounded to three
+  `normalize-target` derive a target from, so any failure — a non-zero `gh`/fetch, a malformed/mismatched
+  compare payload (its `base_commit.sha` must equal `baseRefOid`, with a valid `merge_base_commit.sha`),
+  or a drifted identity field — discards every partial before/after/compare/merge-base/head/target
+  artifact and retries, bounded to three
   attempts and halting clearly on exhaustion.
 - Source snapshot unavailable or unsafe — a missing/empty reused GitHub `head.tar.gz`, a
   failed/truncated/stale local `git -C ... archive`, or a rejected `materialize-target`: materialization

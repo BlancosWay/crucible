@@ -15,11 +15,15 @@
 - Exactly one canonical `target_loaded` event is allowed, before `load-dag`, PLAN output, or protocol events.
 - Every pr-review PLAN/thread/FINAL binding and peer attestation includes exact `target_sha256`.
 - GitHub PR metadata records base/head repository identity plus immutable base/head OIDs and fork status.
-- GitHub metadata is read before and after fetching the base/head snapshots; the immutable patch is
-  **derived** from those two codeload snapshots (never `gh pr diff`), and the acquisition fails closed
-  (each `gh pr view` read and both `gh api` archive fetches are error-checked, `normalize-target` runs
-  only after all succeed), and any failed read/fetch or drifted identity field discards every partial
-  artifact and retries, at most three times, halting clearly on exhaustion.
+- GitHub metadata is read before and after fetching the compare metadata and the merge-base/head
+  snapshots; the immutable patch is **derived** PR-style from the merge-base snapshot (base
+  `repository@merge_base_commit.sha`, the fork point from the base repo's exact-OID compare endpoint) →
+  the head snapshot (never `gh pr diff` or a base-tip two-dot diff, so a base-only commit after the fork
+  never appears as a reverse change), and the acquisition fails closed (each `gh pr view` read, the
+  `gh api` compare fetch, the merge-base parse, and both `gh api` archive fetches are error-checked,
+  `normalize-target` runs only after all succeed), and any failed read/fetch, malformed/mismatched
+  compare payload, or drifted identity field discards every partial artifact and retries, at most three
+  times, halting clearly on exhaustion.
 - Local range normalization always diffs `merge_base_sha..head_sha`, regardless of input spelling `..` or `...`.
 - Diff-file targets are patch-bound only (`revision_bound: false`) and never borrow ambient source context.
 - GitHub PR and diff-file targets never execute locally.
@@ -161,7 +165,8 @@ class ReviewTarget:
             "changed_files", "intent",
         }
         variant = {
-            "github-pr": {"pr_number", "url", "base", "head", "is_cross_repository"},
+            "github-pr": {"pr_number", "url", "base", "head", "merge_base_sha",
+                          "is_cross_repository"},
             "local-range": {"base", "head", "merge_base_sha"},
             "diff-file": set(),
         }[kind]
@@ -188,7 +193,7 @@ class ReviewTarget:
             head=_parse_revision(data["head"]) if kind != "diff-file" else None,
             merge_base_sha=(
                 _required_hash(data, "merge_base_sha", SHA1_RE)
-                if kind == "local-range" else None
+                if kind in ("local-range", "github-pr") else None
             ),
             is_cross_repository=(
                 _required_bool(data, "is_cross_repository")
@@ -214,6 +219,7 @@ class ReviewTarget:
                 "url": self.url,
                 "base": self.base.to_dict(),
                 "head": self.head.to_dict(),
+                "merge_base_sha": self.merge_base_sha,
                 "is_cross_repository": self.is_cross_repository,
             })
         elif self.kind == "local-range":
@@ -259,9 +265,13 @@ The fixture must create:
 5. assertions that inputs `main..feature` and `main...feature` resolve to identical target/patch.
 
 Add GitHub metadata tests preserving `baseRefOid`, `headRefOid`, `headRepository.nameWithOwner`,
-`headRepositoryOwner.login`, and `isCrossRepository`. Pass metadata before and after the patch;
-reject any changed PR number/URL/title/body/files/base/head repository/ref/OID/cross-repository flag
-and accept a stable cross-fork tuple. Add diff-file patch-only tests.
+`headRepositoryOwner.login`, and `isCrossRepository`. Pass metadata before and after the archive
+fetches plus the base repo's exact-OID `compare/<baseRefOid>...<headRefOid>` payload; assert the patch
+is derived from the merge-base→head snapshots (a base-only commit after the fork never appears), the
+recorded `merge_base_sha` is the compare `merge_base_commit.sha`, and a mismatched compare
+(`base_commit.sha` != `baseRefOid`, a missing/invalid merge base, or a disagreeing file list) is
+rejected; reject any changed PR number/URL/title/body/files/base/head repository/ref/OID/cross-repository
+flag and accept a stable cross-fork tuple. Add diff-file patch-only tests.
 
 - [ ] **Step 5: Implement normalization helpers**
 
@@ -657,7 +667,7 @@ GH_JSON=number,url,title,body,files,baseRefName,baseRefOid,headRefName,headRefOi
 for ATTEMPT in 1 2 3; do
   ok=1
   gh pr view "$PR" --json "$GH_JSON" > "$RUN/pr-before.json" || ok=0
-  BASE_REPOSITORY=; BASE_OID=; HEAD_REPOSITORY=; HEAD_OID=
+  BASE_REPOSITORY=; BASE_OID=; HEAD_REPOSITORY=; HEAD_OID=; MERGE_BASE_OID=
   [ "$ok" = 1 ] && { BASE_REPOSITORY=$(/Users/sri/personal/crucible/.venv/bin/python -c \
     'import json,sys,urllib.parse as u; print("/".join(u.urlsplit(json.load(open(sys.argv[1]))["url"]).path.strip("/").split("/")[:2]))' \
     "$RUN/pr-before.json") || ok=0; }
@@ -668,16 +678,21 @@ for ATTEMPT in 1 2 3; do
   [ "$ok" = 1 ] && { HEAD_OID=$(/Users/sri/personal/crucible/.venv/bin/python -c \
     'import json,sys; print(json.load(open(sys.argv[1]))["headRefOid"])' "$RUN/pr-before.json") || ok=0; }
   [ "$ok" = 1 ] && { test -n "$BASE_REPOSITORY" && test -n "$BASE_OID" && test -n "$HEAD_REPOSITORY" && test -n "$HEAD_OID" || ok=0; }
-  [ "$ok" = 1 ] && { gh api "repos/$BASE_REPOSITORY/tarball/$BASE_OID" > "$RUN/base.tar.gz" || ok=0; }
+  [ "$ok" = 1 ] && { gh api "repos/$BASE_REPOSITORY/compare/$BASE_OID...$HEAD_OID" > "$RUN/compare.json" || ok=0; }
+  [ "$ok" = 1 ] && { MERGE_BASE_OID=$(/Users/sri/personal/crucible/.venv/bin/python -c \
+    'import json,sys; print(json.load(open(sys.argv[1]))["merge_base_commit"]["sha"])' "$RUN/compare.json") || ok=0; }
+  [ "$ok" = 1 ] && { test -n "$MERGE_BASE_OID" || ok=0; }
+  [ "$ok" = 1 ] && { gh api "repos/$BASE_REPOSITORY/tarball/$MERGE_BASE_OID" > "$RUN/merge-base.tar.gz" || ok=0; }
   [ "$ok" = 1 ] && { gh api "repos/$HEAD_REPOSITORY/tarball/$HEAD_OID" > "$RUN/head.tar.gz" || ok=0; }
   [ "$ok" = 1 ] && { gh pr view "$PR" --json "$GH_JSON" > "$RUN/pr-after.json" || ok=0; }
   if [ "$ok" = 1 ] && PYTHONPATH=scripts python3 -m crucible normalize-target github \
     --metadata-before "$RUN/pr-before.json" --metadata-after "$RUN/pr-after.json" \
-    --base-archive "$RUN/base.tar.gz" --head-archive "$RUN/head.tar.gz" \
+    --compare-metadata "$RUN/compare.json" \
+    --merge-base-archive "$RUN/merge-base.tar.gz" --head-archive "$RUN/head.tar.gz" \
     --output "$RUN/target.json" --diff-output "$RUN/target.diff"; then
     break
   fi
-  rm -f "$RUN/pr-before.json" "$RUN/pr-after.json" "$RUN/base.tar.gz" "$RUN/head.tar.gz" "$RUN/target.json" "$RUN/target.diff"
+  rm -f "$RUN/pr-before.json" "$RUN/pr-after.json" "$RUN/compare.json" "$RUN/merge-base.tar.gz" "$RUN/head.tar.gz" "$RUN/target.json" "$RUN/target.diff"
   [ "$ATTEMPT" -lt 3 ] || { echo "pr-review: GitHub target acquisition failed after 3 attempts" >&2; exit 1; }
 done
 PYTHONPATH=scripts python3 -m crucible load-target \
@@ -698,10 +713,14 @@ fi
 ```
 
 The GitHub normalizer takes intent directly from stable before/after title/body metadata, and the
-immutable patch is **derived** from the base/head codeload snapshots (never `gh pr diff` or a caller
-patch). Both peers read `RUN/target.diff` and `RUN/source`, never ambient checkout files. Acquisition
-fails **closed** (each `gh pr view` read, both `gh api` archive fetches, and the second read explicitly
-checked; any failure discards every partial artifact and retries). Materialization **reuses** the
+immutable patch is **derived** PR-style from the merge-base and head codeload snapshots — base
+`repository@merge_base_commit.sha` (the fork point from the base repo's exact-OID
+`compare/<baseRefOid>...<headRefOid>` endpoint) → head `repository@headRefOid` — never `gh pr diff`, a
+base-tip two-dot diff, or a caller patch, so a base-only commit after the fork can never appear as a
+reverse change. Both peers read `RUN/target.diff` and `RUN/source`, never ambient checkout files.
+Acquisition fails **closed** (each `gh pr view` read, the `gh api` compare fetch, the merge-base parse,
+both `gh api` archive fetches, and the second read explicitly checked; any failure discards every
+partial artifact and retries). Materialization **reuses** the
 acquired `head.tar.gz` and **fails closed / non-fatal**: `SOURCE_AVAILABLE` defaults to `no`,
 `materialize-target` is explicitly checked (never a global `set -e`), any failure leaves
 `SOURCE_AVAILABLE=no`, and only a clean materialize sets `SOURCE_AVAILABLE=yes`.

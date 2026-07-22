@@ -3331,21 +3331,38 @@ def _gh_meta(tmp_path, files, **overrides):
     return md
 
 
-def test_normalize_target_github_derives_patch_from_archives(tmp_path):
-    # F1: the CLI derives the immutable patch from --base-archive/--head-archive snapshots, never a
-    # caller diff. There is no --diff flag on the github subcommand any more.
-    base = _codeload_archive(tmp_path / "base.tar", "base-repo-a", {"src/a.py": b"print('base')\n"})
+def _compare_file(tmp_path, files, *, base_sha="1" * 40, merge_base_sha="3" * 40, name="compare.json"):
+    """Write a GitHub ``compare/BASE...HEAD`` payload and return its path."""
+    compare = {
+        "base_commit": {"sha": base_sha},
+        "merge_base_commit": {"sha": merge_base_sha},
+        "status": "ahead",
+        "files": [{"filename": p, "status": "modified"} for p in files],
+    }
+    cpath = tmp_path / name
+    cpath.write_text(json.dumps(compare))
+    return cpath
+
+
+def test_normalize_target_github_derives_patch_from_merge_base(tmp_path):
+    # F1: the CLI derives the immutable PR-style patch from --merge-base-archive/--head-archive
+    # snapshots, never a caller diff. There is no --diff flag on the github subcommand any more, and the
+    # recorded merge_base_sha comes from the compare payload.
+    mb = _codeload_archive(tmp_path / "merge-base.tar", "base-repo-a", {"src/a.py": b"print('base')\n"})
     head = _codeload_archive(tmp_path / "head.tar", "fork-repo-b", {"src/a.py": b"print('head')\n"})
     bpath = tmp_path / "before.json"; bpath.write_text(json.dumps(_gh_meta(tmp_path, ["src/a.py"])))
     apath = tmp_path / "after.json"; apath.write_text(json.dumps(_gh_meta(tmp_path, ["src/a.py"])))
+    cpath = _compare_file(tmp_path, ["src/a.py"])
     out = tmp_path / "o.json"; dout = tmp_path / "o.diff"
     r = _run(["normalize-target", "github", "--metadata-before", str(bpath),
-              "--metadata-after", str(apath), "--base-archive", str(base),
+              "--metadata-after", str(apath), "--compare-metadata", str(cpath),
+              "--merge-base-archive", str(mb),
               "--head-archive", str(head), "--output", str(out), "--diff-output", str(dout)])
     assert r.returncode == 0, r.stderr
     manifest = json.loads(out.read_text())
     assert manifest["kind"] == "github-pr"
     assert manifest["changed_files"] == ["src/a.py"]
+    assert manifest["merge_base_sha"] == "3" * 40  # recorded from the compare merge_base_commit
     derived = dout.read_bytes()
     assert manifest["diff_sha256"] == hashlib.sha256(derived).hexdigest()
     text = derived.decode()
@@ -3354,25 +3371,30 @@ def test_normalize_target_github_derives_patch_from_archives(tmp_path):
 
 
 def test_normalize_target_github_help_documents_archives(tmp_path):
-    # F1 CLI/help: the github subcommand consumes --base-archive/--head-archive snapshots (the patch is
-    # derived from them). It has no standalone diff-input flag beyond the --diff-output sink.
+    # F1 CLI/help: the github subcommand consumes --compare-metadata + --merge-base-archive/--head-archive
+    # snapshots (the PR-style patch is derived from them). It has no standalone diff-input flag beyond the
+    # --diff-output sink, and it no longer offers a base-tip --base-archive.
     r = _run(["normalize-target", "github", "--help"])
     assert r.returncode == 0, r.stderr
-    assert "--base-archive" in r.stdout and "--head-archive" in r.stdout
+    assert "--compare-metadata" in r.stdout
+    assert "--merge-base-archive" in r.stdout and "--head-archive" in r.stdout
+    assert "--base-archive" not in r.stdout  # the stale base-tip snapshot flag is gone
     assert "--diff-output" in r.stdout
     # no dedicated patch INTAKE flag (only the derived-patch output sink remains)
     assert "--diff " not in r.stdout and "--diff\n" not in r.stdout
 
 
 def test_normalize_target_github_rejects_metadata_drift(tmp_path):
-    base = _codeload_archive(tmp_path / "base.tar", "base-repo-a", {"src/a.py": b"x\n"})
+    mb = _codeload_archive(tmp_path / "merge-base.tar", "base-repo-a", {"src/a.py": b"x\n"})
     head = _codeload_archive(tmp_path / "head.tar", "fork-repo-b", {"src/a.py": b"y\n"})
     before = _gh_meta(tmp_path, ["src/a.py"])
     after = dict(before, headRefOid="9" * 40)  # head advanced mid-acquisition
     bpath = tmp_path / "before.json"; bpath.write_text(json.dumps(before))
     apath = tmp_path / "after.json"; apath.write_text(json.dumps(after))
+    cpath = _compare_file(tmp_path, ["src/a.py"])
     r = _run(["normalize-target", "github", "--metadata-before", str(bpath),
-              "--metadata-after", str(apath), "--base-archive", str(base),
+              "--metadata-after", str(apath), "--compare-metadata", str(cpath),
+              "--merge-base-archive", str(mb),
               "--head-archive", str(head),
               "--output", str(tmp_path / "o.json"), "--diff-output", str(tmp_path / "o.diff")])
     assert r.returncode != 0
@@ -3380,17 +3402,37 @@ def test_normalize_target_github_rejects_metadata_drift(tmp_path):
     assert not (tmp_path / "o.json").exists()  # no output written on rejection
 
 
+def test_normalize_target_github_rejects_compare_base_mismatch(tmp_path):
+    # F1: the compare payload's base_commit.sha must equal the pinned baseRefOid, else the target is
+    # rejected (the compare describes a different base) and no output is written.
+    mb = _codeload_archive(tmp_path / "merge-base.tar", "base-repo-a", {"src/a.py": b"x\n"})
+    head = _codeload_archive(tmp_path / "head.tar", "fork-repo-b", {"src/a.py": b"y\n"})
+    bpath = tmp_path / "before.json"; bpath.write_text(json.dumps(_gh_meta(tmp_path, ["src/a.py"])))
+    apath = tmp_path / "after.json"; apath.write_text(json.dumps(_gh_meta(tmp_path, ["src/a.py"])))
+    cpath = _compare_file(tmp_path, ["src/a.py"], base_sha="9" * 40)  # wrong base
+    r = _run(["normalize-target", "github", "--metadata-before", str(bpath),
+              "--metadata-after", str(apath), "--compare-metadata", str(cpath),
+              "--merge-base-archive", str(mb),
+              "--head-archive", str(head),
+              "--output", str(tmp_path / "o.json"), "--diff-output", str(tmp_path / "o.diff")])
+    assert r.returncode != 0
+    assert "base_commit" in r.stderr
+    assert not (tmp_path / "o.json").exists()
+
+
 def test_normalize_target_github_head_archive_reused_for_materialize(tmp_path):
     # F1: after loading a github target the exact head archive is reused for materialize-target; the
     # codeload wrapper is stripped by kind so the head tree materializes under RUN/source.
-    base = _codeload_archive(tmp_path / "base.tar", "base-repo-a", {"src/a.py": b"print('base')\n"})
+    mb = _codeload_archive(tmp_path / "merge-base.tar", "base-repo-a", {"src/a.py": b"print('base')\n"})
     head = _codeload_archive(tmp_path / "head.tar", "fork-repo-b",
                              {"src/a.py": b"print('head')\n"})
     bpath = tmp_path / "before.json"; bpath.write_text(json.dumps(_gh_meta(tmp_path, ["src/a.py"])))
     apath = tmp_path / "after.json"; apath.write_text(json.dumps(_gh_meta(tmp_path, ["src/a.py"])))
+    cpath = _compare_file(tmp_path, ["src/a.py"])
     out = tmp_path / "o.json"; dout = tmp_path / "o.diff"
     assert _run(["normalize-target", "github", "--metadata-before", str(bpath),
-                 "--metadata-after", str(apath), "--base-archive", str(base),
+                 "--metadata-after", str(apath), "--compare-metadata", str(cpath),
+                 "--merge-base-archive", str(mb),
                  "--head-archive", str(head), "--output", str(out),
                  "--diff-output", str(dout)]).returncode == 0
     run_dir = _init_pr_review(tmp_path / "run")
@@ -3573,6 +3615,7 @@ def _github_pr_manifest(head_repository, diff_bytes):
         "pr_number": 7, "url": "https://github.com/base/repo/pull/7",
         "base": {"repository": "base/repo", "ref": "main", "sha": "1" * 40},
         "head": {"repository": head_repository, "ref": "feature", "sha": "2" * 40},
+        "merge_base_sha": "3" * 40,
         "is_cross_repository": True,
         "diff_sha256": hashlib.sha256(diff_bytes).hexdigest(),
         "changed_files": ["src/a.py"],

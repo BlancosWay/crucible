@@ -113,20 +113,22 @@ def _bash_blocks(text: str) -> list[str]:
 
 
 def _github_acquisition_block(text: str) -> str:
-    """The single executable GitHub before/base/head/after acquisition loop in `text`."""
+    """The single executable GitHub before/compare/merge-base/head/after acquisition loop in `text`."""
     blocks = [b for b in _bash_blocks(text) if "normalize-target github" in b]
     assert len(blocks) == 1, \
-        "exactly one executable GitHub before/base/head/after acquisition block is required"
+        "exactly one executable GitHub before/compare/merge-base/head/after acquisition block is required"
     return blocks[0]
 
 
 def _assert_github_acquisition_fails_closed(block: str) -> None:
-    """The GitHub before/base/head/after acquisition must fail CLOSED without a global `set -e`, and
-    DERIVE the patch from the two snapshots — never `gh pr diff` (F1): bounded 3-attempt retry, the two
-    `gh pr view` reads (before/after) and the two `gh api .../tarball/...` archive fetches (base + head)
-    each explicitly error-checked, `normalize-target` (with `--base-archive`/`--head-archive`) only
-    after every step succeeds, EVERY partial before/after/base/head/target artifact discarded on any
-    failure, a clear non-zero halt on exhaustion, and the metadata-drift retry preserved."""
+    """The GitHub before/compare/merge-base/head/after acquisition must fail CLOSED without a global
+    `set -e`, and DERIVE the patch PR-style from the merge-base and head snapshots — never `gh pr diff`
+    and never a base-tip two-dot diff (F1): bounded 3-attempt retry, the two `gh pr view` reads
+    (before/after), the exact-OID `gh api .../compare/...` fetch, and the two `gh api .../tarball/...`
+    archive fetches (merge-base + head) each explicitly error-checked, `normalize-target` (with
+    `--compare-metadata`/`--merge-base-archive`/`--head-archive`) only after every step succeeds, EVERY
+    partial before/after/compare/merge-base/head/target artifact discarded on any failure, a clear
+    non-zero halt on exhaustion, and the metadata-drift retry preserved."""
     joined = re.sub(r"\\\n\s*", "", block)
     flat = " ".join(joined.split())
 
@@ -140,27 +142,41 @@ def _assert_github_acquisition_fails_closed(block: str) -> None:
         assert "|| ok=0" in ln, \
             f"each gh pr view read must record failure explicitly (|| ok=0): {ln!r}"
 
+    compare_lines = [ln.strip() for ln in joined.splitlines() if "gh api" in ln and "compare/" in ln]
+    assert len(compare_lines) == 1, \
+        f"expected exactly 1 gh api compare fetch, found {len(compare_lines)}"
+    assert "compare/$BASE_OID...$HEAD_OID" in flat, \
+        "the compare must use the exact base/head OIDs (never branch names)"
+    assert "|| ok=0" in compare_lines[0], \
+        f"the compare fetch must record failure explicitly (|| ok=0): {compare_lines[0]!r}"
+    assert "merge_base_commit" in flat, "acquisition must parse merge_base_commit.sha from compare.json"
+
     api_lines = [ln.strip() for ln in joined.splitlines() if "gh api" in ln and "tarball" in ln]
     assert len(api_lines) == 2, f"expected exactly 2 gh api tarball fetches, found {len(api_lines)}"
     for ln in api_lines:
         assert "|| ok=0" in ln, \
             f"each archive fetch must record failure explicitly (|| ok=0): {ln!r}"
-    assert "base.tar.gz" in flat and "head.tar.gz" in flat, \
-        "acquisition must fetch base.tar.gz and head.tar.gz (base/head OID snapshots)"
+    assert "merge-base.tar.gz" in flat and "head.tar.gz" in flat, \
+        "acquisition must fetch merge-base.tar.gz and head.tar.gz (merge-base/head OID snapshots)"
+    assert "tarball/$MERGE_BASE_OID" in flat and "tarball/$HEAD_OID" in flat, \
+        "the two tarball fetches must pin the merge-base and head OIDs"
+    assert "tarball/$BASE_OID" not in flat, \
+        "acquisition must not fetch a base-tip tarball (the patch is derived from the merge base)"
 
     assert re.search(
         r'\[\s*"\$ok"\s*=\s*1\s*\]\s*&&\s*PYTHONPATH=\S+ python3 -m crucible normalize-target github',
         flat), \
         "normalize-target github must be guarded by the success flag — run only after every step"
-    assert "--base-archive" in flat and "--head-archive" in flat, \
-        "normalize-target github must consume the base/head snapshot archives (not a caller diff)"
+    assert "--compare-metadata" in flat and "--merge-base-archive" in flat and "--head-archive" in flat, \
+        "normalize-target github must consume the compare metadata + merge-base/head snapshots"
+    assert "--base-archive" not in flat, "the removed base-tip --base-archive flag must not appear"
     assert re.search(r"normalize-target github.*?then\s+break", flat), \
         "normalize-target must gate the loop break so metadata drift (non-zero exit) retries"
 
     rm = re.search(r"rm -f [^\n]*", joined)
     assert rm, "acquisition must clean up partial artifacts on failure"
-    for name in ("pr-before.json", "pr-after.json", "base.tar.gz", "head.tar.gz",
-                 "target.json", "target.diff"):
+    for name in ("pr-before.json", "pr-after.json", "compare.json", "merge-base.tar.gz",
+                 "head.tar.gz", "target.json", "target.diff"):
         assert name in rm.group(0), f"cleanup must remove the partial {name} on any failure"
 
     assert re.search(r'\[\s*"\$ATTEMPT"\s*-lt\s*3\s*\][^\n]*exit 1', joined), \

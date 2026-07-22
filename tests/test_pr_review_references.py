@@ -285,15 +285,18 @@ def _github_acquisition_block(section: str) -> str:
 
 
 def assert_github_acquisition_fails_closed(block: str) -> None:
-    """The GitHub before/base/head/after acquisition must fail CLOSED without relying on a global
-    `set -e`, and must DERIVE the patch from the two snapshots — never `gh pr diff` (F1).
+    """The GitHub before/compare/merge-base/head/after acquisition must fail CLOSED without relying on a
+    global `set -e`, and must DERIVE the patch PR-style from the merge-base and head snapshots — never
+    `gh pr diff` and never a base-tip two-dot diff (F1).
 
     The loop must: bound retries to 3; use NO `gh pr diff` anywhere; explicitly error-check the two
-    `gh pr view` reads (before/after) and the two `gh api .../tarball/...` archive fetches (base +
-    head); pass `--base-archive`/`--head-archive` to `normalize-target`, run ONLY after every step
-    succeeds; discard EVERY partial before/after/base/head/target artifact on any failure; halt clearly
-    once the attempts are exhausted; and preserve the metadata-drift retry (a non-zero `normalize-target`
-    exit re-enters the loop)."""
+    `gh pr view` reads (before/after), the exact-OID `gh api .../compare/...` fetch, and the two
+    `gh api .../tarball/...` archive fetches (merge-base + head); pass
+    `--compare-metadata`/`--merge-base-archive`/`--head-archive` to `normalize-target` (never the removed
+    `--base-archive`), run ONLY after every step succeeds; discard EVERY partial
+    before/after/compare/merge-base/head/target artifact on any failure; halt clearly once the attempts
+    are exhausted; and preserve the metadata-drift retry (a non-zero `normalize-target` exit re-enters
+    the loop)."""
     joined = re.sub(r"\\\n\s*", "", block)          # fold shell line-continuations to logical lines
     flat = " ".join(joined.split())
 
@@ -307,27 +310,41 @@ def assert_github_acquisition_fails_closed(block: str) -> None:
         assert "|| ok=0" in ln, \
             f"each gh pr view read must record failure explicitly (|| ok=0): {ln!r}"
 
+    compare_lines = [ln.strip() for ln in joined.splitlines() if "gh api" in ln and "compare/" in ln]
+    assert len(compare_lines) == 1, \
+        f"expected exactly 1 gh api compare fetch, found {len(compare_lines)}"
+    assert 'compare/$BASE_OID...$HEAD_OID' in flat, \
+        "the compare must use the exact base/head OIDs (never branch names)"
+    assert "|| ok=0" in compare_lines[0], \
+        f"the compare fetch must record failure explicitly (|| ok=0): {compare_lines[0]!r}"
+    assert "merge_base_commit" in flat, "acquisition must parse merge_base_commit.sha from compare.json"
+
     api_lines = [ln.strip() for ln in joined.splitlines() if "gh api" in ln and "tarball" in ln]
     assert len(api_lines) == 2, f"expected exactly 2 gh api tarball fetches, found {len(api_lines)}"
     for ln in api_lines:
         assert "|| ok=0" in ln, \
             f"each archive fetch must record failure explicitly (|| ok=0): {ln!r}"
-    assert "base.tar.gz" in flat and "head.tar.gz" in flat, \
-        "acquisition must fetch base.tar.gz and head.tar.gz (base/head OID snapshots)"
+    assert "merge-base.tar.gz" in flat and "head.tar.gz" in flat, \
+        "acquisition must fetch merge-base.tar.gz and head.tar.gz (merge-base/head OID snapshots)"
+    assert "tarball/$MERGE_BASE_OID" in flat and "tarball/$HEAD_OID" in flat, \
+        "the two tarball fetches must pin the merge-base and head OIDs"
+    assert "tarball/$BASE_OID" not in flat, \
+        "acquisition must not fetch a base-tip tarball (the patch is derived from the merge base)"
 
     assert re.search(
         r'\[\s*"\$ok"\s*=\s*1\s*\]\s*&&\s*PYTHONPATH=\S+ python3 -m crucible normalize-target github',
         flat), \
         "normalize-target github must be guarded by the success flag — run only after every step"
-    assert "--base-archive" in flat and "--head-archive" in flat, \
-        "normalize-target github must consume the base/head snapshot archives (not a caller diff)"
+    assert "--compare-metadata" in flat and "--merge-base-archive" in flat and "--head-archive" in flat, \
+        "normalize-target github must consume the compare metadata + merge-base/head snapshots"
+    assert "--base-archive" not in flat, "the removed base-tip --base-archive flag must not appear"
     assert re.search(r"normalize-target github.*?then\s+break", flat), \
         "normalize-target must gate the loop break so metadata drift (non-zero exit) retries"
 
     rm = re.search(r"rm -f [^\n]*", joined)
     assert rm, "acquisition must clean up partial artifacts on failure"
-    for name in ("pr-before.json", "pr-after.json", "base.tar.gz", "head.tar.gz",
-                 "target.json", "target.diff"):
+    for name in ("pr-before.json", "pr-after.json", "compare.json", "merge-base.tar.gz",
+                 "head.tar.gz", "target.json", "target.diff"):
         assert name in rm.group(0), f"cleanup must remove the partial {name} on any failure"
 
     assert re.search(r'\[\s*"\$ATTEMPT"\s*-lt\s*3\s*\][^\n]*exit 1', joined), \
@@ -572,8 +589,10 @@ def test_platform_notes_normalizes_gh_or_local_diff_input():
     assert "normalize-target" in low
     assert "load-target" in low
     assert "materialize-target" in low
-    assert "gh pr diff" not in low            # the patch is derived from base/head snapshots, not gh pr diff
-    assert "--base-archive" in low and "--head-archive" in low  # GitHub derives from OID snapshots
+    assert "gh pr diff" not in low            # the patch is derived from merge-base/head snapshots, not gh pr diff
+    assert "--compare-metadata" in low  # GitHub pins the fork point via the exact-OID compare endpoint
+    assert "--merge-base-archive" in low and "--head-archive" in low  # GitHub derives from merge-base/head OID snapshots
+    assert "--base-archive" not in low  # the stale base-tip snapshot flag is gone
     for field in ("baserefoid", "headrefoid", "headrepository",
                   "headrepositoryowner", "iscrossrepository"):
         assert field in low, f"platform-notes must request the {field} field"
@@ -613,24 +632,36 @@ def _codeload_targz(path, wrapper, files):
 
 def test_platform_notes_github_acquisition_never_normalizes_after_failed_step(tmp_path):
     # Behavioral proof (F1): run the DOCUMENTED loop with a fake `gh` (real `python3`/`crucible`). A
-    # failed base/head archive fetch never reaches `normalize-target`, so no target is written and the
-    # loop halts non-zero — while the identical loop with all fetches succeeding derives the patch from
-    # the two snapshots and writes the target. No `gh pr diff`, no `set -e`.
+    # failed compare or merge-base/head archive fetch never reaches `normalize-target`, so no target is
+    # written and the loop halts non-zero — while the identical loop with every step succeeding derives
+    # the PR-style patch from the MERGE-BASE and head snapshots and writes the target. The base branch
+    # has advanced past the fork point (baseRefOid != merge_base), and the base-only file never leaks in.
+    # No `gh pr diff`, no base-tip tarball, no `set -e`.
     section = _section(_read("platform-notes.md"), "Input normalization")
     loop = _github_acquisition_block(section)
 
-    base_oid, head_oid = "1" * 40, "2" * 40
-    base_tar = tmp_path / "base-fixture.tar.gz"
+    base_tip_oid, merge_base_oid, head_oid = "a" * 40, "b" * 40, "2" * 40
+    mb_tar = tmp_path / "merge-base-fixture.tar.gz"
     head_tar = tmp_path / "head-fixture.tar.gz"
-    _codeload_targz(base_tar, "base-repo-111", {"src/a.py": b"print('base')\n"})
-    _codeload_targz(head_tar, "fork-repo-222", {"src/a.py": b"print('head')\n"})
+    # The fork-point (merge-base) and head snapshots differ only in feature.py; shared.py is unchanged.
+    _codeload_targz(mb_tar, "base-repo-bbb", {"feature.py": b"v1\n", "shared.py": b"shared\n"})
+    _codeload_targz(head_tar, "fork-repo-222", {"feature.py": b"v2\n", "shared.py": b"shared\n"})
     stable_json = json.dumps({
         "number": 1, "url": "https://github.com/base/repo/pull/1", "title": "t", "body": "b",
-        "files": [{"path": "src/a.py"}], "baseRefName": "main", "baseRefOid": base_oid,
+        "files": [{"path": "feature.py"}], "baseRefName": "main", "baseRefOid": base_tip_oid,
         "headRefName": "feat", "headRefOid": head_oid,
         "headRepository": {"nameWithOwner": "fork/repo"}, "headRepositoryOwner": {"login": "fork"},
         "isCrossRepository": True,
     })
+    # The base repo's exact-OID compare reports the fork point as merge_base (the base advanced past it).
+    compare_json = json.dumps({
+        "base_commit": {"sha": base_tip_oid},
+        "merge_base_commit": {"sha": merge_base_oid},
+        "status": "diverged",
+        "files": [{"filename": "feature.py", "status": "modified"}],
+    })
+    compare_fixture = tmp_path / "compare-fixture.json"
+    compare_fixture.write_text(compare_json)
 
     bindir = tmp_path / "bin"
     bindir.mkdir()
@@ -643,7 +674,8 @@ def test_platform_notes_github_acquisition_never_normalizes_after_failed_step(tm
         "fi\n"
         'if [ "$1" = "api" ]; then\n'
         "  case \"$2\" in\n"
-        f'    *"tarball/{base_oid}") cat "$BASE_TAR"; exit "${{GH_BASE_EXIT:-0}}" ;;\n'
+        f'    *"compare/{base_tip_oid}...{head_oid}") cat "$COMPARE_JSON"; exit "${{GH_COMPARE_EXIT:-0}}" ;;\n'
+        f'    *"tarball/{merge_base_oid}") cat "$MERGE_BASE_TAR"; exit "${{GH_MERGE_BASE_EXIT:-0}}" ;;\n'
         f'    *"tarball/{head_oid}") cat "$HEAD_TAR"; exit "${{GH_HEAD_EXIT:-0}}" ;;\n'
         "  esac\n"
         "  exit 1\n"
@@ -653,22 +685,24 @@ def test_platform_notes_github_acquisition_never_normalizes_after_failed_step(tm
     gh.chmod(0o755)
 
     def _run(**overrides) -> subprocess.CompletedProcess:
-        for stale in ("target.json", "target.diff", "base.tar.gz", "head.tar.gz",
-                      "pr-before.json", "pr-after.json"):
+        for stale in ("target.json", "target.diff", "compare.json", "merge-base.tar.gz",
+                      "head.tar.gz", "pr-before.json", "pr-after.json"):
             (tmp_path / stale).unlink(missing_ok=True)
         env = dict(os.environ, PATH=f"{bindir}:{os.environ['PATH']}",
-                   PR="1", RUN=str(tmp_path), BASE_TAR=str(base_tar), HEAD_TAR=str(head_tar))
+                   PR="1", RUN=str(tmp_path), COMPARE_JSON=str(compare_fixture),
+                   MERGE_BASE_TAR=str(mb_tar), HEAD_TAR=str(head_tar))
         env.update({k: str(v) for k, v in overrides.items()})
         # Deliberately NO `set -e`: the loop must fail closed on its own explicit checks.
         return subprocess.run(["bash", "-c", "set -u\n" + loop], cwd=ROOT, env=env,
                               capture_output=True, text=True)
 
-    fail = _run(GH_HEAD_EXIT="1")
-    assert fail.returncode != 0, f"a failed head archive fetch must halt non-zero:\n{fail.stderr}"
-    assert not (tmp_path / "target.json").exists(), \
-        "no target may be normalized after a failed archive fetch"
-    assert not (tmp_path / "target.diff").exists(), \
-        "no target patch may be written after a failed archive fetch"
+    for knob in ("GH_COMPARE_EXIT", "GH_MERGE_BASE_EXIT", "GH_HEAD_EXIT"):
+        fail = _run(**{knob: "1"})
+        assert fail.returncode != 0, f"a failed {knob} step must halt non-zero:\n{fail.stderr}"
+        assert not (tmp_path / "target.json").exists(), \
+            f"no target may be normalized after a failed {knob} step"
+        assert not (tmp_path / "target.diff").exists(), \
+            f"no target patch may be written after a failed {knob} step"
 
     ok = _run()
     assert ok.returncode == 0, f"the happy path must succeed:\n{ok.stderr}"
@@ -676,9 +710,15 @@ def test_platform_notes_github_acquisition_never_normalizes_after_failed_step(tm
     assert (tmp_path / "target.diff").exists(), "the happy path must write the derived patch"
     # The head archive is preserved for reuse by materialize-target (never re-fetched).
     assert (tmp_path / "head.tar.gz").exists(), "the head archive must remain for materialize reuse"
+    manifest = json.loads((tmp_path / "target.json").read_text())
+    assert manifest["kind"] == "github-pr"
+    assert manifest["changed_files"] == ["feature.py"]  # only the feature change, never a base-only file
+    assert manifest["merge_base_sha"] == merge_base_oid  # the recorded fork point, not the advanced tip
+    assert manifest["base"]["sha"] == base_tip_oid and manifest["base"]["sha"] != merge_base_oid
     derived = (tmp_path / "target.diff").read_bytes().decode()
-    assert "-print('base')" in derived and "+print('head')" in derived, \
-        "the derived patch must be the base->head snapshot diff"
+    assert "-v1" in derived and "+v2" in derived, \
+        "the derived patch must be the merge-base->head snapshot diff"
+    assert "shared.py" not in derived, "an unchanged file must not appear in the derived merge-base patch"
 
 
 def test_platform_notes_materializes_pinned_source_per_kind():

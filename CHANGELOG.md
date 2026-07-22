@@ -64,10 +64,14 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
   `docs/superpowers/specs/2026-07-17-pr-review-skill-design.md`.
 - **Immutable `pr-review` target binding (audit finding #4).** Every `pr-review` input is now pinned to
   an immutable review target before PLAN. New `normalize-target github|local|diff` commands emit a
-  canonical manifest + exact patch — GitHub base/head **OIDs** + fork identity read stably **before and
-  after** fetching the base/head snapshots (the immutable patch is **derived** from those two codeload
-  snapshots, not a server-recomputed PR diff), a local single `--range` recorded with `merge_base..head`
-  **merge-base** semantics (no raw two-dot tip diff), or a diff file as patch identity only
+  canonical manifest + exact patch — a GitHub PR pinned to base/head **OIDs** + fork identity read
+  stably **before and after** fetching the compare metadata and the merge-base/head snapshots, with the
+  immutable patch **derived** PR-style from the base repo's exact-OID
+  `compare/<baseRefOid>...<headRefOid>` endpoint (its `merge_base_commit.sha` fork-point snapshot →
+  the head `repository@headRefOid` snapshot, recorded as `merge_base_sha`) — never a server-recomputed
+  PR diff or a base-tip two-dot diff, so a base-only commit made on the base branch after the fork never
+  appears as a reverse change; a local single `--range` recorded with `merge_base..head`
+  **merge-base** semantics (no raw two-dot tip diff); or a diff file as patch identity only
   (`revision_bound: false`).
   `load-target` records the one `target_loaded` event and `target_sha256`; `show-target` prints the
   authoritative target; `repository-identity` fingerprints a local checkout credential-free; and

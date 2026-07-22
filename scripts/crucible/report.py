@@ -588,6 +588,7 @@ def _review_target_lines(events: list[dict[str, Any]], workflow: str | None) -> 
                      f"`{_san(target.base.sha)}`")
         lines.append(f"**Head:** {_san(target.head.repository)}@{_san(target.head.ref)} "
                      f"`{_san(target.head.sha)}`")
+        lines.append(f"**Merge base:** `{_san(target.merge_base_sha)}`")
         lines.append(
             f"**Scope:** {'cross-repository' if target.is_cross_repository else 'same-repository'}")
         lines.append("**Revision:** bound")

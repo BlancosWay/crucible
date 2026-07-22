@@ -55,6 +55,7 @@ def github_target():
         "url": "https://github.com/base/repo/pull/7",
         "base": {"repository": "base/repo", "ref": "main", "sha": "1" * 40},
         "head": {"repository": "fork/repo", "ref": "feature", "sha": "2" * 40},
+        "merge_base_sha": "3" * 40,
         "is_cross_repository": True,
         "diff_sha256": hashlib.sha256(b"patch").hexdigest(),
         "changed_files": ["src/a.py"],
@@ -125,6 +126,7 @@ def test_github_target_rejects_invalid_shape(mutation):
     lambda d: d.pop("url"),
     lambda d: d.pop("base"),
     lambda d: d.pop("head"),
+    lambda d: d.pop("merge_base_sha"),
     lambda d: d.pop("is_cross_repository"),
     lambda d: d.update(pr_number=0),
     lambda d: d.update(pr_number=-1),
@@ -135,7 +137,7 @@ def test_github_target_rejects_invalid_shape(mutation):
     lambda d: d.update(intent={"title": "only title"}),
     lambda d: d.update(repository=None),
     lambda d: d.update(is_cross_repository="yes"),
-    lambda d: d.update(merge_base_sha="4" * 40),  # not a github field
+    lambda d: d.update(merge_base_sha="not-a-sha"),  # github merge base must be 40 lowercase hex
 ])
 def test_github_target_rejects_more_invalid_shapes(mutation):
     data = github_target()
@@ -819,109 +821,189 @@ def _codeload_archive(path, wrapper, files):
     return _write_tar(path, build)
 
 
+def _compare_metadata(*, base_sha="1" * 40, merge_base_sha="3" * 40, files=None, **overrides):
+    """A GitHub ``repos/.../compare/BASE...HEAD`` payload (the exact-OID compare on the base repo).
+
+    ``base_commit.sha`` is the compared base (== ``baseRefOid``); ``merge_base_commit.sha`` is the PR
+    fork point the immutable patch is derived from; ``files[].filename`` is the three-dot (merge-base)
+    changed-file view the derived patch must agree with. ``files`` defaults to ``["src/a.py"]`` to match
+    ``_gh_metadata``'s default file list."""
+    if files is None:
+        files = ["src/a.py"]
+    md = {
+        "base_commit": {"sha": base_sha},
+        "merge_base_commit": {"sha": merge_base_sha},
+        "status": "ahead",
+        "files": [{"filename": p, "status": "modified"} for p in files],
+    }
+    md.update(overrides)
+    return md
+
+
 def test_github_normalization_preserves_cross_fork_identity(tmp_path):
-    base = _codeload_archive(tmp_path / "base.tar", "base-repo-111",
-                             {"src/a.py": b"print('base')\n"})
+    merge_base = _codeload_archive(tmp_path / "merge-base.tar", "base-repo-333",
+                                   {"src/a.py": b"print('base')\n"})
     head = _codeload_archive(tmp_path / "head.tar", "fork-repo-222",
                              {"src/a.py": b"print('head')\n"})
-    target, diff = normalize_github_target(_gh_metadata(), _gh_metadata(), base, head)
+    target, diff = normalize_github_target(
+        _gh_metadata(), _gh_metadata(), _compare_metadata(), merge_base, head)
     assert target.kind == "github-pr"
     assert target.repository == "base/repo"
     assert target.base.repository == "base/repo" and target.base.sha == "1" * 40
     assert target.head.repository == "fork/repo" and target.head.sha == "2" * 40
     assert target.base.ref == "main" and target.head.ref == "feature"
+    assert target.merge_base_sha == "3" * 40  # recorded from the compare endpoint's merge_base_commit
     assert target.is_cross_repository is True
     assert target.pr_number == 7
     assert target.changed_files == ("src/a.py",)
-    # The patch is DERIVED from the two snapshots (not accepted from a caller), and its hash binds it.
+    # The patch is DERIVED from merge-base -> head (not accepted from a caller), and its hash binds it.
     assert target.diff_sha256 == hashlib.sha256(diff).hexdigest()
     text = diff.decode()
     assert "a/src/a.py b/src/a.py" in text
     assert "-print('base')" in text and "+print('head')" in text
 
 
-def test_github_normalization_derives_patch_from_base_head_snapshots(tmp_path):
-    # F1: the immutable patch is DERIVED from the exact base/head OID snapshots — never accepted from
+def test_github_normalization_derives_patch_from_merge_base_head_snapshots(tmp_path):
+    # F1: the immutable patch is DERIVED from the merge-base and head OID snapshots — never accepted from
     # `gh pr diff` or any caller-supplied patch. An unchanged file must not appear in the derived patch.
-    base = _codeload_archive(tmp_path / "base.tar", "base-repo-aaa",
-                             {"src/app.py": b"print('base')\n", "README.md": b"same\n"})
+    merge_base = _codeload_archive(tmp_path / "merge-base.tar", "base-repo-aaa",
+                                   {"src/app.py": b"print('base')\n", "README.md": b"same\n"})
     head = _codeload_archive(tmp_path / "head.tar", "fork-repo-bbb",
                              {"src/app.py": b"print('head')\n", "README.md": b"same\n"})
     md = _gh_metadata(files=[{"path": "src/app.py"}])
-    target, diff = normalize_github_target(md, md, base, head)
+    cmp = _compare_metadata(files=["src/app.py"])
+    target, diff = normalize_github_target(md, md, cmp, merge_base, head)
     assert target.changed_files == ("src/app.py",)
     text = diff.decode()
     assert "a/src/app.py b/src/app.py" in text
     assert "README.md" not in text  # an unchanged file is never in the derived patch
     # Deterministic: a re-derivation from the same snapshots yields byte-identical patch + hash.
-    target2, diff2 = normalize_github_target(md, md, base, head)
+    target2, diff2 = normalize_github_target(md, md, cmp, merge_base, head)
     assert diff2 == diff and target2.diff_sha256 == target.diff_sha256
 
 
+def test_github_normalization_excludes_base_only_commit_after_fork(tmp_path):
+    # F1 regression: the base branch advanced past the PR fork point with a base-only commit (a normal PR
+    # case). Deriving base-tip -> head would show that base-only file as a REVERSE change; deriving
+    # merge-base -> head shows ONLY the feature change. baseRefOid is the *current* base tip; the compare
+    # endpoint reports the fork point as merge_base, and the merge-base/head archives are the fork/head
+    # snapshots (the base-only file exists in NEITHER, so it can never enter the derived patch).
+    base_tip_oid, fork_oid, head_oid = "a" * 40, "b" * 40, "2" * 40
+    merge_base = _codeload_archive(tmp_path / "merge-base.tar", "base-repo-fork",
+                                   {"feature.py": b"v1\n", "shared.py": b"shared\n"})
+    head = _codeload_archive(tmp_path / "head.tar", "fork-repo-head",
+                             {"feature.py": b"v2\n", "shared.py": b"shared\n"})
+    md = _gh_metadata(baseRefOid=base_tip_oid, headRefOid=head_oid,
+                      files=[{"path": "feature.py"}])
+    cmp = _compare_metadata(base_sha=base_tip_oid, merge_base_sha=fork_oid,
+                            files=["feature.py"])
+    target, diff = normalize_github_target(md, md, cmp, merge_base, head)
+
+    # Only the feature change is derived; the base-only commit never appears as a reverse change.
+    assert target.changed_files == ("feature.py",)
+    text = diff.decode()
+    assert "a/feature.py b/feature.py" in text
+    assert "-v1" in text and "+v2" in text
+    assert "base_only" not in text and "shared.py" not in text
+    # The recorded merge base is the fork point, NOT the advanced base tip.
+    assert target.merge_base_sha == fork_oid
+    assert target.base.sha == base_tip_oid and target.merge_base_sha != target.base.sha
+
+
 def test_github_patch_is_pure_function_of_snapshots_not_caller(tmp_path):
-    # F1 ABA regression: the derived target is a pure function of the two archives. There is NO caller
-    # diff parameter to smuggle an unrelated "B" patch through, so before/after "A" metadata with any
-    # B-flavoured field can never change the patch — only the snapshots decide it.
+    # F1 ABA regression: the derived target is a pure function of the merge-base/head archives. There is
+    # NO caller diff parameter to smuggle an unrelated "B" patch through, so before/after/compare "A"
+    # metadata with any B-flavoured prose can never change the patch — only the snapshots decide it.
     import inspect
-    assert "diff" not in inspect.signature(normalize_github_target).parameters, \
+    params = inspect.signature(normalize_github_target).parameters
+    assert "diff" not in params, \
         "normalize_github_target must not accept a caller-supplied diff (derive from snapshots)"
 
-    base_a = _codeload_archive(tmp_path / "baseA.tar", "base-repo-a1",
-                               {"src/app.py": b"print('A base')\n"})
+    mb_a = _codeload_archive(tmp_path / "mbA.tar", "base-repo-a1",
+                             {"src/app.py": b"print('A base')\n"})
     head_a = _codeload_archive(tmp_path / "headA.tar", "fork-repo-a2",
                                {"src/app.py": b"print('A head')\n"})
     head_b = _codeload_archive(tmp_path / "headB.tar", "fork-repo-b2",
                                {"src/app.py": b"print('B head is unrelated')\n"})
     md = _gh_metadata(files=[{"path": "src/app.py"}])
+    cmp = _compare_metadata(files=["src/app.py"])
 
-    target_a, diff_a = normalize_github_target(md, md, base_a, head_a)
-    # A known-A snapshot pair yields a stable A patch/hash regardless of metadata prose.
+    target_a, diff_a = normalize_github_target(md, md, cmp, mb_a, head_a)
+    # A known-A snapshot pair yields a stable A patch/hash regardless of metadata/compare prose.
     md_prose = _gh_metadata(files=[{"path": "src/app.py"}], title="totally different", body="B story")
-    target_a2, diff_a2 = normalize_github_target(md_prose, md_prose, base_a, head_a)
+    cmp_prose = _compare_metadata(files=["src/app.py"], status="diverged", ahead_by=99)
+    target_a2, diff_a2 = normalize_github_target(md_prose, md_prose, cmp_prose, mb_a, head_a)
     assert diff_a2 == diff_a and target_a2.diff_sha256 == target_a.diff_sha256
 
     # Swapping in an unrelated B head snapshot is the ONLY way the patch changes — it tracks content.
-    target_b, diff_b = normalize_github_target(md, md, base_a, head_b)
+    target_b, diff_b = normalize_github_target(md, md, cmp, mb_a, head_b)
     assert diff_b != diff_a and target_b.diff_sha256 != target_a.diff_sha256
 
 
 def test_github_normalization_derives_changed_files_and_rejects_metadata_disagreement(tmp_path):
     # F1: changed_files is DERIVED from the snapshots; metadata files that disagree are rejected rather
     # than trusted (a tampered/ stale file list can never become the authoritative changed-files set).
-    base = _codeload_archive(tmp_path / "base.tar", "base-repo-x",
-                             {"src/app.py": b"a\n"})
+    merge_base = _codeload_archive(tmp_path / "merge-base.tar", "base-repo-x",
+                                   {"src/app.py": b"a\n"})
     head = _codeload_archive(tmp_path / "head.tar", "fork-repo-y",
                              {"src/app.py": b"b\n"})
     good = _gh_metadata(files=[{"path": "src/app.py"}])
-    target, _diff = normalize_github_target(good, good, base, head)
+    target, _diff = normalize_github_target(
+        good, good, _compare_metadata(files=["src/app.py"]), merge_base, head)
     assert target.changed_files == ("src/app.py",)
 
     lying = _gh_metadata(files=[{"path": "src/other.py"}])
     with pytest.raises(ValueError, match="disagree"):
-        normalize_github_target(lying, lying, base, head)
+        normalize_github_target(
+            lying, lying, _compare_metadata(files=["src/other.py"]), merge_base, head)
+
+
+@pytest.mark.parametrize("mutate,match", [
+    (lambda c: c.__setitem__("base_commit", {"sha": "9" * 40}), "base_commit"),
+    (lambda c: c["base_commit"].__setitem__("sha", "not-a-sha"), "base_commit"),
+    (lambda c: c.pop("base_commit"), "base_commit"),
+    (lambda c: c.pop("merge_base_commit"), "merge_base"),
+    (lambda c: c["merge_base_commit"].__setitem__("sha", ""), "merge_base"),
+    (lambda c: c["merge_base_commit"].__setitem__("sha", "3" * 39), "merge_base"),
+    (lambda c: c["merge_base_commit"].__setitem__("sha", "Z" * 40), "merge_base"),
+    (lambda c: c.__setitem__("files", [{"filename": "src/other.py", "status": "modified"}]),
+     "disagree"),
+    (lambda c: c.pop("files"), "files"),
+])
+def test_github_normalization_rejects_malformed_compare_metadata(tmp_path, mutate, match):
+    # F1: the compare payload is validated fail-closed — base_commit.sha must equal baseRefOid, the
+    # merge_base_commit.sha must be a valid 40 lowercase hex, and the compare file list must agree with
+    # the metadata/derived file set. Any drift rejects the whole target so the orchestrator can retry.
+    merge_base = _codeload_archive(tmp_path / "merge-base.tar", "base-repo-1", {"src/a.py": b"o\n"})
+    head = _codeload_archive(tmp_path / "head.tar", "fork-repo-2", {"src/a.py": b"n\n"})
+    cmp = _compare_metadata()
+    mutate(cmp)
+    with pytest.raises(ValueError, match=match):
+        normalize_github_target(_gh_metadata(), _gh_metadata(), cmp, merge_base, head)
 
 
 def test_github_normalization_captures_new_deleted_binary(tmp_path):
-    base = _codeload_archive(tmp_path / "base.tar", "base-repo-1", {
+    merge_base = _codeload_archive(tmp_path / "merge-base.tar", "base-repo-1", {
         "keep.py": b"v1\n", "gone.py": b"bye\n", "img.bin": b"\x00\x01\x02BIN\xff",
     })
     head = _codeload_archive(tmp_path / "head.tar", "fork-repo-2", {
         "keep.py": b"v2\n", "new.py": b"hi\n", "img.bin": b"\x00\x01\x02CHANGED\xff",
     })
-    md = _gh_metadata(files=[{"path": "gone.py"}, {"path": "img.bin"},
-                             {"path": "keep.py"}, {"path": "new.py"}])
-    target, diff = normalize_github_target(md, md, base, head)
+    files = ["gone.py", "img.bin", "keep.py", "new.py"]
+    md = _gh_metadata(files=[{"path": p} for p in files])
+    cmp = _compare_metadata(files=files)
+    target, diff = normalize_github_target(md, md, cmp, merge_base, head)
     assert target.changed_files == ("gone.py", "img.bin", "keep.py", "new.py")
     text = diff.decode("utf-8", "replace")
     assert "new file mode" in text and "deleted file mode" in text and "GIT binary patch" in text
 
 
 def test_github_normalization_same_repo_pr_is_not_cross(tmp_path):
-    base = _codeload_archive(tmp_path / "base.tar", "base-repo-1", {"src/a.py": b"o\n"})
+    merge_base = _codeload_archive(tmp_path / "merge-base.tar", "base-repo-1", {"src/a.py": b"o\n"})
     head = _codeload_archive(tmp_path / "head.tar", "base-repo-2", {"src/a.py": b"n\n"})
     md = _gh_metadata(headRepository={"nameWithOwner": "base/repo"},
                       headRepositoryOwner={"login": "base"}, isCrossRepository=False)
-    target, _diff = normalize_github_target(md, md, base, head)
+    target, _diff = normalize_github_target(md, md, _compare_metadata(), merge_base, head)
     assert target.is_cross_repository is False
     assert target.head.repository == "base/repo"
 
@@ -941,24 +1023,25 @@ def test_github_normalization_same_repo_pr_is_not_cross(tmp_path):
 ])
 def test_github_normalization_rejects_before_after_mismatch(tmp_path, field, value):
     # Identity drift is detected BEFORE any archive is extracted, so the archives are never even read.
-    base = _codeload_archive(tmp_path / "base.tar", "base-repo-1", {"src/a.py": b"o\n"})
+    merge_base = _codeload_archive(tmp_path / "merge-base.tar", "base-repo-1", {"src/a.py": b"o\n"})
     head = _codeload_archive(tmp_path / "head.tar", "fork-repo-2", {"src/a.py": b"n\n"})
     before = _gh_metadata()
     after = _gh_metadata(**{field: value})
     with pytest.raises(ValueError):
-        normalize_github_target(before, after, base, head)
+        normalize_github_target(before, after, _compare_metadata(), merge_base, head)
 
 
 def test_github_normalization_accepts_stable_identity_reordered_files(tmp_path):
     # Same file set in a different list order is still stable identity (files are order-normalized), and
     # the derived changed-files set (from the snapshots) must match that normalized metadata set.
-    base = _codeload_archive(tmp_path / "base.tar", "base-repo-1",
-                             {"src/a.py": b"a1\n", "src/b.py": b"b1\n"})
+    merge_base = _codeload_archive(tmp_path / "merge-base.tar", "base-repo-1",
+                                   {"src/a.py": b"a1\n", "src/b.py": b"b1\n"})
     head = _codeload_archive(tmp_path / "head.tar", "fork-repo-2",
                              {"src/a.py": b"a2\n", "src/b.py": b"b2\n"})
     before = _gh_metadata(files=[{"path": "src/a.py"}, {"path": "src/b.py"}])
     after = _gh_metadata(files=[{"path": "src/b.py"}, {"path": "src/a.py"}])
-    target, _diff = normalize_github_target(before, after, base, head)
+    cmp = _compare_metadata(files=["src/b.py", "src/a.py"])
+    target, _diff = normalize_github_target(before, after, cmp, merge_base, head)
     assert target.changed_files == ("src/a.py", "src/b.py")
 
 
