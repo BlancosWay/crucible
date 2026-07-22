@@ -108,6 +108,216 @@ def _flat(s: str) -> str:
     return " ".join(s.lower().replace("*", "").replace("`", "").replace("#", " ").split())
 
 
+def _bash_blocks(text: str) -> list[str]:
+    return re.findall(r"```bash\n(.*?)```", text, re.DOTALL)
+
+
+def _github_acquisition_block(text: str) -> str:
+    """The single executable GitHub before/compare/merge-base/head/after acquisition loop in `text`."""
+    blocks = [b for b in _bash_blocks(text) if "normalize-target github" in b]
+    assert len(blocks) == 1, \
+        "exactly one executable GitHub before/compare/merge-base/head/after acquisition block is required"
+    return blocks[0]
+
+
+def _assert_github_acquisition_fails_closed(block: str) -> None:
+    """The GitHub before/compare/merge-base/head/after acquisition must fail CLOSED without a global
+    `set -e`, and DERIVE the patch PR-style from the merge-base and head snapshots — never `gh pr diff`
+    and never a base-tip two-dot diff (F1): bounded 3-attempt retry, the two `gh pr view` reads
+    (before/after), the exact-OID `gh api .../compare/...` fetch, and the two `gh api .../tarball/...`
+    archive fetches (merge-base + head) each explicitly error-checked, `normalize-target` (with
+    `--compare-metadata`/`--merge-base-archive`/`--head-archive`) only after every step succeeds, EVERY
+    partial before/after/compare/merge-base/head/target artifact discarded on any failure, a clear
+    non-zero halt on exhaustion, and the metadata-drift retry preserved."""
+    joined = re.sub(r"\\\n\s*", "", block)
+    flat = " ".join(joined.split())
+
+    assert "for ATTEMPT in 1 2 3" in flat, "acquisition must retry within a bounded 3-attempt loop"
+    assert "ok=1" in flat, "each attempt must reset the success flag before the gh reads"
+    assert "gh pr diff" not in flat, "the live protocol must not use gh pr diff (derive from snapshots)"
+
+    view_lines = [ln.strip() for ln in joined.splitlines() if "gh pr view" in ln]
+    assert len(view_lines) == 2, f"expected exactly 2 gh pr view reads, found {len(view_lines)}"
+    for ln in view_lines:
+        assert "|| ok=0" in ln, \
+            f"each gh pr view read must record failure explicitly (|| ok=0): {ln!r}"
+
+    compare_lines = [ln.strip() for ln in joined.splitlines() if "gh api" in ln and "compare/" in ln]
+    assert len(compare_lines) == 1, \
+        f"expected exactly 1 gh api compare fetch, found {len(compare_lines)}"
+    assert "compare/$BASE_OID...$HEAD_OID" in flat, \
+        "the compare must use the exact base/head OIDs (never branch names)"
+    assert "|| ok=0" in compare_lines[0], \
+        f"the compare fetch must record failure explicitly (|| ok=0): {compare_lines[0]!r}"
+    assert "merge_base_commit" in flat, "acquisition must parse merge_base_commit.sha from compare.json"
+
+    api_lines = [ln.strip() for ln in joined.splitlines() if "gh api" in ln and "tarball" in ln]
+    assert len(api_lines) == 2, f"expected exactly 2 gh api tarball fetches, found {len(api_lines)}"
+    for ln in api_lines:
+        assert "|| ok=0" in ln, \
+            f"each archive fetch must record failure explicitly (|| ok=0): {ln!r}"
+    assert "merge-base.tar.gz" in flat and "head.tar.gz" in flat, \
+        "acquisition must fetch merge-base.tar.gz and head.tar.gz (merge-base/head OID snapshots)"
+    assert "tarball/$MERGE_BASE_OID" in flat and "tarball/$HEAD_OID" in flat, \
+        "the two tarball fetches must pin the merge-base and head OIDs"
+    assert "tarball/$BASE_OID" not in flat, \
+        "acquisition must not fetch a base-tip tarball (the patch is derived from the merge base)"
+
+    assert re.search(
+        r'\[\s*"\$ok"\s*=\s*1\s*\]\s*&&\s*PYTHONPATH=\S+ python3 -m crucible normalize-target github',
+        flat), \
+        "normalize-target github must be guarded by the success flag — run only after every step"
+    assert "--compare-metadata" in flat and "--merge-base-archive" in flat and "--head-archive" in flat, \
+        "normalize-target github must consume the compare metadata + merge-base/head snapshots"
+    assert "--base-archive" not in flat, "the removed base-tip --base-archive flag must not appear"
+    assert re.search(r"normalize-target github.*?then\s+break", flat), \
+        "normalize-target must gate the loop break so metadata drift (non-zero exit) retries"
+
+    rm = re.search(r"rm -f [^\n]*", joined)
+    assert rm, "acquisition must clean up partial artifacts on failure"
+    for name in ("pr-before.json", "pr-after.json", "compare.json", "merge-base.tar.gz",
+                 "head.tar.gz", "target.json", "target.diff"):
+        assert name in rm.group(0), f"cleanup must remove the partial {name} on any failure"
+
+    assert re.search(r'\[\s*"\$ATTEMPT"\s*-lt\s*3\s*\][^\n]*exit 1', joined), \
+        "after the 3rd attempt the acquisition must halt clearly (exit non-zero)"
+    assert re.search(r"echo[^\n]*(fail|abort|halt)", joined, re.I), \
+        "the halt must announce the acquisition failure"
+
+
+def _assert_block_fails_closed(block: str, fetch: str, archive: str) -> None:
+    """One source-materialization block (GitHub or local) must fail CLOSED and NON-FATAL (Task 3,
+    round 3): the live `gh api ... > source.tar.gz` fetch / local `git -C ... archive` were UNCHECKED, so
+    a failed/truncated/stale archive relied on later or global shell behaviour instead of explicitly
+    switching to source-unavailable. The block must remove any stale archive BEFORE the fetch/archive,
+    default `SOURCE_AVAILABLE=no`, `if`-check the fetch/archive (never a bare command), `if`-check
+    materialize-target so it is unreachable on a failed fetch/archive, set `SOURCE_AVAILABLE=yes` only
+    after materialize succeeds, and `rm -f` the partial archive on every failure branch."""
+    folded = re.sub(r"\\\n\s*", "", block)
+    esc = re.escape(archive)
+    rm = rf"rm -f [^\n]*{esc}(?![\w.])"
+    materialize = r"PYTHONPATH=\S+ python3 -m crucible materialize-target"
+
+    assert "SOURCE_AVAILABLE=no" in folded, "must default SOURCE_AVAILABLE=no (fail closed)"
+    assert "SOURCE_AVAILABLE=yes" in folded, "must set SOURCE_AVAILABLE=yes only on success"
+
+    first_rm = re.search(rm, folded)
+    first_fetch = re.search(fetch, folded)
+    assert first_rm and first_fetch, "a stale archive must be removed and the fetch/archive attempted"
+    assert first_rm.start() < first_fetch.start(), \
+        "any stale archive must be removed BEFORE the fetch/archive"
+
+    assert re.search(rf"(?:if|&&)\s+{fetch}", folded), \
+        "the fetch/archive must be checked (`if ...` or the final `&&` conjunct of a compound if), " \
+        "never an unchecked bare command"
+    assert not re.search(rf"(?m)^\s*{fetch}", folded), \
+        "the fetch/archive must not be a bare unchecked command"
+
+    assert re.search(rf"if\s+{materialize}", folded), \
+        "materialize-target must be explicitly checked (`if ...`)"
+    assert not re.search(rf"(?m)^\s*{materialize}", folded), \
+        "materialize-target must not be a bare unchecked command (would run on a failed fetch)"
+
+    assert folded.index("materialize-target") < folded.index("SOURCE_AVAILABLE=yes"), \
+        "SOURCE_AVAILABLE=yes must be set only AFTER materialize succeeds"
+    assert len(re.findall(rm, folded)) >= 2, \
+        "the partial archive must be discarded (rm -f) on failure, not left behind"
+
+
+def _assert_github_reuse_fails_closed(block: str) -> None:
+    """The GitHub materialization REUSES the acquisition ``head.tar.gz`` and fails closed + non-fatal
+    (F1): it never re-fetches (`gh api`) or archives (`git archive`), defaults `SOURCE_AVAILABLE=no`,
+    requires the reused archive present/non-empty (`test -s`) AND checks `materialize-target` in the
+    same guard, sets `SOURCE_AVAILABLE=yes` only after materialize succeeds, and NEVER deletes the
+    reused acquisition archive."""
+    folded = re.sub(r"\\\n\s*", "", block)
+    assert "SOURCE_AVAILABLE=no" in folded, "must default SOURCE_AVAILABLE=no (fail closed)"
+    assert "SOURCE_AVAILABLE=yes" in folded, "must set SOURCE_AVAILABLE=yes only on success"
+    assert "gh api" not in folded, "GitHub materialization must reuse head.tar.gz, never re-fetch"
+    assert not re.search(r"git\s+archive", folded), "GitHub materialization must not archive with git"
+    assert re.search(r'if\s+test -s "\$RUN/head\.tar\.gz"', folded), \
+        "must require the reused head.tar.gz is present/non-empty before materialize"
+    assert re.search(
+        r'test -s "\$RUN/head\.tar\.gz"\s*&&\s*PYTHONPATH=\S+ python3 -m crucible materialize-target',
+        folded), \
+        "materialize-target must be &&-guarded by the reused-archive check (never a bare command)"
+    assert folded.index("materialize-target") < folded.index("SOURCE_AVAILABLE=yes"), \
+        "SOURCE_AVAILABLE=yes must be set only AFTER materialize succeeds"
+    assert not re.search(r"rm -f[^\n]*head\.tar\.gz", folded), \
+        "the reused acquisition archive is authoritative and must never be deleted here"
+
+
+def _assert_source_materialization_fails_closed(text: str, section_heading: str | None) -> None:
+    """Both source-materialization kinds in `text` (optionally scoped to `section_heading`) fail
+    closed (Task 3, round 3; F1 for the GitHub reuse path)."""
+    scope = _section(text, section_heading) if section_heading else text
+    blocks = _bash_blocks(scope)
+    gh = [b for b in blocks
+          if "materialize-target" in b and "head.tar.gz" in b and "git -C" not in b]
+    local = [b for b in blocks if "materialize-target" in b and "git -C" in b]
+    assert len(gh) == 1 and len(local) == 1, \
+        "exactly one GitHub and one local source-materialization block are required"
+    _assert_github_reuse_fails_closed(gh[0])
+    _assert_block_fails_closed(local[0], fetch=r'git -C "\$LOCAL_REPO" archive', archive="source.tar")
+
+
+def _assert_local_source_identity_gates_archive(text: str, section_heading: str | None) -> None:
+    """Task 3, round 4: the local source block ran its `test -n`, repository-identity equality, and
+    recorded-HEAD checks as BARE commands. The snippets deliberately do NOT rely on a global `set -e`,
+    so a mismatch was ignored and `git archive` + `materialize-target` still succeeded. The archive
+    must instead be gated by ONE explicit compound `if`: parse `RECORDED_REPOSITORY_IDENTITY` +
+    `HEAD_SHA`, compute `OBSERVED_REPOSITORY` only when those parses (and a valid `$LOCAL_REPO`) hold,
+    then require — all `&&`-joined so any mismatch short-circuits past the archive — non-empty parses,
+    `OBSERVED_REPOSITORY == RECORDED_REPOSITORY_IDENTITY`, `git rev-parse HEAD == HEAD_SHA`, and finally
+    `git -C "$LOCAL_REPO" archive`."""
+    scope = _section(text, section_heading) if section_heading else text
+    blocks = _bash_blocks(scope)
+    local = [b for b in blocks
+             if "materialize-target" in b and 'git -C "$LOCAL_REPO" archive' in b]
+    assert len(local) == 1, "exactly one executable local source-materialization block is required"
+    folded = re.sub(r"\\\n\s*", "", local[0])
+
+    assert "RECORDED_REPOSITORY_IDENTITY=" in folded, \
+        "the local path must parse RECORDED_REPOSITORY_IDENTITY from the loaded manifest"
+    assert not re.search(r"RECORDED_REPOSITORY(?!_IDENTITY)", folded), \
+        "the old bare RECORDED_REPOSITORY name must be gone (use RECORDED_REPOSITORY_IDENTITY)"
+
+    assert re.search(r"(?m)^\s*OBSERVED_REPOSITORY=\s*$", folded), \
+        "OBSERVED_REPOSITORY must be initialized empty before the guarded computation (set -u safe)"
+    assert re.search(
+        r'(?m)^\s+OBSERVED_REPOSITORY=\$\(PYTHONPATH=\S+ python3 -m crucible '
+        r'repository-identity --repo "\$LOCAL_REPO"\)', folded), \
+        "OBSERVED_REPOSITORY must be computed via repository-identity inside a guard, not unconditionally"
+
+    assert re.search(
+        r'if\b[^\n]*?test -n "\$RECORDED_REPOSITORY_IDENTITY"[^\n]*?'
+        r'&&[^\n]*?test -n "\$HEAD_SHA"[^\n]*?'
+        r'&&[^\n]*?test "\$OBSERVED_REPOSITORY" = "\$RECORDED_REPOSITORY_IDENTITY"[^\n]*?'
+        r'&&[^\n]*?test "\$\(git -C "\$LOCAL_REPO" rev-parse HEAD\)" = "\$HEAD_SHA"[^\n]*?'
+        r'&&[^\n]*?git -C "\$LOCAL_REPO" archive', folded), \
+        "the archive must be gated by ONE compound `if` with the identity + recorded-HEAD checks " \
+        "&&-joined ahead of it (a mismatch must skip the archive/materialize)"
+
+    # $LOCAL_REPO directory validity is a conjunct of the gate, checked BEFORE any git runs against it,
+    # so a missing/empty $LOCAL_REPO never runs `git rev-parse`/archive in an unrelated/ambient repo.
+    assert 'test -d "$LOCAL_REPO"' in folded, \
+        "the gate must validate $LOCAL_REPO is a directory before running git against it"
+    gate = next((ln for ln in folded.splitlines()
+                 if 'git -C "$LOCAL_REPO" rev-parse HEAD' in ln), "")
+    assert 'test -d "$LOCAL_REPO"' in gate and \
+        gate.index('test -d "$LOCAL_REPO"') < gate.index('git -C "$LOCAL_REPO" rev-parse'), \
+        "the $LOCAL_REPO directory check must precede `git rev-parse HEAD` in the compound gate"
+
+    assert not re.search(r'(?m)^\s*test -n "\$RECORDED_REPOSITORY_IDENTITY"', folded), \
+        "the non-empty identity parse must gate the archive inside `if`, not run as a bare command"
+    assert not re.search(r'(?m)^\s*test "\$OBSERVED_REPOSITORY" = "\$RECORDED_REPOSITORY_IDENTITY"', folded), \
+        "the identity-equality check must gate the archive inside `if`, not run as a bare command"
+    assert not re.search(r'(?m)^\s*test "\$\([^\n]*repository-identity', folded), \
+        'the identity check must not be a bare inline `test "$(... repository-identity ...)"` command'
+    assert not re.search(r'(?m)^\s*test "\$\(git -C "\$LOCAL_REPO" rev-parse HEAD\)"', folded), \
+        "the recorded-HEAD check must gate the archive inside `if`, not run as a bare command"
+
+
 def test_no_hardcoded_round_cap_override_in_workflow_examples():
     # The cap must come from run config; workflow command examples must not pass the
     # override. (The argv test form '"--max-rounds", "5"' is intentionally different and ok.)
@@ -337,6 +547,247 @@ def test_symmetric_design_marked_implemented_and_links_plan():
     assert re.search(r"\*\*Status:\*\*\s*implemented", design, re.IGNORECASE), \
         "the 2026-07-20 symmetric-consensus design must be marked implemented"
     assert "2026-07-20-symmetric-consensus.md" in design, "design must link its implementation plan"
+
+
+# --- pr-review target-binding documentation guards ------------------------------------------------
+# Finding #4: every pr-review input is pinned to an immutable review target (base/head OIDs, local
+# merge-base, or patch-only), bound into every gate, materialized into a pinned static source
+# snapshot, and executed only at the recorded head. The public docs must document the target commands,
+# manifest variants, provenance, and safe-source/exact-head execution — with command/schema shape.
+
+def test_cli_docs_document_target_commands_and_manifest_variants():
+    text = (ROOT / "docs" / "cli.md").read_text()
+    sec = _flat(_section(text, "Target binding"))
+    for cmd in ("normalize-target", "load-target", "show-target",
+                "materialize-target", "repository-identity"):
+        assert cmd in sec, f"docs/cli.md Target-binding section omits {cmd}"
+    # the three manifest kinds
+    assert "github-pr" in sec and "local-range" in sec and "diff-file" in sec
+    # immutable identity bound into every gate + merge-base local semantics + patch-only diff-file
+    assert "target_sha256" in sec
+    assert "merge-base" in sec or "merge_base" in sec
+    assert "revision_bound" in sec or "revision-unbound" in sec or "patch identity" in sec
+    # safe, one-shot source materialization into a pinned snapshot
+    assert "run/source" in sec or "source snapshot" in sec
+
+
+def test_readme_documents_immutable_target_provenance():
+    sec = _flat(_section((ROOT / "README.md").read_text(), "Companion skill: `pr-review`"))
+    assert "target" in sec
+    assert "immutable" in sec or "pinned" in sec
+    # base/head commit identity (not branch names) + local merge-base + patch-only diff-file
+    assert "baserefoid" in sec or "head sha" in sec or "base/head" in sec or "commit" in sec
+    assert "merge-base" in sec or "merge base" in sec
+    assert "diff-file" in sec or "diff file" in sec
+
+
+def test_security_documents_pinned_source_and_exact_head_execution():
+    bullet = _flat(_bullet((ROOT / "SECURITY.md").read_text(), "Pinned review target"))
+    # a static, read-only source snapshot that is never executed, extracted via a confined archive path
+    assert "snapshot" in bullet
+    assert "archive" in bullet
+    assert "traversal" in bullet or "symlink" in bullet
+    assert "never execute" in bullet or "not executed" in bullet or "never executed" in bullet
+    # trusted-local execution runs only at the recorded head commit
+    assert "recorded head" in bullet or "head commit" in bullet or "exact head" in bullet
+
+
+def test_changelog_records_target_binding_finding4():
+    unreleased = _flat(_section((ROOT / "CHANGELOG.md").read_text(), "[Unreleased]"))
+    assert "normalize-target" in unreleased
+    assert "load-target" in unreleased
+    assert "materialize-target" in unreleased
+    assert "target_sha256" in unreleased
+    assert "merge-base" in unreleased or "merge base" in unreleased
+
+
+def test_target_binding_design_marked_implemented_and_links_plan():
+    design = (ROOT / "docs" / "superpowers" / "specs"
+              / "2026-07-21-pr-review-target-binding-design.md").read_text()
+    assert re.search(r"\*\*Status:\*\*\s*implemented", design, re.IGNORECASE), \
+        "the 2026-07-21 pr-review-target-binding design must be marked implemented"
+    assert "2026-07-21-pr-review-target-binding.md" in design, "design must link its implementation plan"
+
+
+def test_target_binding_design_source_snapshots_are_executable_per_kind():
+    # F1: the design's source-snapshot commands must be executable and separate — GitHub REUSES the
+    # acquired head.tar.gz codeload archive (never a re-fetch) and materializes it; local verifies the
+    # recorded identity, archives the exact head via an explicit `git -C "$LOCAL_REPO"` (never ambient),
+    # and materializes source.tar. No shared command with unset head variables or a mismatched archive.
+    design = (ROOT / "docs" / "superpowers" / "specs"
+              / "2026-07-21-pr-review-target-binding-design.md").read_text()
+    snapshots = _section(design, "Source snapshots")
+    gh_sec = _section(snapshots, "GitHub PR")
+    local_sec = _section(snapshots, "Local range")
+    gh_blocks, local_blocks = _bash_blocks(gh_sec), _bash_blocks(local_sec)
+    assert len(gh_blocks) == 1 and len(local_blocks) == 1, \
+        "each source-snapshot kind documents exactly one executable command block"
+    gh, local = gh_blocks[0], local_blocks[0]
+
+    # GitHub: reuse the acquired head.tar.gz (no re-fetch), require it present, materialize head.tar.gz.
+    assert "gh api" not in gh, "GitHub design block must reuse head.tar.gz, never re-fetch via gh api"
+    assert 'test -s "$RUN/head.tar.gz"' in gh, \
+        "GitHub design block must require the reused head.tar.gz present/non-empty"
+    assert '--archive "$RUN/head.tar.gz"' in gh, "GitHub design block must materialize the reused head.tar.gz"
+    assert not re.search(r"git\s+archive", gh_sec), "GitHub design section must not archive with git"
+
+    # Local: recorded-identity check BEFORE the archive -> explicit `git -C` -> materialize source.tar.
+    assert "loaded-target.json" in local, "local design block must read the authoritative loaded manifest"
+    assert '["repository"]' in local and '["head"]["sha"]' in local
+    assert 'test -n "$HEAD_SHA"' in local
+    assert 'repository-identity --repo "$LOCAL_REPO"' in local
+    assert local.index("repository-identity") < local.index("git -C"), \
+        "the recorded-identity check must precede the archive"
+    assert re.search(
+        r'git -C "\$LOCAL_REPO" archive --format=tar --output "\$RUN/source.tar" "\$HEAD_SHA"', local), \
+        'local design block must archive via `git -C "$LOCAL_REPO" archive` (never ambient)'
+    assert '--archive "$RUN/source.tar"' in local
+    assert "head.tar.gz" not in local, "local path must not feed the GitHub head.tar.gz to materialize"
+
+
+TARGET_BINDING_PLAN = (ROOT / "docs" / "superpowers" / "plans"
+                       / "2026-07-21-pr-review-target-binding.md")
+TARGET_BINDING_DESIGN = (ROOT / "docs" / "superpowers" / "specs"
+                         / "2026-07-21-pr-review-target-binding-design.md")
+
+
+def test_target_binding_plan_github_acquisition_fails_closed():
+    # Finding (Task 3, round 2): the plan's Step-3 `gh pr view`/`gh pr diff` reads were unchecked, so a
+    # failed command left an empty/truncated artifact that stable before/after metadata still let
+    # `normalize-target` hash into a target. The plan's executable loop must fail closed.
+    _assert_github_acquisition_fails_closed(
+        _github_acquisition_block(TARGET_BINDING_PLAN.read_text()))
+
+
+def test_target_binding_design_github_acquisition_is_fail_closed():
+    # F1: the design must state the fail-closed acquisition contract — the two `gh pr view` reads and the
+    # two `gh api` base/head archive fetches are checked (not only metadata drift), any failure discards
+    # the partial artifacts, retries are bounded, exhaustion halts, and normalize runs only after all
+    # succeed — and there is no `gh pr diff` (the patch is derived from the two snapshots).
+    design = TARGET_BINDING_DESIGN.read_text()
+    errors = _flat(_section(design, "Error handling"))
+    assert "gh pr view" in errors and "gh api" in errors, \
+        "error handling must scope the fail-closed rule to the gh acquisition commands (view + api)"
+    assert "gh pr diff" not in errors, "the acquisition must not use gh pr diff (derive from snapshots)"
+    assert "empty" in errors or "truncat" in errors, \
+        "error handling must name the empty/truncated-artifact hazard"
+    assert "all" in errors or "each" in errors, \
+        "error handling must require every gh read/fetch to succeed, not only stable metadata"
+    assert "discard" in errors or "clean" in errors or "remove" in errors, \
+        "error handling must discard partial artifacts on failure"
+    assert "set -e" in errors, "error handling must warn against relying on a global set -e"
+    assert re.search(r"3 attempt|three attempt|bounded", errors), \
+        "error handling must bound the retries"
+    assert "halt" in errors, "error handling must halt clearly once attempts are exhausted"
+
+    variant = _flat(_section(design, "GitHub PR variant"))
+    assert "fail" in variant and "closed" in variant, \
+        "the GitHub PR variant prose must state the acquisition fails closed"
+    assert "derived" in variant, \
+        "the GitHub PR variant prose must state the patch is derived from the base/head snapshots"
+
+
+def test_target_binding_design_source_materialization_fails_closed():
+    # Finding (Task 3, round 3): the design's source-snapshot blocks ran `gh api ... > source.tar.gz` and
+    # `git -C ... archive` UNCHECKED, so a failed/truncated/stale archive relied on later/global shell
+    # behaviour. Each kind must fail closed and non-fatal.
+    _assert_source_materialization_fails_closed(TARGET_BINDING_DESIGN.read_text(), "Source snapshots")
+
+
+def test_target_binding_design_source_snapshot_errors_fail_closed():
+    # The Error-handling contract must state the source-snapshot fail-closed rule (F1): GitHub reuses
+    # the acquired head.tar.gz (never re-fetch/delete it), local removes any stale archive before
+    # `git -C ... archive`, both explicitly check materialize, leave SOURCE_AVAILABLE=no on failure,
+    # don't rely on a global `set -e`, and continue patch-only (non-fatal) with runtime claims
+    # unverified so both peers get the same status.
+    errors = _flat(_section(TARGET_BINDING_DESIGN.read_text(), "Error handling"))
+    assert "source_available=no" in errors, \
+        "error handling must mark the source unavailable (SOURCE_AVAILABLE=no) on any snapshot failure"
+    assert "reuse" in errors and "head.tar.gz" in errors, \
+        "error handling must state GitHub reuses the acquired head.tar.gz (never re-fetch)"
+    assert "archive" in errors, \
+        "error handling must scope the fail-closed rule to the local archive command"
+    assert "materialize" in errors, "error handling must require materialize-target to be checked too"
+    assert "set -e" in errors, "error handling must warn against relying on a global set -e"
+    assert "patch-only" in errors or "patch only" in errors, \
+        "on a source failure the review must continue patch-only (non-fatal)"
+    assert "unverified" in errors, \
+        "when source is unavailable, runtime-verified claims must be marked unverified"
+
+
+def test_target_binding_plan_source_materialization_fails_closed():
+    # Finding (Task 3, round 3): the plan's Step-3 materialization ran the fetch/archive + materialize
+    # unchecked. The plan's executable blocks must mirror the fail-closed, non-fatal flow.
+    _assert_source_materialization_fails_closed(TARGET_BINDING_PLAN.read_text(), None)
+
+
+def test_target_binding_design_local_source_identity_gates_archive():
+    # Finding (Task 3, round 4): the design's local source block ran `test -n`, the repository-identity
+    # equality, and the recorded-HEAD check as BARE commands; without a global `set -e` a mismatch was
+    # ignored and the archive/materialize still ran. The design's local block must gate the archive on
+    # ONE compound `if` (identity + recorded-HEAD checks &&-joined ahead of the archive).
+    _assert_local_source_identity_gates_archive(TARGET_BINDING_DESIGN.read_text(), "Source snapshots")
+
+
+def test_target_binding_plan_local_source_identity_gates_archive():
+    # Finding (Task 3, round 4): the plan's Step-3 local block ran the identity/head checks as bare
+    # commands. The plan's executable block must gate the archive on ONE compound `if` too.
+    _assert_local_source_identity_gates_archive(TARGET_BINDING_PLAN.read_text(), None)
+
+
+def _assert_execution_gate_is_compound(text: str) -> None:
+    """F2: the trusted-local execution-safety proof must be ONE compound `if`/`&&` gate (not bare
+    `test`s a missing global `set -e` would ignore): `CHECKOUT_VERIFIED` defaults to `no`, and one `if`
+    `&&`-joins non-empty recorded identity/head, a valid `$LOCAL_REPO` dir (before any git), observed
+    identity equality, `git status --porcelain` succeeding+empty, and `git rev-parse HEAD`
+    succeeding+equal — only then `CHECKOUT_VERIFIED=yes`."""
+    blocks = [b for b in _bash_blocks(text)
+              if "status --porcelain" in b and "CHECKOUT_VERIFIED" in b]
+    assert len(blocks) == 1, "exactly one executable execution-safety verification block is required"
+    folded = re.sub(r"\\\n\s*", "", blocks[0])
+    assert re.search(r"(?m)^\s*CHECKOUT_VERIFIED=no\s*$", folded), \
+        "CHECKOUT_VERIFIED must default to no (fail closed) before the gate"
+    assert re.search(
+        r'if\b[^\n]*?test -n "\$RECORDED_REPOSITORY_IDENTITY"[^\n]*?'
+        r'&&[^\n]*?test -n "\$RECORDED_HEAD_SHA"[^\n]*?'
+        r'&&[^\n]*?test -d "\$LOCAL_REPO"[^\n]*?'
+        r'&&[^\n]*?test "\$OBSERVED_REPOSITORY" = "\$RECORDED_REPOSITORY_IDENTITY"[^\n]*?'
+        r'&&[^\n]*?git -C "\$LOCAL_REPO" status --porcelain[^\n]*?'
+        r'&&[^\n]*?test -z "\$STATUS"[^\n]*?'
+        r'&&[^\n]*?git -C "\$LOCAL_REPO" rev-parse HEAD[^\n]*?'
+        r'&&[^\n]*?test "\$HEAD_NOW" = "\$RECORDED_HEAD_SHA"', folded), \
+        "the gate must be ONE compound `if` with identity/head/clean-tree/exact-head checks &&-joined"
+    assert folded.index("if ") < folded.index("CHECKOUT_VERIFIED=yes"), \
+        "CHECKOUT_VERIFIED=yes must be set only inside/after the compound gate"
+    assert not re.search(r'(?m)^\s*test "\$OBSERVED_REPOSITORY" = "\$RECORDED_REPOSITORY_IDENTITY"', folded), \
+        "the identity-equality check must gate execution inside `if`, not run as a bare command"
+    assert not re.search(r'(?m)^\s*test -z "\$\(git -C "\$LOCAL_REPO" status', folded), \
+        "the clean-tree check must gate execution inside `if`, not run as a bare command"
+
+
+def test_target_binding_plan_execution_gate_is_compound():
+    # F2: the plan's trusted-local execution proof must be ONE compound `if`/`&&` gate, not bare commands
+    # a missing global `set -e` would ignore. Only a passing gate may reach consent/execution.
+    _assert_execution_gate_is_compound(TARGET_BINDING_PLAN.read_text())
+
+
+def test_target_binding_design_local_source_identity_gate_is_documented():
+    # The Error-handling contract must state the round-4 rule: for the local path the recorded-identity
+    # equality and recorded-HEAD equality are checked conditions in the SAME `if` that gates the archive
+    # (never bare commands relying on a global `set -e`), computed against a validated `$LOCAL_REPO`
+    # (never running git in an unrelated/ambient repo when `$LOCAL_REPO` is missing), and any
+    # parse/identity/head mismatch stays source-unavailable and patch-only.
+    errors = _flat(_section(TARGET_BINDING_DESIGN.read_text(), "Error handling"))
+    assert "rev-parse head" in errors and "repository-identity" in errors, \
+        "error handling must scope the local gate to the recorded-identity + recorded-HEAD checks"
+    assert "set -e" in errors, "error handling must warn the local checks do not rely on a global set -e"
+    assert re.search(r"gate|guard|one .*condition|single .*condition|short-circuit", errors), \
+        "error handling must state the checks gate the archive (one checked condition), not run bare"
+    assert "local_repo" in errors, \
+        "error handling must guard against a missing/ambient $LOCAL_REPO (no git in an unrelated repo)"
+    assert "patch-only" in errors or "patch only" in errors, \
+        "a local identity/head mismatch must continue patch-only (source unavailable)"
+
 
 
 # --- Companion runtime-guidance guards (docs/cli.md Conventions, AGENTS.md, CLAUDE.md) -------------

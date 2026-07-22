@@ -37,7 +37,8 @@ implementation task, and `test_plan` is the thread's **evidence / verification p
 - `title` / `description` — the slice under review and how to approach it (which changed files and
   surrounding code to interrogate).
 - `files` — the primary changed files this thread reviews (plus the nearby code the evidence lives
-  in). Not exhaustive.
+  in), read in the pinned `RUN/source` snapshot (the exact head commit) alongside `RUN/target.diff` —
+  a diff-file target is patch-only — never ambient checkout files. Not exhaustive.
 - `test_plan` — the **evidence/verification plan**, written in two parts: **static evidence** (the
   concrete, **re-runnable** reads/greps that ground this thread's findings, so **either peer can
   independently reproduce** them) and **execution candidates (consent required)** (focused test/build

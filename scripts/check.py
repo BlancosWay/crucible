@@ -17,6 +17,7 @@ Run:
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
@@ -30,6 +31,38 @@ CHECKS: List[Tuple[str, List[str]]] = [
     ("structural", [sys.executable, "tests/validate_structure.py"]),
     ("links", [sys.executable, "tests/check_links.py"]),
 ]
+
+
+def _git_local_env_vars() -> List[str]:
+    """Names of Git's per-repository ("local") environment variables, per
+    ``git rev-parse --local-env-vars`` (``GIT_DIR``, ``GIT_WORK_TREE``, ``GIT_INDEX_FILE``, ...).
+
+    check.py self-installs as a Git ``pre-commit`` hook; Git runs hooks with these exported and
+    pointing at the OUTER repository. Any ``git`` subprocess a check spawns — notably the pytest
+    suite's git-backed target tests, which run ``git`` inside their own temporary repos — would then
+    inherit them and operate on the outer repo, mutating its HEAD/branches/index. Returns ``[]`` when
+    git is unavailable so the caller degrades to an unscrubbed copy of the environment (keeping the
+    non-hook path and non-git platforms working).
+    """
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--local-env-vars"],
+            capture_output=True, text=True, check=True,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return [name for name in out.split() if name]
+
+
+def _isolated_env() -> dict:
+    """A copy of the process environment with every Git local env var removed (see
+    ``_git_local_env_vars``), so a check subprocess resolves its OWN repository and can never mutate
+    the outer worktree. Non-Git variables are preserved verbatim; when git is unavailable the copy is
+    returned unchanged."""
+    env = dict(os.environ)
+    for name in _git_local_env_vars():
+        env.pop(name, None)
+    return env
 
 
 def _pytest_python() -> Optional[str]:
@@ -47,9 +80,18 @@ def _pytest_python() -> Optional[str]:
     return None
 
 
-def run_check(name: str, argv: List[str], cwd: str) -> Tuple[bool, str]:
-    """Run one check as a subprocess; return (passed, combined output)."""
-    proc = subprocess.run(argv, cwd=cwd, capture_output=True, text=True)
+def run_check(name: str, argv: List[str], cwd: str, env: Optional[dict] = None) -> Tuple[bool, str]:
+    """Run one check as a subprocess; return (passed, combined output).
+
+    ``env`` defaults to a Git-isolated copy of the environment (see ``_isolated_env``): every Git
+    local env var is scrubbed so a check that shells out to ``git`` (or the pytest suite, whose target
+    tests do) resolves its own repository and can never move the outer worktree's HEAD/branch/index —
+    the failure mode when check.py runs from the pre-commit hook.
+    """
+    proc = subprocess.run(
+        argv, cwd=cwd, capture_output=True, text=True,
+        env=env if env is not None else _isolated_env(),
+    )
     return proc.returncode == 0, (proc.stdout or "") + (proc.stderr or "")
 
 
@@ -73,8 +115,11 @@ def _build_registry() -> List[Tuple[str, List[str]]]:
 def run_all() -> int:
     """Run every check; print a per-check PASS/FAIL line and a summary. Return 0/1."""
     failed: List[str] = []
+    # Compute the Git-isolated environment ONCE and share it across every check so structural, links,
+    # the pytest suite, and shellcheck all run scrubbed of the outer repo's Git local env vars.
+    env = _isolated_env()
     for name, argv in _build_registry():
-        ok, output = run_check(name, argv, cwd=str(ROOT))
+        ok, output = run_check(name, argv, cwd=str(ROOT), env=env)
         print(f"{'PASS' if ok else 'FAIL'}  {name}")
         if not ok:
             failed.append(name)

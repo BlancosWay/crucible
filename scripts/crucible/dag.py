@@ -70,6 +70,10 @@ class DAG:
             nid = raw["id"]
             if not isinstance(nid, str) or not nid:
                 raise ValueError(f'node at index {i} "id" must be a non-empty string')
+            if nid != nid.strip() or not nid.strip():
+                raise ValueError(
+                    f'node at index {i} "id" must not be blank or have surrounding whitespace '
+                    f"(ids are kebab-case): {nid!r}")
             if nid in nodes:
                 raise ValueError(f"duplicate node id: {nid}")
             status = raw.get("status", "pending")

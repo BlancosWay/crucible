@@ -14,6 +14,7 @@ from crucible.config import Config
 from crucible.dag import DAG
 from crucible.integrity import artifact_sha256, dag_sha256, node_sha256
 from crucible.runlog import init_run
+from crucible.target import ReviewTarget, target_from_events, target_sha256
 from crucible.workflow import (
     accepted_terminal,
     require_final_ready,
@@ -24,6 +25,47 @@ from crucible.workflow import (
     workflow_issues,
     WorkflowIssue,
 )
+
+
+# A minimal revision-unbound diff-file target — the smallest valid pr-review target — so a pr-review
+# fixture binds its gates to a real loaded target identity.
+_TARGET_MANIFEST = {
+    "version": 1, "kind": "diff-file", "revision_bound": False, "repository": None,
+    "diff_sha256": "0" * 64, "changed_files": ["a.py"], "intent": {"title": "t", "body": "b"},
+}
+_TARGET_SHA = target_sha256(ReviewTarget.from_dict(_TARGET_MANIFEST))
+
+
+def _load_target(run):
+    """Append the one immutable ``target_loaded`` event and return its authoritative target hash."""
+    target = ReviewTarget.from_dict(_TARGET_MANIFEST)
+    sha = target_sha256(target)
+    run.append("target_loaded", target=target.to_dict(), target_sha256=sha)
+    return sha
+
+
+# A minimal revision-bound (local-range) target — the smallest valid target that legitimately carries
+# a materialized source snapshot, used by the source-materialization workflow tests.
+_LOCAL_TARGET_MANIFEST = {
+    "version": 1, "kind": "local-range", "revision_bound": True,
+    "repository": "https://github.com/owner/repo.git",
+    "base": {"ref": "main", "sha": "1" * 40}, "head": {"ref": "feature", "sha": "2" * 40},
+    "merge_base_sha": "3" * 40, "diff_sha256": "b" * 64, "changed_files": ["a.py"],
+    "intent": {"title": "t", "body": "b"},
+}
+
+
+def _load_local_range_target(run):
+    """Append a revision-bound local-range ``target_loaded`` event; return its target hash."""
+    target = ReviewTarget.from_dict(_LOCAL_TARGET_MANIFEST)
+    sha = target_sha256(target)
+    run.append("target_loaded", target=target.to_dict(), target_sha256=sha)
+    return sha
+
+
+def _empty_dag():
+    return DAG.from_dict({"nodes": [], "edges": []})
+
 
 
 def _peers(gate, rnd, bindings, outer_objs=()):
@@ -484,13 +526,14 @@ def _symmetric_run(tmp_path, *, accepted="valid", final=None, verdict="match", p
     ``"wrong_outcome"`` (a symmetric_verdict that does not correspond to the terminal)."""
     cfg = Config.from_dict({"final_review": final is not None})
     run = init_run("sym", cfg, base_dir=tmp_path, workflow="pr-review")
+    tgt = _load_target(run)
     dag = _dag(status="done")
     run.save_dag(dag.to_dict())
     dsha, nsha = dag_sha256(dag), node_sha256(dag, "a")
 
     plan_art = artifact_sha256(b"plan")
     run.append("builder_output", gate="plan", round=1, payload="plan", artifact_sha256=plan_art)
-    plan_bind = {"artifact_sha256": plan_art, "dag_sha256": dsha}
+    plan_bind = {"artifact_sha256": plan_art, "dag_sha256": dsha, "target_sha256": tgt}
     if plan == "critic":
         run.append("critic_verdict", gate="plan", round=1, verdict="APPROVE", **plan_bind)
     elif plan != "bare":
@@ -505,7 +548,8 @@ def _symmetric_run(tmp_path, *, accepted="valid", final=None, verdict="match", p
     candidate = {"summary": "", "findings": [_af("dep:a", "F1")]}
     cand_text = json.dumps(candidate)
     cand_art = artifact_sha256(cand_text.encode("utf-8"))
-    dep_bind = {"artifact_sha256": cand_art, "dag_sha256": dsha, "node_sha256": nsha}
+    dep_bind = {"artifact_sha256": cand_art, "dag_sha256": dsha, "node_sha256": nsha,
+                "target_sha256": tgt}
     run.append("builder_output", gate="dep:a", round=1, payload=cand_text, artifact_sha256=cand_art)
     ver_bind = dep_bind if verdict == "match" else {**dep_bind, "artifact_sha256": "9" * 64}
     run.append("symmetric_verdict", gate="dep:a", round=1, outcome="CONSENSUS", objections=[],
@@ -524,7 +568,7 @@ def _symmetric_run(tmp_path, *, accepted="valid", final=None, verdict="match", p
         final_payload = {"summary": "", "findings": final_findings}
         final_text = json.dumps(final_payload)
         final_art = artifact_sha256(final_text.encode("utf-8"))
-        fbind = {"artifact_sha256": final_art, "dag_sha256": dsha}
+        fbind = {"artifact_sha256": final_art, "dag_sha256": dsha, "target_sha256": tgt}
         run.append("builder_output", gate="final", round=1, payload=final_text,
                    artifact_sha256=final_art)
         run.append("symmetric_verdict", gate="final", round=1, outcome="CONSENSUS", objections=[],
@@ -598,6 +642,199 @@ def _corrupt_dep_trio(events, corruption):
 def test_workflow_issues_clean_for_valid_symmetric_dependency_only(tmp_path):
     run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
     assert workflow_issues(run.read_events(), dag, cfg) == []
+
+
+# --- Task 2: pr-review target integrity (missing / invalid / mismatched binding) -----------------
+
+def _rebind_target(events, gate, value):
+    """Rewrite ``target_sha256`` to ``value`` on every binding event (and nested peer attestation +
+    raw provenance) for ``gate`` — a consistent forged rebinding the CLI write path never produces."""
+    for e in events:
+        if e.get("gate") != gate:
+            continue
+        if "target_sha256" in e:
+            e["target_sha256"] = value
+        peers = e.get("peers")
+        if isinstance(peers, dict):
+            for slot in peers.values():
+                if not isinstance(slot, dict):
+                    continue
+                att = slot.get("attestation")
+                if isinstance(att, dict) and "target_sha256" in att:
+                    att["target_sha256"] = value
+                    slot["raw"] = json.dumps(att)
+    return events
+
+
+def test_workflow_issues_init_only_pr_review_missing_target(tmp_path):
+    # An init-only pr-review run (no target loaded yet, no protocol work) is merely IN PROGRESS: the
+    # target is not yet loaded -> a `missing` issue, never `invalid`.
+    cfg = Config.from_dict({"final_review": False})
+    run = init_run("sym", cfg, base_dir=tmp_path, workflow="pr-review")
+    dag = _dag(status="pending")
+    run.save_dag(dag.to_dict())
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "missing" and "target" in i.message.lower() for i in issues)
+    assert not any(i.kind == "invalid" and "target" in i.message.lower() for i in issues)
+
+
+def test_workflow_issues_pr_review_protocol_without_target_invalid(tmp_path):
+    # DAG/PLAN/review work recorded with no loaded target is an integrity violation (a target must
+    # precede protocol work) -> invalid.
+    cfg = Config.from_dict({"final_review": False})
+    run = init_run("sym", cfg, base_dir=tmp_path, workflow="pr-review")
+    dag = _dag(status="pending")
+    run.save_dag(dag.to_dict())
+    run.append("builder_output", gate="plan", round=1, payload="plan",
+               artifact_sha256=artifact_sha256(b"plan"))
+    run.append("gate_consensus", gate="plan", round=1,
+               artifact_sha256=artifact_sha256(b"plan"), dag_sha256=dag_sha256(dag))
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "invalid" and "target" in i.message.lower() for i in issues)
+
+
+def test_workflow_issues_target_in_build_run_invalid(tmp_path):
+    cfg = Config.from_dict({"final_review": False})
+    run = init_run("b", cfg, base_dir=tmp_path)  # build
+    dag = _dag(status="pending")
+    run.save_dag(dag.to_dict())
+    _load_target(run)
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "invalid" and "target" in i.message.lower() for i in issues)
+
+
+def test_workflow_issues_target_in_deep_dive_run_invalid(tmp_path):
+    cfg = Config.from_dict({"final_review": False})
+    run = init_run("d", cfg, base_dir=tmp_path, workflow="deep-dive")
+    dag = _dag(status="pending")
+    run.save_dag(dag.to_dict())
+    _load_target(run)
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "invalid" and "target" in i.message.lower() for i in issues)
+
+
+def test_workflow_issues_duplicate_target_invalid(tmp_path):
+    cfg = Config.from_dict({"final_review": False})
+    run = init_run("sym", cfg, base_dir=tmp_path, workflow="pr-review")
+    _load_target(run)
+    _load_target(run)  # a target is immutable — a second load is invalid
+    dag = _dag(status="pending")
+    run.save_dag(dag.to_dict())
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "invalid" and "target" in i.message.lower() for i in issues)
+
+
+def test_workflow_issues_late_target_invalid(tmp_path):
+    cfg = Config.from_dict({"final_review": False})
+    run = init_run("sym", cfg, base_dir=tmp_path, workflow="pr-review")
+    dag = _dag(status="pending")
+    run.save_dag(dag.to_dict())
+    run.append("dag_loaded", gate="plan", nodes=1)  # protocol work begins
+    _load_target(run)  # loaded AFTER protocol work — a target must precede it
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "invalid" and "target" in i.message.lower() for i in issues)
+
+
+def test_workflow_issues_consistent_wrong_target_trio_invalid(tmp_path):
+    # A fully consistent dep trio (verdict/accepted/terminal/peers all rebind the same WRONG target)
+    # passes the internal binding-consistency checks yet is not bound to the loaded target -> invalid.
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    events = _rebind_target(run.read_events(), "dep:a", "9" * 64)
+    issues = workflow_issues(events, dag, cfg)
+    assert any(i.kind == "invalid" and "target" in i.message.lower() for i in issues)
+
+
+def test_workflow_issues_mismatched_target_on_accepted_set_invalid(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    events = run.read_events()
+    for e in events:
+        if e.get("event") == "accepted_finding_set" and e.get("gate") == "dep:a":
+            e["target_sha256"] = "9" * 64
+    issues = workflow_issues(events, dag, cfg)
+    assert any(i.kind == "invalid" and "target" in i.message.lower() for i in issues)
+
+
+def test_workflow_issues_mismatched_target_on_verdict_invalid(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    events = run.read_events()
+    for e in events:
+        if e.get("event") == "symmetric_verdict" and e.get("gate") == "dep:a":
+            e["target_sha256"] = "9" * 64
+    issues = workflow_issues(events, dag, cfg)
+    assert any(i.kind == "invalid" and "target" in i.message.lower() for i in issues)
+
+
+def test_workflow_issues_mismatched_target_on_terminal_invalid(tmp_path):
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    events = run.read_events()
+    for e in events:
+        if e.get("event") == "gate_consensus" and e.get("gate") == "dep:a":
+            e["target_sha256"] = "9" * 64
+    issues = workflow_issues(events, dag, cfg)
+    assert any(i.kind == "invalid" and "target" in i.message.lower() for i in issues)
+
+
+def test_workflow_issues_source_materialized_wrong_target_invalid(tmp_path):
+    # A source snapshot bound to a different target than the loaded one is invalid history.
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid")
+    run.append("source_materialized", kind="diff-file", target_sha256="9" * 64,
+               archive_sha256="a" * 64)
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert any(i.kind == "invalid" and ("target" in i.message.lower()
+                                        or "source" in i.message.lower()) for i in issues)
+
+
+def test_workflow_issues_valid_source_materialization_has_no_source_issue(tmp_path):
+    # A valid revision-bound materialization (correct kind/hash/archive/order) yields NO source issue;
+    # workflow_issues consumes the centralized validator, which accepts it.
+    cfg = Config.from_dict({"final_review": False})
+    run = init_run("sym", cfg, base_dir=tmp_path, workflow="pr-review")
+    sha = _load_local_range_target(run)
+    run.append("source_materialized", kind="local-range", target_sha256=sha, archive_sha256="d" * 64)
+    issues = workflow_issues(run.read_events(), _empty_dag(), cfg)
+    assert not any("source" in i.message.lower() for i in issues)
+
+
+def test_workflow_issues_source_without_target_is_invalid_not_missing(tmp_path):
+    # F2/F3: a source event with NO loaded target must render INVALID (fail-closed), never a plain
+    # in-progress 'missing target'. The invalid source issue suppresses the missing-target note.
+    cfg = Config.from_dict({"final_review": False})
+    run = init_run("sym", cfg, base_dir=tmp_path, workflow="pr-review")
+    run.append("source_materialized", kind="local-range", target_sha256="d" * 64,
+               archive_sha256="d" * 64)
+    issues = workflow_issues(run.read_events(), _empty_dag(), cfg)
+    assert any(i.kind == "invalid" and "source" in i.message.lower() for i in issues)
+    assert not any(i.kind == "missing" and "target is not loaded" in i.message for i in issues)
+
+
+def test_workflow_issues_forged_diff_file_source_is_invalid(tmp_path):
+    # A diff-file (revision-unbound) target carries no source snapshot; a forged source_materialized
+    # bound to it — even with the CORRECT target hash — is invalid history.
+    cfg = Config.from_dict({"final_review": False})
+    run = init_run("sym", cfg, base_dir=tmp_path, workflow="pr-review")
+    sha = _load_target(run)  # the diff-file _TARGET_MANIFEST
+    run.append("source_materialized", kind="diff-file", target_sha256=sha, archive_sha256="d" * 64)
+    issues = workflow_issues(run.read_events(), _empty_dag(), cfg)
+    assert any(i.kind == "invalid" and "source" in i.message.lower() for i in issues)
+
+
+def test_workflow_issues_source_in_build_run_is_invalid(tmp_path):
+    # A build run has no review target; a recorded source_materialized is invalid history.
+    cfg = Config.from_dict({"final_review": False})
+    run = init_run("b", cfg, base_dir=tmp_path)  # default build workflow
+    run.append("source_materialized", kind="local-range", target_sha256="d" * 64,
+               archive_sha256="d" * 64)
+    issues = workflow_issues(run.read_events(), _empty_dag(), cfg)
+    assert any(i.kind == "invalid" and "source" in i.message.lower() for i in issues)
+
+
+
+def test_workflow_issues_valid_pr_review_has_no_target_issue(tmp_path):
+    # A valid pr-review run (target loaded, every in-scope gate bound to it) has NO target issue.
+    run, dag, cfg = _symmetric_run(tmp_path, accepted="valid", final="valid")
+    issues = workflow_issues(run.read_events(), dag, cfg)
+    assert not any("target" in i.message.lower() for i in issues)
+    assert issues == []
 
 
 def test_workflow_issues_flags_two_pre_terminal_accepted_sets(tmp_path):

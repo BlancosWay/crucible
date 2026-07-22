@@ -19,6 +19,12 @@ from crucible.symmetric import (
     review_result,
     workflow_kind,
 )
+from crucible.target import (
+    target_event_issues,
+    target_from_events,
+    target_sha256,
+    validate_source_materialization,
+)
 from crucible.workflow import WorkflowIssue, workflow_issues
 
 
@@ -31,20 +37,44 @@ def _html_escape(text: str) -> str:
 
 
 def _san(value: Any) -> str:
-    """Flatten untrusted text to a single line and neutralize Markdown table/heading AND
-    HTML breakers.
+    """Flatten untrusted text to a single line and neutralize Markdown table/heading, Markdown
+    image/link, AND HTML breakers.
 
-    Critic verdicts, goals, and DAG fields are untrusted data: a newline or a stray ``|``
-    could inject a fake heading/row/outcome line, and raw HTML (``<script>``,
-    ``<img onerror=…>``) would execute when ``report.md`` is opened in an HTML-permitting
-    Markdown renderer. So escape ``&``/``<``/``>`` (``&`` first) in addition to ``|`` and
-    backticks. The fenced raw provenance is handled separately — kept verbatim in Markdown
-    (code-fence content renders literally) and escaped by ``render_html``.
+    Critic verdicts, goals, DAG fields, and PR-derived text are untrusted data: a newline or a stray
+    ``|`` could inject a fake heading/row/outcome line; raw HTML (``<script>``, ``<img onerror=…>``)
+    would execute when ``report.md`` is opened in an HTML-permitting Markdown renderer; and Markdown
+    image/link syntax (``![alt](url)`` / ``[text](url)``) would render an **active** ``<img>`` request
+    (a tracking pixel / content injection) with no HTML at all. So escape ``&``/``<``/``>`` (``&``
+    first), ``|`` and backticks, AND the link/image brackets ``[``/``]`` (escaping the brackets breaks
+    both ``![…](…)`` and ``[…](…)`` — the ``!`` alone is inert once the brackets are escaped). The
+    fenced raw provenance is handled separately — kept verbatim in Markdown (code-fence content renders
+    literally) and escaped by ``render_html``.
+
+    Its output is safe in Markdown **running text**; it is NOT placed inside a backtick code span,
+    where a backtick in the value would break out (code spans ignore backslash escapes) — untrusted
+    ids are rendered as plain ``_san`` text, never ``` `…` ```.
     """
     text = str(value).replace("\r", " ").replace("\n", " ")
     text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     text = text.replace("|", "\\|").replace("`", "\\`")
+    text = text.replace("[", "\\[").replace("]", "\\]")
     return " ".join(text.split()).strip()
+
+
+def _gate_policy_suffix(terminal_event: dict[str, Any]) -> str:
+    """The effective per-gate policy recorded on a terminal event (F5) — the round cap actually used
+    (a ``--max-rounds`` override or the config default) and ``on_cap`` that produced the decision —
+    rendered as ``` (round cap N, on_cap X)```. A legacy terminal event that never recorded the policy
+    yields ``''`` (no suffix), so the report stays readable for pre-F5 runs. Surfacing this lets the
+    report reconstruct a ``--max-rounds``-driven decision that the run config alone cannot show."""
+    mr = terminal_event.get("max_rounds")
+    oc = terminal_event.get("on_cap")
+    parts = []
+    if mr is not None:
+        parts.append(f"round cap {_san(mr)}")
+    if oc is not None:
+        parts.append(f"on_cap {_san(oc)}")
+    return f" ({', '.join(parts)})" if parts else ""
 
 
 def _payload_text(payload: Any) -> str:
@@ -175,9 +205,12 @@ def _schema_v2_issues(
     The single owner of the schema/config-aware validation the report consumes. A PRESENT current
     tree that cannot be loaded as a JSON object fails closed to an ``invalid`` issue; a present,
     loadable tree is validated by :func:`_config_aware_issues` (which itself fails closed on a
-    malformed tree/config). A legacy run or an ABSENT tree yields ``[]`` (never certifiable / still
-    in progress). Shared by the run summary and the symmetric result section so both agree on
-    INVALID/MISSING integrity.
+    malformed tree/config). A legacy run yields ``[]`` (never certifiable). An ABSENT tree yields only
+    the fail-closed target-identity and source-materialization integrity issues — a
+    duplicate/malformed/late ``target_loaded``, pr-review protocol work with no target, or a
+    forged/duplicate/target-less ``source_materialized`` is INVALID even before a tree is loaded — and
+    otherwise ``[]`` (still in progress). Shared by the run summary and the symmetric result section so
+    both agree on INVALID/MISSING integrity.
     """
     schema_current = schema_version is not None and schema_version >= RUN_SCHEMA_VERSION
     if not schema_current:
@@ -187,7 +220,7 @@ def _schema_v2_issues(
     # single `workflow_kind` read path) BEFORE the tree checks, so it renders INVALID even when no
     # tree is loaded and it never routes a corrupt run down the config-aware validator.
     try:
-        workflow_kind(events)
+        workflow = workflow_kind(events)
     except CorruptWorkflowError as exc:
         return [WorkflowIssue(
             "invalid", f"the run's recorded workflow metadata is corrupt: {exc}")]
@@ -198,7 +231,23 @@ def _schema_v2_issues(
             "object and cannot be parsed, bound, or certified")]
     if dag_present:
         return _config_aware_issues(events, dag, config)
-    return []
+    # An ABSENT tree normally stays IN PROGRESS (nothing to certify yet). But target IDENTITY and the
+    # source snapshot are BOTH authoritative over the event history alone — not the dependency tree —
+    # so they are validated NOW, tree or no tree, and each renders the run INVALID rather than being
+    # masked as merely in progress:
+    #   - target-EVENT integrity (`target_event_issues`): a duplicate/malformed/late `target_loaded`,
+    #     or pr-review DAG/PLAN/review work recorded with no target (an init-only pr-review run that
+    #     has simply not loaded its target yet is *missing*, not invalid, and returns []);
+    #   - source-MATERIALIZATION integrity (`validate_source_materialization`, F2/F3): a
+    #     forged/duplicate/target-less/wrong-kind/-hash/-order `source_materialized` event.
+    # This reuses the SAME central validators the present-tree path applies via
+    # `workflow_issues`/`_target_issues`, so both paths agree, and the source issue is listed exactly
+    # once (target-event issues name `target_loaded`; source issues name `source_materialized`).
+    # Tree-dependent phases (binding, DAG/PLAN/FINAL ordering) still wait for the tree.
+    issues = [WorkflowIssue("invalid", msg) for msg in target_event_issues(events, workflow)]
+    issues.extend(WorkflowIssue("invalid", msg)
+                  for msg in validate_source_materialization(events, workflow).issues)
+    return issues
 
 
 def _overall_status(
@@ -517,13 +566,76 @@ def _symmetric_result_lines(
         lines.append(f"- **{_san(gate)}**")
         for finding in groups[gate]:
             lines.append(
-                f"  - `{_san(finding.get('id'))}` [{_san(finding.get('severity'))}] "
+                f"  - {_san(finding.get('id'))} [{_san(finding.get('severity'))}] "
                 f"{_san(finding.get('location'))}: {_san(finding.get('claim'))} -> "
                 f"{_san(finding.get('suggestion'))}"
             )
     lines.append("")
     return lines
 
+
+def _source_snapshot_line(events: list[dict[str, Any]], workflow: str | None) -> str | None:
+    """Render the source-snapshot status ONLY from the centrally-VALIDATED ``source_materialized``
+    event (:func:`crucible.target.validate_source_materialization`): a single, in-order snapshot of a
+    valid revision-bound loaded target with a matching kind/hash and a well-formed archive digest. A
+    forged diff-file snapshot, a duplicate, a malformed/wrong-kind/wrong-hash/out-of-order event, or a
+    snapshot of any other target never renders here (the Summary renders such a run INVALID)."""
+    event = validate_source_materialization(events, workflow).event
+    if event is None:
+        return None
+    archive = str(event.get("archive_sha256", ""))
+    return f"**Source snapshot:** materialized (archive `{_san(archive[:12])}…`)"
+
+
+def _review_target_lines(events: list[dict[str, Any]], workflow: str | None) -> list[str]:
+    """The ``## Review target`` section (pr-review only), rendered from the authoritative
+    ``target_loaded`` event with sanitized labels/paths and full hashes.
+
+    Fails closed rather than fabricate: a build/deep-dive run (no target), a pr-review run whose
+    target is not yet loaded (in progress), or a duplicate/malformed/invalid target (the Summary
+    renders it INVALID) yields NO section — the reader never sees a half-formed identity.
+    """
+    if workflow != "pr-review":
+        return []
+    try:
+        target = target_from_events(events)
+    except ValueError:
+        return []  # duplicate/malformed/mismatched target: the Summary renders the run INVALID
+    if target is None:
+        return []  # not loaded yet: the Summary renders the run IN PROGRESS
+    sha = target_sha256(target)
+    lines = ["## Review target", ""]
+    if target.kind == "github-pr":
+        lines.append(f"**Pull request:** {_san(target.repository)}#{target.pr_number}")
+        lines.append(f"**URL:** {_san(target.url)}")
+        lines.append(f"**Base:** {_san(target.base.repository)}@{_san(target.base.ref)} "
+                     f"`{_san(target.base.sha)}`")
+        lines.append(f"**Head:** {_san(target.head.repository)}@{_san(target.head.ref)} "
+                     f"`{_san(target.head.sha)}`")
+        lines.append(f"**Merge base:** `{_san(target.merge_base_sha)}`")
+        lines.append(
+            f"**Scope:** {'cross-repository' if target.is_cross_repository else 'same-repository'}")
+        lines.append("**Revision:** bound")
+    elif target.kind == "local-range":
+        lines.append(f"**Local range:** {_san(target.repository)}")
+        lines.append(f"**Base:** {_san(target.base.ref)} `{_san(target.base.sha)}`")
+        lines.append(f"**Head:** {_san(target.head.ref)} `{_san(target.head.sha)}`")
+        lines.append(f"**Merge base:** `{_san(target.merge_base_sha)}`")
+        lines.append("**Revision:** bound")
+    else:  # diff-file
+        lines.append("**Kind:** diff-file")
+        lines.append("**Revision:** unbound (patch identity only)")
+    lines.append(f"**Intent:** {_san(target.intent_title)} \u2014 {_san(target.intent_body)}")
+    files = target.changed_files
+    listed = ", ".join(_san(f) for f in files) if files else "(none)"
+    lines.append(f"**Changed files ({len(files)}):** {listed}")
+    lines.append(f"**Patch hash:** `{_san(target.diff_sha256)}`")
+    lines.append(f"**Target hash:** `{_san(sha)}`")
+    snapshot = _source_snapshot_line(events, workflow)
+    if snapshot is not None:
+        lines.append(snapshot)
+    lines.append("")
+    return lines
 
 
 def render_markdown(run: RunLog) -> str:
@@ -593,6 +705,10 @@ def render_markdown(run: RunLog) -> str:
             dag = {"nodes": []}
             dag_load_error = True
 
+    # The immutable review target identity (pr-review only), rendered BEFORE the Summary so a reader
+    # sees WHAT was reviewed before the status. Read from the authoritative ``target_loaded`` event.
+    lines.extend(_review_target_lines(events, workflow))
+
     lines.extend(_run_summary_lines(
         events, dag, config=config, schema_version=schema_version,
         dag_present=dag_present, dag_load_error=dag_load_error,
@@ -616,14 +732,14 @@ def render_markdown(run: RunLog) -> str:
     lines.append("| Node | Title | Status |")
     lines.append("|------|-------|--------|")
     for n in dag.get("nodes", []):
-        lines.append(f"| `{_san(n.get('id', ''))}` | {_san(n.get('title', ''))} | {_san(n.get('status', ''))} |")
+        lines.append(f"| {_san(n.get('id', ''))} | {_san(n.get('title', ''))} | {_san(n.get('status', ''))} |")
     lines.append("")
 
     lines.append("## Gates")
     lines.append("")
     gates = _events_by_gate(events)
     for gate, gate_events in gates.items():
-        lines.append(f"### Gate: `{_san(gate)}`")
+        lines.append(f"### Gate: {_san(gate)}")
         lines.append("")
         for e in gate_events:
             ev = e.get("event")
@@ -637,7 +753,7 @@ def render_markdown(run: RunLog) -> str:
                 lines.append(f"- **Round {rnd}:** {_san(payload.get('verdict', '?'))} - {_san(payload.get('summary', ''))}")
                 for f in payload.get("findings", []):
                     lines.append(
-                        f"  - `{_san(f.get('id'))}` [{_san(f.get('severity'))}] {_san(f.get('location'))}: "
+                        f"  - {_san(f.get('id'))} [{_san(f.get('severity'))}] {_san(f.get('location'))}: "
                         f"{_san(f.get('claim'))} -> {_san(f.get('suggestion'))}"
                     )
                 raw = e.get("raw")
@@ -663,7 +779,7 @@ def render_markdown(run: RunLog) -> str:
                 for o in e.get("objections", []):
                     if isinstance(o, dict):
                         lines.append(
-                            f"  - `{_san(o.get('id'))}` [{_san(o.get('severity'))}] "
+                            f"  - {_san(o.get('id'))} [{_san(o.get('severity'))}] "
                             f"{_san(o.get('location'))}: {_san(o.get('claim'))} -> "
                             f"{_san(o.get('suggestion'))}"
                         )
@@ -677,7 +793,7 @@ def render_markdown(run: RunLog) -> str:
                         else:
                             res, rationale = info, ""
                         tail = f" — {_san(rationale)}" if rationale else ""
-                        lines.append(f"  - `{_san(fid)}` -> {_san(res)}{tail}")
+                        lines.append(f"  - {_san(fid)} -> {_san(res)}{tail}")
         # A gate ends in exactly one terminal event; if several were ever logged, the LAST in
         # log order is authoritative. Each interpolated value is sanitized individually.
         terminal = [e for e in gate_events
@@ -685,16 +801,17 @@ def render_markdown(run: RunLog) -> str:
         if terminal:
             last = terminal[-1]
             rnd = _san(last.get("round", "?"))
+            policy = _gate_policy_suffix(last)
             if last["event"] == "gate_consensus":
-                lines.append(f"- **Outcome:** CONSENSUS at round {rnd}")
+                lines.append(f"- **Outcome:** CONSENSUS at round {rnd}{policy}")
             elif last["event"] == "gate_proceeded_with_flags":
                 flags = last.get("open_findings", [])
                 ids = ", ".join(_san(i) for i in flags)
                 carried = f": {ids}" if ids else ""
-                lines.append(f"- **Outcome:** PROCEEDED WITH FLAGS at round {rnd} — "
+                lines.append(f"- **Outcome:** PROCEEDED WITH FLAGS at round {rnd}{policy} — "
                              f"{len(flags)} unresolved finding(s) carried{carried}")
             else:  # gate_capped
-                lines.append(f"- **Outcome:** CAPPED at round {rnd} (unresolved)")
+                lines.append(f"- **Outcome:** CAPPED at round {rnd}{policy} (unresolved)")
         lines.append("")
 
     return "\n".join(lines)

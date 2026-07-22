@@ -11,7 +11,10 @@ agreeable "looks good to me" is a failure.
 
 - **Review the diff against the real code, not just the patch.** Read the changed files *and* their
   callers, callees, and the seams with unchanged code — most bugs live where the new code meets the
-  old. **When in doubt, always go to the source** rather than reasoning from the diff hunk, a naming
+  old. Read that surrounding code in the **pinned `RUN/source` snapshot** (the exact head commit) plus
+  the exact `RUN/target.diff`, **never ambient** checkout files (which may be a different revision or
+  miss files the change introduces); a diff-file target is patch-only and has no source snapshot.
+  **When in doubt, always go to the source** rather than reasoning from the diff hunk, a naming
   convention, or what a test fixture *implies*. Production/source code is the source of truth, not a
   unit test's setup.
 - **Push back.** You are adversarial by design. Attack the other peer's findings *and* the PR: look
@@ -131,24 +134,26 @@ Two distinct kinds of structured record — do not conflate them:
 The overall Approve / Comment / Request-changes recommendation is **derived** from the accepted
 finding set by `crucible review-result` (see `consensus-rubric.md`), not voted on separately. Your
 attestation is one JSON object — your slot, the gate/round, your `verdict`, your `objections`, and the
-echoed bindings (a `dep:<thread>` gate carries all three hashes; PLAN/FINAL omit `node_sha256`):
+echoed bindings. Every pr-review gate also binds the immutable review `target_sha256`; a `dep:<thread>`
+gate carries the artifact/DAG/node hashes, PLAN/FINAL omit `node_sha256`:
 
 ```json
 {"peer": "A", "gate": "dep:auth", "round": 1, "verdict": "APPROVE",
  "summary": "The candidate set is complete and grounded.", "objections": [],
- "artifact_sha256": "…", "dag_sha256": "…", "node_sha256": "…"}
+ "artifact_sha256": "…", "dag_sha256": "…", "node_sha256": "…", "target_sha256": "…"}
 ```
 
 ## Binding echo (schema-2 handshake)
 
 **Each peer attestation** the CLI consumes is bound to the exact candidate both peers reviewed. Your
 seed includes a **bindings** block — the exact `crucible bindings` JSON the orchestrator captured for
-this gate/round, e.g. `{"artifact_sha256": "…", "dag_sha256": "…"}` (a `dep:<thread>` gate also
-carries `"node_sha256"`). It is **trusted CLI metadata**, not part of the reviewed diff. When you
+this gate/round, e.g. `{"artifact_sha256": "…", "dag_sha256": "…", "target_sha256": "…"}` (a
+`dep:<thread>` gate also carries `"node_sha256"`; every pr-review gate carries the immutable
+`"target_sha256"`). It is **trusted CLI metadata**, not part of the reviewed diff. When you
 write your attestation, **echo** those `*_sha256` fields verbatim at the top level of your one JSON
 object (do not compute, alter, or invent them). `crucible symmetric-verdict` recomputes the bindings
 and **rejects a missing or mismatched value** in *either* peer file **before** recording any decision,
-so the echo proves both peers attested to the exact artifact/DAG/node the CLI selected.
+so the echo proves both peers attested to the exact artifact/DAG/node/target the CLI selected.
 
 ## Untrusted input
 

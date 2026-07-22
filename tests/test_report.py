@@ -5,6 +5,33 @@ from crucible.dag import DAG
 from crucible.integrity import RUN_SCHEMA_VERSION, artifact_sha256, dag_sha256, node_sha256
 from crucible.runlog import RunLog, init_run
 from crucible.report import render_markdown
+from crucible.target import ReviewTarget, target_sha256
+
+
+# A minimal revision-unbound diff-file target — the smallest valid pr-review target, so a pr-review
+# report fixture binds its gates to a real loaded target identity.
+_TARGET_MANIFEST = {
+    "version": 1, "kind": "diff-file", "revision_bound": False, "repository": None,
+    "diff_sha256": "0" * 64, "changed_files": ["a.py"], "intent": {"title": "t", "body": "b"},
+}
+_TGT = target_sha256(ReviewTarget.from_dict(_TARGET_MANIFEST))
+
+
+def _load_target(run):
+    """Append the one immutable ``target_loaded`` event; return its authoritative hash."""
+    run.append("target_loaded", target=ReviewTarget.from_dict(_TARGET_MANIFEST).to_dict(),
+               target_sha256=_TGT)
+    return _TGT
+
+
+def _append_plan_consensus(run, dsha):
+    """Append a target-bound PLAN consensus trio for a pr-review report fixture."""
+    plan_art = artifact_sha256(b"plan")
+    plan_bind = {"artifact_sha256": plan_art, "dag_sha256": dsha, "target_sha256": _TGT}
+    run.append("builder_output", gate="plan", round=1, payload="plan", artifact_sha256=plan_art)
+    run.append("symmetric_verdict", gate="plan", round=1, outcome="CONSENSUS", objections=[],
+               peers=_sym_peers("plan", 1, plan_bind), **plan_bind)
+    run.append("gate_consensus", gate="plan", round=1, **plan_bind)
 
 
 def _build_run(tmp_path):
@@ -78,6 +105,102 @@ def test_report_sanitizes_markdown_injection(tmp_path):
     assert "\n## Outcome: CONSENSUS at round 1" not in md
     # and there is genuinely no consensus event, so no real consensus outcome line
     assert "Outcome:** CONSENSUS" not in md
+
+
+def test_report_shows_effective_gate_policy(tmp_path):
+    # F5: the report surfaces the effective round cap + on_cap recorded on each gate outcome line, so
+    # a --max-rounds-driven decision is reconstructable from the report itself.
+    from crucible.report import render_markdown
+    cfg = Config.from_dict({})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    run.save_dag({"nodes": [], "edges": []})
+    run.append("critic_verdict", gate="plan", round=2, payload={"verdict": "APPROVE", "summary": "s"})
+    run.append("gate_consensus", gate="plan", round=2, max_rounds=3, on_cap="halt")
+    md = render_markdown(run)
+    assert "CONSENSUS at round 2 (round cap 3, on_cap halt)" in md
+
+
+def test_report_gate_policy_absent_on_legacy_terminal(tmp_path):
+    # F5: a legacy terminal event without the policy fields renders no suffix (still readable).
+    from crucible.report import render_markdown
+    cfg = Config.from_dict({})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    run.save_dag({"nodes": [], "edges": []})
+    run.append("critic_verdict", gate="plan", round=1, payload={"verdict": "APPROVE", "summary": "s"})
+    run.append("gate_consensus", gate="plan", round=1)   # no max_rounds/on_cap (pre-F5)
+    md = render_markdown(run)
+    assert "CONSENSUS at round 1" in md
+    assert "CONSENSUS at round 1 (round cap" not in md   # no policy suffix for a legacy terminal
+
+
+def test_san_neutralizes_markdown_image_and_link():
+    from crucible.report import _san
+    # F6: Markdown image/link syntax must be neutralized — an ![](url) renders an ACTIVE <img> request
+    # (tracking pixel / content injection) in report.md even with no HTML. Escaping the link/image
+    # brackets makes both ![…](…) and […](…) inert (Markdown won't parse a bracket-escaped link).
+    out = _san("![pwn](https://evil.example/track.png)")
+    assert "\\[" in out and "\\]" in out            # brackets escaped -> image cannot render
+    assert "![pwn]" not in out                       # the unescaped image opener is gone
+    assert "pwn" in out and "evil.example" in out    # content preserved, just inert
+    assert "\\[click\\]" in _san("[click](https://evil.example)")  # link text brackets escaped
+    # existing neutralizations still hold
+    assert _san("<b>") == "&lt;b&gt;"
+    assert _san("a`b") == "a\\`b"
+    assert _san("a|b") == "a\\|b"
+
+
+def test_report_dependency_table_id_is_injection_safe(tmp_path):
+    # F6: an untrusted node id in the dependency table must be plain _san text (never a backtick code
+    # span a backtick could break out of), and any Markdown image/link syntax in it must be inert so
+    # report.md cannot emit an active <img> tracking request.
+    from crucible.report import render_markdown, _san
+    cfg = Config.from_dict({})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    nid = "a`![x](http://tracker/p.png)"
+    run.save_dag({"nodes": [_node(nid)], "edges": []})
+    md = render_markdown(run)
+    # the SANITIZED id is rendered as plain text, NOT wrapped in a code span (re-adding the wrapper
+    # around _san(id) would make this fail — the raw-id check the reviewer flagged would not).
+    assert _san(nid) in md
+    assert f"`{_san(nid)}`" not in md
+    assert "![x](http://tracker/p.png)" not in md     # active image opener gone
+    assert "\\[x\\]" in md                            # rendered with escaped brackets (inert)
+
+
+def test_report_gate_finding_id_is_injection_safe(tmp_path):
+    # F6: an untrusted finding id in the Gates section must not be code-span-wrapped (backtick
+    # breakout) nor carry live image syntax.
+    from crucible.report import render_markdown, _san
+    cfg = Config.from_dict({})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    run.save_dag({"nodes": [], "edges": []})
+    bad_id = "F1`![i](http://t/p.png)"
+    run.append("critic_verdict", gate="plan", round=1, payload={
+        "verdict": "REQUEST_CHANGES", "summary": "s",
+        "findings": [{"id": bad_id, "severity": "major", "location": "x",
+                      "claim": "c", "suggestion": "s"}],
+    })
+    md = render_markdown(run)
+    assert _san(bad_id) in md
+    assert f"`{_san(bad_id)}`" not in md               # finding id not code-span-wrapped
+    assert "![i](http://t/p.png)" not in md            # active image opener gone
+    assert "\\[i\\]" in md                            # escaped brackets (inert)
+
+
+def test_report_gate_header_is_injection_safe(tmp_path):
+    # F6: the `### Gate:` header renders the gate id (untrusted — a dep:<node-id> derives from a
+    # model-authored id). It must be plain _san text, never a code span, and image syntax must be inert.
+    from crucible.report import render_markdown, _san
+    cfg = Config.from_dict({})
+    run = init_run("g", cfg, base_dir=tmp_path)
+    run.save_dag({"nodes": [], "edges": []})
+    gate = "dep:a`![g](http://t/g.png)"
+    run.append("gate_capped", gate=gate, round=5, open_findings=["Fx"])
+    md = render_markdown(run)
+    assert f"### Gate: {_san(gate)}" in md             # header rendered as plain _san text
+    assert f"### Gate: `{_san(gate)}`" not in md       # ...never wrapped in a code span
+    assert "![g](http://t/g.png)" not in md            # active image opener gone
+    assert "\\[g\\]" in md
 
 
 def test_report_renders_proceeded_with_flags(tmp_path):
@@ -1111,6 +1234,8 @@ def _symmetric_dep_run(tmp_path, *, accepted="pre", workflow="pr-review",
     """
     cfg = Config.from_dict({"final_review": False})
     run = init_run("symmetric dependency", cfg, base_dir=tmp_path, workflow=workflow)
+    # Only a pr-review run binds a target; a deep-dive run must NOT record one.
+    tbind = {"target_sha256": _load_target(run)} if workflow == "pr-review" else {}
     dag = DAG.from_dict({
         "nodes": [{"id": "auth", "title": "Auth", "description": "d", "files": ["auth.py"],
                    "test_plan": "pytest", "status": "done"}],
@@ -1121,17 +1246,17 @@ def _symmetric_dep_run(tmp_path, *, accepted="pre", workflow="pr-review",
 
     plan_payload = "investigation plan"
     plan_art = artifact_sha256(plan_payload.encode("utf-8"))
+    plan_bind = {"artifact_sha256": plan_art, "dag_sha256": dsha, **tbind}
     run.append("builder_output", gate="plan", round=1, payload=plan_payload,
                artifact_sha256=plan_art)
     run.append("symmetric_verdict", gate="plan", round=1, outcome="CONSENSUS", objections=[],
-               peers=_sym_peers("plan", 1, {"artifact_sha256": plan_art, "dag_sha256": dsha}),
-               artifact_sha256=plan_art, dag_sha256=dsha)
-    run.append("gate_consensus", gate="plan", round=1, artifact_sha256=plan_art, dag_sha256=dsha)
+               peers=_sym_peers("plan", 1, plan_bind), **plan_bind)
+    run.append("gate_consensus", gate="plan", round=1, **plan_bind)
 
     candidate = _sym_candidate(severity=severity)
     cand_text = json.dumps(candidate)
     cand_art = artifact_sha256(cand_text.encode("utf-8"))
-    bindings = {"artifact_sha256": cand_art, "dag_sha256": dsha, "node_sha256": nsha}
+    bindings = {"artifact_sha256": cand_art, "dag_sha256": dsha, "node_sha256": nsha, **tbind}
     run.append("builder_output", gate="dep:auth", round=1, payload=cand_text,
                artifact_sha256=cand_art)
     run.append("symmetric_verdict", gate="dep:auth", round=1, outcome="CONSENSUS",
@@ -1156,6 +1281,7 @@ def _sym_final_run(tmp_path):
     the effective result spans two source gates (``dep:auth`` and ``final``)."""
     cfg = Config.from_dict({"final_review": True})
     run = init_run("symmetric final", cfg, base_dir=tmp_path, workflow="pr-review")
+    _load_target(run)
     dag = DAG.from_dict({
         "nodes": [{"id": "auth", "title": "Auth", "description": "d", "files": ["auth.py"],
                    "test_plan": "pytest", "status": "done"}],
@@ -1164,17 +1290,13 @@ def _sym_final_run(tmp_path):
     run.save_dag(dag.to_dict())
     dsha, nsha = dag_sha256(dag), node_sha256(dag, "auth")
 
-    plan_art = artifact_sha256(b"plan")
-    run.append("builder_output", gate="plan", round=1, payload="plan", artifact_sha256=plan_art)
-    run.append("symmetric_verdict", gate="plan", round=1, outcome="CONSENSUS", objections=[],
-               peers=_sym_peers("plan", 1, {"artifact_sha256": plan_art, "dag_sha256": dsha}),
-               artifact_sha256=plan_art, dag_sha256=dsha)
-    run.append("gate_consensus", gate="plan", round=1, artifact_sha256=plan_art, dag_sha256=dsha)
+    _append_plan_consensus(run, dsha)
 
     candidate = _sym_candidate()
     cand_text = json.dumps(candidate)
     cand_art = artifact_sha256(cand_text.encode("utf-8"))
-    bindings = {"artifact_sha256": cand_art, "dag_sha256": dsha, "node_sha256": nsha}
+    bindings = {"artifact_sha256": cand_art, "dag_sha256": dsha, "node_sha256": nsha,
+                "target_sha256": _TGT}
     run.append("builder_output", gate="dep:auth", round=1, payload=cand_text,
                artifact_sha256=cand_art)
     run.append("symmetric_verdict", gate="dep:auth", round=1, outcome="CONSENSUS", objections=[],
@@ -1188,7 +1310,7 @@ def _sym_final_run(tmp_path):
         "location": "src/auth.py:1", "claim": "Cross-cutting note.", "suggestion": "Consider it."}]}
     final_text = json.dumps(final_payload)
     final_art = artifact_sha256(final_text.encode("utf-8"))
-    fbind = {"artifact_sha256": final_art, "dag_sha256": dsha}
+    fbind = {"artifact_sha256": final_art, "dag_sha256": dsha, "target_sha256": _TGT}
     run.append("builder_output", gate="final", round=1, payload=final_text, artifact_sha256=final_art)
     run.append("symmetric_verdict", gate="final", round=1, outcome="CONSENSUS", objections=[],
                peers=_sym_peers("final", 1, fbind), candidate=final_payload, **fbind)
@@ -1203,6 +1325,7 @@ def _sym_flags_run(tmp_path):
     of accepted findings (result section) from peer objections (gate provenance)."""
     cfg = Config.from_dict({"final_review": False, "on_cap": "proceed_with_flags"})
     run = init_run("symmetric flags", cfg, base_dir=tmp_path, workflow="pr-review")
+    _load_target(run)
     dag = DAG.from_dict({
         "nodes": [{"id": "auth", "title": "Auth", "description": "d", "files": ["auth.py"],
                    "test_plan": "pytest", "status": "done"}],
@@ -1211,17 +1334,13 @@ def _sym_flags_run(tmp_path):
     run.save_dag(dag.to_dict())
     dsha, nsha = dag_sha256(dag), node_sha256(dag, "auth")
 
-    plan_art = artifact_sha256(b"plan")
-    run.append("builder_output", gate="plan", round=1, payload="plan", artifact_sha256=plan_art)
-    run.append("symmetric_verdict", gate="plan", round=1, outcome="CONSENSUS", objections=[],
-               peers=_sym_peers("plan", 1, {"artifact_sha256": plan_art, "dag_sha256": dsha}),
-               artifact_sha256=plan_art, dag_sha256=dsha)
-    run.append("gate_consensus", gate="plan", round=1, artifact_sha256=plan_art, dag_sha256=dsha)
+    _append_plan_consensus(run, dsha)
 
     candidate = _sym_candidate(severity="nit")
     cand_text = json.dumps(candidate)
     cand_art = artifact_sha256(cand_text.encode("utf-8"))
-    bindings = {"artifact_sha256": cand_art, "dag_sha256": dsha, "node_sha256": nsha}
+    bindings = {"artifact_sha256": cand_art, "dag_sha256": dsha, "node_sha256": nsha,
+                "target_sha256": _TGT}
     objections = [{"id": "A:OBJ1", "severity": "blocker", "location": "candidate:F1",
                    "claim": "Peer A disputes the finding set.", "suggestion": "Add the missing case."}]
     run.append("builder_output", gate="dep:auth", round=1, payload=cand_text,
@@ -1415,21 +1534,18 @@ def test_report_symmetric_clean_no_findings_recommends_approve(tmp_path):
     # recommendation line.
     run = init_run("clean approve", Config.from_dict({"final_review": False}),
                    base_dir=tmp_path, workflow="pr-review")
+    _load_target(run)
     dag = DAG.from_dict({"nodes": [{"id": "auth", "title": "Auth", "description": "d",
                                     "files": ["auth.py"], "test_plan": "pytest",
                                     "status": "done"}], "edges": []})
     run.save_dag(dag.to_dict())
     dsha, nsha = dag_sha256(dag), node_sha256(dag, "auth")
-    plan_art = artifact_sha256(b"plan")
-    run.append("builder_output", gate="plan", round=1, payload="plan", artifact_sha256=plan_art)
-    run.append("symmetric_verdict", gate="plan", round=1, outcome="CONSENSUS", objections=[],
-               peers=_sym_peers("plan", 1, {"artifact_sha256": plan_art, "dag_sha256": dsha}),
-               artifact_sha256=plan_art, dag_sha256=dsha)
-    run.append("gate_consensus", gate="plan", round=1, artifact_sha256=plan_art, dag_sha256=dsha)
+    _append_plan_consensus(run, dsha)
     empty = {"summary": "clean", "findings": []}
     cand_text = json.dumps(empty)
     cand_art = artifact_sha256(cand_text.encode("utf-8"))
-    bindings = {"artifact_sha256": cand_art, "dag_sha256": dsha, "node_sha256": nsha}
+    bindings = {"artifact_sha256": cand_art, "dag_sha256": dsha, "node_sha256": nsha,
+                "target_sha256": _TGT}
     run.append("builder_output", gate="dep:auth", round=1, payload=cand_text, artifact_sha256=cand_art)
     run.append("symmetric_verdict", gate="dep:auth", round=1, outcome="CONSENSUS", objections=[],
                peers=_sym_peers("dep:auth", 1, bindings), candidate=empty, **bindings)
@@ -1484,21 +1600,18 @@ def test_report_symmetric_incomplete_missing_final_is_partial_no_recommendation(
     # the explicit "no recommendation until complete" note and derives NO recommendation.
     run = init_run("symmetric missing final", Config.from_dict({"final_review": True}),
                    base_dir=tmp_path, workflow="pr-review")
+    _load_target(run)
     dag = DAG.from_dict({"nodes": [{"id": "auth", "title": "Auth", "description": "d",
                                     "files": ["auth.py"], "test_plan": "pytest",
                                     "status": "done"}], "edges": []})
     run.save_dag(dag.to_dict())
     dsha, nsha = dag_sha256(dag), node_sha256(dag, "auth")
-    plan_art = artifact_sha256(b"plan")
-    run.append("builder_output", gate="plan", round=1, payload="plan", artifact_sha256=plan_art)
-    run.append("symmetric_verdict", gate="plan", round=1, outcome="CONSENSUS", objections=[],
-               peers=_sym_peers("plan", 1, {"artifact_sha256": plan_art, "dag_sha256": dsha}),
-               artifact_sha256=plan_art, dag_sha256=dsha)
-    run.append("gate_consensus", gate="plan", round=1, artifact_sha256=plan_art, dag_sha256=dsha)
+    _append_plan_consensus(run, dsha)
     candidate = _sym_candidate()
     cand_text = json.dumps(candidate)
     cand_art = artifact_sha256(cand_text.encode("utf-8"))
-    bindings = {"artifact_sha256": cand_art, "dag_sha256": dsha, "node_sha256": nsha}
+    bindings = {"artifact_sha256": cand_art, "dag_sha256": dsha, "node_sha256": nsha,
+                "target_sha256": _TGT}
     run.append("builder_output", gate="dep:auth", round=1, payload=cand_text, artifact_sha256=cand_art)
     run.append("symmetric_verdict", gate="dep:auth", round=1, outcome="CONSENSUS", objections=[],
                peers=_sym_peers("dep:auth", 1, bindings), candidate=candidate, **bindings)
@@ -1519,21 +1632,18 @@ def test_report_symmetric_capped_gate_has_no_recommendation(tmp_path):
     # which fails such a run closed).
     run = init_run("symmetric capped", Config.from_dict({"final_review": False}),
                    base_dir=tmp_path, workflow="pr-review")
+    _load_target(run)
     dag = DAG.from_dict({"nodes": [{"id": "auth", "title": "Auth", "description": "d",
                                     "files": ["auth.py"], "test_plan": "pytest",
                                     "status": "in_review"}], "edges": []})
     run.save_dag(dag.to_dict())
     dsha, nsha = dag_sha256(dag), node_sha256(dag, "auth")
-    plan_art = artifact_sha256(b"plan")
-    run.append("builder_output", gate="plan", round=1, payload="plan", artifact_sha256=plan_art)
-    run.append("symmetric_verdict", gate="plan", round=1, outcome="CONSENSUS", objections=[],
-               peers=_sym_peers("plan", 1, {"artifact_sha256": plan_art, "dag_sha256": dsha}),
-               artifact_sha256=plan_art, dag_sha256=dsha)
-    run.append("gate_consensus", gate="plan", round=1, artifact_sha256=plan_art, dag_sha256=dsha)
+    _append_plan_consensus(run, dsha)
     candidate = _sym_candidate()
     cand_text = json.dumps(candidate)
     cand_art = artifact_sha256(cand_text.encode("utf-8"))
-    bindings = {"artifact_sha256": cand_art, "dag_sha256": dsha, "node_sha256": nsha}
+    bindings = {"artifact_sha256": cand_art, "dag_sha256": dsha, "node_sha256": nsha,
+                "target_sha256": _TGT}
     objections = [{"id": "A:OBJ1", "severity": "blocker", "location": "candidate:F1",
                    "claim": "Peer A disputes the finding set.", "suggestion": "Add the missing case."}]
     run.append("builder_output", gate="dep:auth", round=1, payload=cand_text, artifact_sha256=cand_art)
@@ -1565,4 +1675,315 @@ def test_report_symmetric_malformed_accepted_history_is_invalid_no_result(tmp_pa
     assert "INVALID" in md
     assert "CLEAN" not in md
     assert "**Review recommendation:**" not in md
+    assert "## Review result" not in md
+
+
+# --- Task 2: the report renders the immutable review target identity -----------------------------
+
+def _load_target_manifest(run, manifest):
+    """Append a target_loaded event for an arbitrary target manifest; return its hash."""
+    target = ReviewTarget.from_dict(manifest)
+    sha = target_sha256(target)
+    run.append("target_loaded", target=target.to_dict(), target_sha256=sha)
+    return sha
+
+
+_GITHUB_TARGET = {
+    "version": 1, "kind": "github-pr", "revision_bound": True, "repository": "base/repo",
+    "pr_number": 7, "url": "https://github.com/base/repo/pull/7",
+    "base": {"repository": "base/repo", "ref": "main", "sha": "1" * 40},
+    "head": {"repository": "fork/repo", "ref": "feature", "sha": "2" * 40},
+    "merge_base_sha": "3" * 40,
+    "is_cross_repository": True, "diff_sha256": "a" * 64, "changed_files": ["src/a.py"],
+    "intent": {"title": "Fix A", "body": "Details"},
+}
+_LOCAL_TARGET = {
+    "version": 1, "kind": "local-range", "revision_bound": True,
+    "repository": "https://github.com/owner/repo.git",
+    "base": {"ref": "main", "sha": "1" * 40}, "head": {"ref": "feature", "sha": "2" * 40},
+    "merge_base_sha": "3" * 40, "diff_sha256": "b" * 64, "changed_files": ["src/a.py"],
+    "intent": {"title": "Local range review", "body": "..."},
+}
+_DIFF_TARGET = {
+    "version": 1, "kind": "diff-file", "revision_bound": False, "repository": None,
+    "diff_sha256": "c" * 64, "changed_files": ["src/a.py"],
+    "intent": {"title": "Patch review", "body": "..."},
+}
+
+
+def _pr_review_with_target(tmp_path, manifest):
+    """A pr-review run whose only recorded work is the loaded target (enough to render the section)."""
+    run = init_run("target report", Config.from_dict({"final_review": False}),
+                   base_dir=tmp_path, workflow="pr-review")
+    sha = _load_target_manifest(run, manifest)
+    return run, sha
+
+
+def test_report_renders_github_target_identity(tmp_path):
+    run, sha = _pr_review_with_target(tmp_path, _GITHUB_TARGET)
+    md = render_markdown(run)
+    target = _section(md, "Review target")
+    assert "base/repo#7" in target
+    assert "1" * 40 in target
+    assert "fork/repo" in target
+    assert "2" * 40 in target
+    assert "3" * 40 in target  # the recorded PR merge base (fork point) is rendered
+    assert "Merge base" in target
+    assert "cross-repository" in target
+    assert sha in target  # the authoritative target hash is rendered
+
+
+def test_report_renders_snapshot_derived_changed_files(tmp_path):
+    # Round-2 F1: the report surfaces the snapshot-DERIVED changed-files list verbatim — including a
+    # rename's old+new pair (which GitHub's rename-detected `files` view would collapse to a single
+    # path). The report never re-derives or filters the list against any external file view.
+    manifest = dict(_GITHUB_TARGET, changed_files=["src/new.py", "src/old.py"], diff_sha256="d" * 64)
+    run, _ = _pr_review_with_target(tmp_path, manifest)
+    target = _section(render_markdown(run), "Review target")
+    assert "Changed files (2)" in target
+    assert "src/new.py" in target and "src/old.py" in target
+
+
+def test_report_renders_local_range_target(tmp_path):
+    run, _ = _pr_review_with_target(tmp_path, _LOCAL_TARGET)
+    target = _section(render_markdown(run), "Review target")
+    assert "owner/repo" in target
+    assert "1" * 40 in target and "2" * 40 in target
+    assert "3" * 40 in target  # merge base
+
+
+def test_report_diff_file_states_revision_unbound(tmp_path):
+    run, _ = _pr_review_with_target(tmp_path, _DIFF_TARGET)
+    assert "Revision:** unbound (patch identity only)" in render_markdown(run)
+
+
+def test_report_review_target_section_precedes_summary(tmp_path):
+    run, _ = _pr_review_with_target(tmp_path, _DIFF_TARGET)
+    md = render_markdown(run)
+    assert "## Review target" in md and "## Summary" in md
+    assert md.index("## Review target") < md.index("## Summary")
+
+
+def test_report_target_section_sanitizes_untrusted_fields(tmp_path):
+    manifest = dict(_DIFF_TARGET)
+    manifest["intent"] = {"title": "pwn <img src=x onerror=alert(1)>", "body": "b | c"}
+    manifest["changed_files"] = ["src/<script>.py"]
+    run, _ = _pr_review_with_target(tmp_path, manifest)
+    target = _section(render_markdown(run), "Review target")
+    assert "<img" not in target and "<script>" not in target
+    assert "&lt;img" in target or "&lt;script&gt;" in target
+
+
+def test_report_no_target_section_before_load(tmp_path):
+    # An init-only pr-review run has no target yet: no target section, and the Summary is IN PROGRESS.
+    run = init_run("no target", Config.from_dict({"final_review": False}),
+                   base_dir=tmp_path, workflow="pr-review")
+    md = render_markdown(run)
+    assert "## Review target" not in md
+    assert "**Status:** IN PROGRESS" in md
+
+
+def test_report_downstream_work_without_target_is_invalid(tmp_path):
+    # pr-review protocol work with no loaded target is INVALID and renders no target section.
+    run = init_run("no target work", Config.from_dict({"final_review": False}),
+                   base_dir=tmp_path, workflow="pr-review")
+    dag = DAG.from_dict({"nodes": [{"id": "auth", "title": "Auth", "description": "d",
+                                    "files": ["auth.py"], "test_plan": "pytest",
+                                    "status": "pending"}], "edges": []})
+    run.save_dag(dag.to_dict())
+    run.append("builder_output", gate="plan", round=1, payload="plan",
+               artifact_sha256=artifact_sha256(b"plan"))
+    run.append("gate_consensus", gate="plan", round=1,
+               artifact_sha256=artifact_sha256(b"plan"), dag_sha256=dag_sha256(dag))
+    md = render_markdown(run)
+    assert "## Review target" not in md
+    assert "**Status:** INVALID" in md
+
+
+def test_report_no_target_section_for_build(tmp_path):
+    run = _build_run(tmp_path)
+    assert "## Review target" not in render_markdown(run)
+
+
+def test_report_no_target_section_for_deep_dive(tmp_path):
+    run = _symmetric_dep_run(tmp_path, accepted="pre", workflow="deep-dive")
+    assert "## Review target" not in render_markdown(run)
+
+
+def test_report_renders_source_snapshot_when_materialized(tmp_path):
+    run, sha = _pr_review_with_target(tmp_path, _LOCAL_TARGET)
+    run.append("source_materialized", kind="local-range", target_sha256=sha,
+               archive_sha256="d" * 64)
+    target = _section(render_markdown(run), "Review target")
+    assert "materialized" in target.lower()
+
+
+def test_report_ignores_source_snapshot_bound_to_other_target(tmp_path):
+    # A source_materialized whose target hash does not match the loaded target is not a valid snapshot
+    # of THIS target, so its status is not rendered as if it were.
+    run, sha = _pr_review_with_target(tmp_path, _LOCAL_TARGET)
+    run.append("source_materialized", kind="local-range", target_sha256="9" * 64,
+               archive_sha256="d" * 64)
+    target = _section(render_markdown(run), "Review target")
+    assert "materialized" not in target.lower()
+
+
+def test_report_ignores_forged_diff_file_source(tmp_path):
+    # A diff-file target is revision-unbound: it never has a source snapshot. A forged
+    # source_materialized bound to it (even with the correct target hash) never renders and the run
+    # is INVALID.
+    run, sha = _pr_review_with_target(tmp_path, _DIFF_TARGET)
+    run.append("source_materialized", kind="diff-file", target_sha256=sha, archive_sha256="d" * 64)
+    md = render_markdown(run)
+    assert "materialized" not in _section(md, "Review target").lower()
+    assert "**Status:** INVALID" in md
+
+
+def test_report_ignores_duplicate_source_materialization(tmp_path):
+    run, sha = _pr_review_with_target(tmp_path, _LOCAL_TARGET)
+    run.append("source_materialized", kind="local-range", target_sha256=sha, archive_sha256="d" * 64)
+    run.append("source_materialized", kind="local-range", target_sha256=sha, archive_sha256="e" * 64)
+    md = render_markdown(run)
+    assert "materialized" not in _section(md, "Review target").lower()
+    assert "**Status:** INVALID" in md
+
+
+def test_report_ignores_malformed_archive_source(tmp_path):
+    run, sha = _pr_review_with_target(tmp_path, _LOCAL_TARGET)
+    run.append("source_materialized", kind="local-range", target_sha256=sha,
+               archive_sha256="NOT-A-HEX-DIGEST")
+    md = render_markdown(run)
+    assert "materialized" not in _section(md, "Review target").lower()
+    assert "**Status:** INVALID" in md
+
+
+def test_report_ignores_wrong_kind_source(tmp_path):
+    run, sha = _pr_review_with_target(tmp_path, _LOCAL_TARGET)
+    run.append("source_materialized", kind="github-pr", target_sha256=sha, archive_sha256="d" * 64)
+    md = render_markdown(run)
+    assert "materialized" not in _section(md, "Review target").lower()
+    assert "**Status:** INVALID" in md
+
+
+def test_report_ignores_out_of_order_source(tmp_path):
+    # A source_materialized recorded AFTER DAG/PLAN work is out of order: no snapshot, INVALID.
+    run, sha = _pr_review_with_target(tmp_path, _LOCAL_TARGET)
+    dag = DAG.from_dict({"nodes": [{"id": "a", "title": "A", "description": "d",
+                                    "files": ["a.py"], "test_plan": "pytest",
+                                    "status": "pending"}], "edges": []})
+    run.save_dag(dag.to_dict())
+    run.append("dag_loaded", gate="plan", nodes=1)
+    run.append("source_materialized", kind="local-range", target_sha256=sha, archive_sha256="d" * 64)
+    md = render_markdown(run)
+    assert "materialized" not in _section(md, "Review target").lower()
+    assert "**Status:** INVALID" in md
+
+
+# --- Task 2 (round-2 finding): the absent-DAG report validates general target-event state ----------
+#
+# A schema-v2 pr-review report with NO dag.json present (nothing to certify yet) still fails closed on
+# an INVALID target-event history: a duplicate, malformed/hash-mismatched, or late ``target_loaded``,
+# or pr-review protocol work recorded with no target, renders INVALID rather than being masked as
+# merely IN PROGRESS. This reuses the central ``crucible.target.target_event_issues`` validator — the
+# same one the DAG-present path already applies via ``workflow_issues`` — so both paths agree, and it
+# layers cleanly with the existing source-materialization fail-closed check (source issues once, no
+# duplicate messages). An init-only run (no target yet) and a single valid target stay IN PROGRESS.
+
+def _absent_dag_pr_review(tmp_path, name="absent dag"):
+    """An init-only pr-review run with NO dag.json saved (the absent-tree report path)."""
+    return init_run(name, Config.from_dict({"final_review": False}),
+                    base_dir=tmp_path, workflow="pr-review")
+
+
+def test_report_absent_dag_init_only_no_target_is_in_progress(tmp_path):
+    # No target, no work, no tree: nothing to certify yet -> IN PROGRESS, and no target section.
+    md = render_markdown(_absent_dag_pr_review(tmp_path))
+    assert "**Status:** IN PROGRESS" in md
+    assert "## Review target" not in md
+    assert "**Status:** INVALID" not in md
+
+
+def test_report_absent_dag_single_valid_target_is_in_progress_with_section(tmp_path):
+    # A single valid loaded target with no tree yet stays IN PROGRESS but may render its identity.
+    run, sha = _pr_review_with_target(tmp_path, _LOCAL_TARGET)
+    md = render_markdown(run)
+    assert "**Status:** IN PROGRESS" in md
+    assert "## Review target" in md
+    assert sha in _section(md, "Review target")
+
+
+def test_report_absent_dag_duplicate_target_is_invalid(tmp_path):
+    # Two target_loaded events with no tree: INVALID (a target is immutable; load exactly one). No
+    # success-shaped target or result section is fabricated.
+    run = _absent_dag_pr_review(tmp_path)
+    _load_target_manifest(run, _LOCAL_TARGET)
+    _load_target_manifest(run, _LOCAL_TARGET)
+    md = render_markdown(run)
+    assert "**Status:** INVALID" in md
+    assert "## Review target" not in md
+    assert "## Review result" not in md
+    assert "multiple target_loaded events" in _section(md, "Summary")
+
+
+def test_report_absent_dag_hash_mismatched_target_is_invalid(tmp_path):
+    # A target_loaded whose recorded target_sha256 disagrees with its payload is malformed -> INVALID,
+    # even with no tree present.
+    run = _absent_dag_pr_review(tmp_path)
+    run.append("target_loaded", target=ReviewTarget.from_dict(_LOCAL_TARGET).to_dict(),
+               target_sha256="9" * 64)
+    md = render_markdown(run)
+    assert "**Status:** INVALID" in md
+    assert "## Review target" not in md
+    assert "## Review result" not in md
+    assert "malformed target_loaded event" in _section(md, "Summary")
+
+
+def test_report_absent_dag_protocol_work_without_target_is_invalid(tmp_path):
+    # pr-review protocol work (a builder output) recorded with no loaded target and no tree -> INVALID.
+    run = _absent_dag_pr_review(tmp_path)
+    run.append("builder_output", gate="plan", round=1, payload="plan",
+               artifact_sha256=artifact_sha256(b"plan"))
+    md = render_markdown(run)
+    assert "**Status:** INVALID" in md
+    assert "## Review target" not in md
+    assert "## Review result" not in md
+    assert "without a loaded target" in _section(md, "Summary")
+
+
+def test_report_absent_dag_late_target_after_protocol_is_invalid(tmp_path):
+    # A target loaded AFTER protocol work began is late -> INVALID even without a tree.
+    run = _absent_dag_pr_review(tmp_path)
+    run.append("builder_output", gate="plan", round=1, payload="plan",
+               artifact_sha256=artifact_sha256(b"plan"))
+    _load_target_manifest(run, _LOCAL_TARGET)
+    md = render_markdown(run)
+    assert "**Status:** INVALID" in md
+    assert "target loaded after" in _section(md, "Summary")
+
+
+def test_report_absent_dag_source_issue_reported_once(tmp_path):
+    # A forged source snapshot on a valid revision-unbound diff-file target renders INVALID with the
+    # single source issue listed exactly ONCE — the added target-event layer must not duplicate the
+    # centrally-reported source-materialization message.
+    run, sha = _pr_review_with_target(tmp_path, _DIFF_TARGET)
+    run.append("source_materialized", kind="diff-file", target_sha256=sha, archive_sha256="d" * 64)
+    md = render_markdown(run)
+    assert "**Status:** INVALID" in md
+    assert _section(md, "Summary").count("revision-unbound diff-file target") == 1
+
+
+def test_report_absent_dag_corrupt_workflow_metadata_is_invalid(tmp_path):
+    # Corrupt workflow metadata still fails closed on the absent-tree path (handled BEFORE the target
+    # checks), rendering INVALID with a workflow-metadata issue — never a target message, never a crash.
+    run = _absent_dag_pr_review(tmp_path)
+    _load_target_manifest(run, _LOCAL_TARGET)
+
+    def mutate(records):
+        for r in records:
+            if r.get("event") == "run_start":
+                r["workflow"] = "bogus"
+    _rewrite_run_events(run, mutate)
+    md = render_markdown(run)  # must not raise
+    assert "**Status:** INVALID" in md
+    assert "workflow" in md.lower()
     assert "## Review result" not in md

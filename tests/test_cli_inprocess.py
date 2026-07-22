@@ -2,6 +2,7 @@
 subprocess, which leaves cli.py at 0% in-process coverage). These exercise ``main`` and the
 small private helpers so a regression in a ``cmd_*`` error branch is caught fast, in-process."""
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -360,6 +361,22 @@ def _peer(tmp_path, slot, gate, round_index, binding, name, verdict="APPROVE", o
     })
 
 
+def _load_diff_target_inprocess(run, tmp_path):
+    """Load a minimal valid revision-unbound diff-file target through the REAL CLI so a pr-review
+    run satisfies the Task 1 loaded-target guard — no monkeypatching of the guard. Uses
+    ``normalize-target diff`` + ``load-target`` (the actual user path); the guard only needs a valid
+    loaded target, not a particular kind."""
+    diff = Path(tmp_path) / "target.in.diff"
+    diff.write_bytes(b"diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-o\n+n\n")
+    intent = _write(tmp_path, "target.intent.json", {"title": "t", "body": "b"})
+    manifest = Path(tmp_path) / "target.json"
+    diff_out = Path(tmp_path) / "target.diff"
+    assert main(["normalize-target", "diff", "--diff", str(diff), "--intent", intent,
+                 "--output", str(manifest), "--diff-output", str(diff_out)]) == 0
+    assert main(["load-target", "--run", run, "--file", str(manifest),
+                 "--diff", str(diff_out)]) == 0
+
+
 def test_verdict_rejects_symmetric_run_inprocess(tmp_path):
     run = _init_workflow(tmp_path, "deep-dive")
     vfile = _write(tmp_path, "v.json", {"gate": "plan", "round": 1, "verdict": "APPROVE",
@@ -377,8 +394,54 @@ def test_symmetric_verdict_rejects_build_inprocess(tmp_path):
               "--peer-a", a, "--peer-b", b])
 
 
+def test_load_target_rejects_credentialed_repository_inprocess(tmp_path, capsys):
+    run = _init_workflow(tmp_path, "pr-review")
+    diff = Path(tmp_path) / "t.diff"
+    diff.write_bytes(b"patch-body")
+    manifest = _write(tmp_path, "t.json", {
+        "version": 1, "kind": "local-range", "revision_bound": True,
+        "repository": "https://user:pass@github.com/owner/repo.git",
+        "base": {"ref": "main", "sha": "1" * 40},
+        "head": {"ref": "feature", "sha": "2" * 40},
+        "merge_base_sha": "3" * 40,
+        "diff_sha256": hashlib.sha256(b"patch-body").hexdigest(),
+        "changed_files": ["src/a.py"],
+        "intent": {"title": "t", "body": "b"},
+    })
+    rc = main(["load-target", "--run", run, "--file", manifest, "--diff", str(diff)])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "repository" in err
+    assert not any(e["event"] == "target_loaded" for e in RunLog(run).read_events())
+
+
+def test_load_target_rejects_file_url_repository_inprocess(tmp_path, capsys):
+    run = _init_workflow(tmp_path, "pr-review")
+    diff = Path(tmp_path) / "t.diff"
+    diff.write_bytes(b"patch-body")
+    manifest = _write(tmp_path, "t.json", {
+        "version": 1, "kind": "local-range", "revision_bound": True,
+        "repository": "file://localhost/Users/foo/checkout",
+        "base": {"ref": "main", "sha": "1" * 40},
+        "head": {"ref": "feature", "sha": "2" * 40},
+        "merge_base_sha": "3" * 40,
+        "diff_sha256": hashlib.sha256(b"patch-body").hexdigest(),
+        "changed_files": ["src/a.py"],
+        "intent": {"title": "t", "body": "b"},
+    })
+    rc = main(["load-target", "--run", run, "--file", manifest, "--diff", str(diff)])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "repository" in err
+    assert not any(e["event"] == "target_loaded" for e in RunLog(run).read_events())
+
+
 def test_symmetric_verdict_plan_consensus_inprocess(tmp_path, capsys):
     run = _init_workflow(tmp_path, "pr-review")
+    # A pr-review command is guarded by the Task 1 loaded-target guard; load a minimal valid
+    # diff-file target through the REAL CLI first (no monkeypatching of the guard), before any
+    # DAG/PLAN event so load-target's "target must precede protocol work" ordering rule holds.
+    _load_diff_target_inprocess(run, tmp_path)
     r = RunLog(run)
     r.save_dag(DAG.from_dict({"nodes": [{"id": "a", "title": "A", "description": "",
                "files": [], "test_plan": "", "status": "pending"}], "edges": []}).to_dict())

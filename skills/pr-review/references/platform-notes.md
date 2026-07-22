@@ -15,22 +15,136 @@ model/effort. It **does not cryptographically prove** that two distinct model *p
 files — runtime peer independence is a platform/orchestrator property (dispatch Peer B as a real
 separate subagent) and must not be overclaimed.
 
-## Input normalization (do this once, before the PLAN gate)
+## Input normalization (do this once, right after `init-run`, before the PLAN gate)
 
-Resolve the review target into one triple — `diff`, `changed-files`, `intent` — so the rest of the
-flow is source-agnostic:
+Resolve the review target to a deterministic **manifest + exact patch** through the CLI, load it as
+the run's one immutable `target_loaded` event, and — for a revision-bound GitHub/local target —
+materialize a **pinned, read-only source snapshot** of the exact head commit. Branch names are display
+metadata; the base/head commit **OIDs** and repository identities are authoritative. A target is
+immutable — correcting it needs a **fresh run**.
 
-- **GitHub PR** (`--goal` names a PR number/URL): `gh pr view <n> --json title,body,files,headRefName,baseRefName`
-  for the changed files + **stated intent** (title/body), and `gh pr diff <n>` for the diff. Both
-  peers may also read the PR's linked issues for intent.
-- **Local diff** (`--goal` names a `base..head` range or a diff file):
-  - a **range** → `git diff <range>` for the diff and `git diff --name-only <range>` for the changed
-    files; intent from `git log <range>` (commit messages) and/or user-supplied text.
-  - a **diff file** → read the file itself as the diff and derive the changed files from its patch
-    headers (`git apply --numstat -- <file>`, or the `+++`/`---` lines); intent from user-supplied text.
+**GitHub PR** (`--goal` names a PR number/URL). Read the metadata **before and after** fetching the
+compare metadata and the **merge-base/head snapshots**, and fail **closed** without relying on a global
+`set -e`: error-check the first metadata read, the base/head repository+OID parses, the exact-OID
+`compare` fetch, the `merge_base_commit.sha` parse, **both** codeload archive fetches (merge-base +
+head), and the second metadata read, and run `normalize-target` **only after all of them succeed**. The
+immutable patch is **derived** PR-style from the **merge-base** snapshot — base
+`repository@merge_base_commit.sha` (the fork point the base repo's exact-OID
+`compare/<baseRefOid>...<headRefOid>` endpoint reports) — and the head snapshot — head
+`repository@headRefOid` — **never** from a server-recomputed PR diff or any caller-supplied patch, so the
+target is a pure function of the pinned merge-base/head OIDs and a base-only commit made on the base
+branch **after** the fork point can never appear as a reverse change (and the ABA race is eliminated).
+The recorded `changed_files` set is derived **solely** from this snapshot patch; GitHub's own `files`
+view (PR metadata + compare) is informational — it paginates/truncates on large PRs and applies rename
+detection (a rename shows as one new path where the historyless snapshot diff yields the old+new pair),
+so it is **never** required to equal the derived set and is **not** part of the immutable identity.
+Cross-fork exact head OIDs are supported by the compare endpoint — use the OIDs, never branch names. Any
+failure — a non-zero `gh`/parse, a malformed/mismatched compare payload (its `base_commit.sha` must equal
+`baseRefOid`), or a metadata drift between the two reads (an identity field moved) — discards **every**
+partial before/after/compare/merge-base/head/target artifact and retries (≤3 attempts, halting clearly on
+exhaustion). The stable before/after title/body supplies the intent directly, and the fetched **head**
+archive is reused for materialization (never re-fetched):
 
-Give **both** peers the same normalized triple, and have both read the surrounding real code (the full
-changed files and their callers/callees), not just the patch hunks.
+```bash
+GH_JSON=number,url,title,body,files,baseRefName,baseRefOid,headRefName,headRefOid,headRepository,headRepositoryOwner,isCrossRepository
+for ATTEMPT in 1 2 3; do
+  ok=1
+  gh pr view "$PR" --json "$GH_JSON" > "$RUN"/pr-before.json || ok=0
+  BASE_REPOSITORY=; BASE_OID=; HEAD_REPOSITORY=; HEAD_OID=; MERGE_BASE_OID=
+  [ "$ok" = 1 ] && { BASE_REPOSITORY=$(python3 -c 'import json,sys,urllib.parse as u; print("/".join(u.urlsplit(json.load(open(sys.argv[1]))["url"]).path.strip("/").split("/")[:2]))' "$RUN"/pr-before.json) || ok=0; }
+  [ "$ok" = 1 ] && { BASE_OID=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["baseRefOid"])' "$RUN"/pr-before.json) || ok=0; }
+  [ "$ok" = 1 ] && { HEAD_REPOSITORY=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["headRepository"]["nameWithOwner"])' "$RUN"/pr-before.json) || ok=0; }
+  [ "$ok" = 1 ] && { HEAD_OID=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["headRefOid"])' "$RUN"/pr-before.json) || ok=0; }
+  [ "$ok" = 1 ] && { test -n "$BASE_REPOSITORY" && test -n "$BASE_OID" && test -n "$HEAD_REPOSITORY" && test -n "$HEAD_OID" || ok=0; }
+  [ "$ok" = 1 ] && { gh api "repos/$BASE_REPOSITORY/compare/$BASE_OID...$HEAD_OID" > "$RUN"/compare.json || ok=0; }
+  [ "$ok" = 1 ] && { MERGE_BASE_OID=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["merge_base_commit"]["sha"])' "$RUN"/compare.json) || ok=0; }
+  [ "$ok" = 1 ] && { test -n "$MERGE_BASE_OID" || ok=0; }
+  [ "$ok" = 1 ] && { gh api "repos/$BASE_REPOSITORY/tarball/$MERGE_BASE_OID" > "$RUN"/merge-base.tar.gz || ok=0; }
+  [ "$ok" = 1 ] && { gh api "repos/$HEAD_REPOSITORY/tarball/$HEAD_OID" > "$RUN"/head.tar.gz || ok=0; }
+  [ "$ok" = 1 ] && { gh pr view "$PR" --json "$GH_JSON" > "$RUN"/pr-after.json || ok=0; }
+  if [ "$ok" = 1 ] && PYTHONPATH=scripts python3 -m crucible normalize-target github --metadata-before "$RUN"/pr-before.json --metadata-after "$RUN"/pr-after.json --compare-metadata "$RUN"/compare.json --merge-base-archive "$RUN"/merge-base.tar.gz --head-archive "$RUN"/head.tar.gz --output "$RUN"/target.json --diff-output "$RUN"/target.diff; then
+    break
+  fi
+  rm -f "$RUN"/pr-before.json "$RUN"/pr-after.json "$RUN"/compare.json "$RUN"/merge-base.tar.gz "$RUN"/head.tar.gz "$RUN"/target.json "$RUN"/target.diff
+  [ "$ATTEMPT" -lt 3 ] || { echo "pr-review: GitHub target acquisition failed after 3 attempts" >&2; exit 1; }
+done
+```
+
+**Local range** (`--goal` names a `BASE..HEAD` range). Use the single merge-base `--range` — never a
+raw two-dot tip diff, and **no separate base/head flags** (`BASE..HEAD` and `BASE...HEAD` both
+normalize to `merge_base..head`, so a base-only commit never appears as a reverse change):
+`PYTHONPATH=scripts python3 -m crucible normalize-target local --repo "$REPO" --range BASE..HEAD --intent "$RUN"/intent.json --output "$RUN"/target.json --diff-output "$RUN"/target.diff`.
+
+**Diff file** (`--goal` names a patch): `PYTHONPATH=scripts python3 -m crucible normalize-target diff --diff "$PATCH" --intent "$RUN"/intent.json --output "$RUN"/target.json --diff-output "$RUN"/target.diff`. A diff-file target is `revision_bound: false`, has **no source snapshot**, and never borrows ambient checkout files.
+
+Then load the target (before any `load-dag`/PLAN/review event) and emit the authoritative loaded
+manifest; the head repository/SHA for the snapshot come **only** from that `show-target` payload,
+never an ambient archive variable:
+
+```bash
+PYTHONPATH=scripts python3 -m crucible load-target --run "$RUN" --file "$RUN"/target.json --diff "$RUN"/target.diff
+PYTHONPATH=scripts python3 -m crucible show-target --run "$RUN" > "$RUN"/loaded-target.json
+```
+
+Then materialize the pinned snapshot of the **exact head commit** on the path that matches the target
+kind. Materialization **fails closed and is non-fatal**: `SOURCE_AVAILABLE` defaults to `no`,
+`materialize-target` is explicitly checked, any failure leaves `SOURCE_AVAILABLE=no` (never relying on
+a global `set -e`), and only a clean materialize sets `SOURCE_AVAILABLE=yes`. **GitHub PR** — **reuse
+the exact `head.tar.gz` codeload archive already fetched during acquisition** (the head
+`repository@headRefOid` snapshot the patch was derived from); never re-fetch a fresh tarball (a re-fetch
+could observe a moved head). Require the reused archive is present and non-empty, then materialize it:
+
+```bash
+SOURCE_AVAILABLE=no
+if test -s "$RUN"/head.tar.gz \
+  && PYTHONPATH=scripts python3 -m crucible materialize-target --run "$RUN" --archive "$RUN"/head.tar.gz
+then
+  SOURCE_AVAILABLE=yes
+fi
+```
+
+**Local range** — parse the recorded repository identity + head SHA, then gate the archive on **one**
+explicit compound `if`: the parses are non-empty, `$LOCAL_REPO` is a directory whose `repository-identity`
+**equals** the recorded identity, and its `git rev-parse HEAD` **equals** the recorded head SHA — every
+check `&&`-joined so a mismatch **short-circuits past** the archive (the snippets don't rely on a global
+`set -e`). Only then does an explicit `git -C "$LOCAL_REPO" archive` run (never ambient git; never
+`rev-parse`/archive in an unrelated repo when `$LOCAL_REPO` is missing), materializing exactly that
+uncompressed `source.tar`; any parse/identity/head/archive failure removes `source.tar`, keeps
+`SOURCE_AVAILABLE=no`, and never invokes materialize:
+
+```bash
+RECORDED_REPOSITORY_IDENTITY=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["repository"])' "$RUN"/loaded-target.json)
+HEAD_SHA=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["head"]["sha"])' "$RUN"/loaded-target.json)
+OBSERVED_REPOSITORY=
+if test -n "$RECORDED_REPOSITORY_IDENTITY" && test -n "$HEAD_SHA" && test -d "$LOCAL_REPO"
+then
+  OBSERVED_REPOSITORY=$(PYTHONPATH=scripts python3 -m crucible repository-identity --repo "$LOCAL_REPO")
+fi
+rm -f "$RUN"/source.tar
+SOURCE_AVAILABLE=no
+if test -n "$RECORDED_REPOSITORY_IDENTITY" && test -n "$HEAD_SHA" && test -d "$LOCAL_REPO" \
+  && test "$OBSERVED_REPOSITORY" = "$RECORDED_REPOSITORY_IDENTITY" \
+  && test "$(git -C "$LOCAL_REPO" rev-parse HEAD)" = "$HEAD_SHA" \
+  && git -C "$LOCAL_REPO" archive --format=tar --output "$RUN"/source.tar "$HEAD_SHA"
+then
+  if PYTHONPATH=scripts python3 -m crucible materialize-target --run "$RUN" --archive "$RUN"/source.tar
+  then
+    SOURCE_AVAILABLE=yes
+  else
+    rm -f "$RUN"/source.tar
+  fi
+else
+  rm -f "$RUN"/source.tar
+fi
+```
+
+A **diff-file** target sets `SOURCE_AVAILABLE=no` and never archives or materializes. Hand **both** peers
+the same `RUN/target.diff`, the pinned `RUN/source` snapshot, and the identical `SOURCE_AVAILABLE`
+status — **never ambient** checkout files (a different revision, or missing files the change introduces).
+Whenever `SOURCE_AVAILABLE=no` — a failed/truncated/stale fetch, a rejected archive, or a diff-file
+target — the review continues **patch-only** with source context explicitly unavailable: never pre-create
+or read a partial `RUN/source`, never fall back to ambient source, and treat any runtime-verified claim
+as **unverified** (patch-only findings only).
 
 ## Binding handshake (every gate)
 
@@ -42,8 +156,9 @@ BINDINGS=$(PYTHONPATH=scripts python3 -m crucible bindings --run "$RUN" --gate "
 ```
 
 - **Trusted CLI metadata, not artifact content.** `$BINDINGS` is the exact `crucible bindings` JSON —
-  `artifact_sha256` plus the gate-specific `dag_sha256`/`node_sha256`. Append it to Peer B's seed as
-  **trusted CLI metadata**; it is **not content copied from the reviewed (untrusted) artifact**.
+  `artifact_sha256` plus the gate-specific `dag_sha256`/`node_sha256`, and — for pr-review — the
+  immutable `target_sha256` on **every** gate. Append it to Peer B's seed as **trusted CLI metadata**;
+  it is **not content copied from the reviewed (untrusted) artifact**.
 - **Each peer attestation echoes it.** Both `peer-a.json` and `peer-b.json` copy those `*_sha256`
   fields verbatim. `crucible symmetric-verdict` **rejects a missing or mismatched value** in either
   peer file **before** recording any decision, so a substituted/edited artifact can never be certified.
@@ -97,6 +212,41 @@ consent channel used for posting), not an inferred yes:
   without execution, or cancel the review. Only an explicit affirmation and an exact-command match set
   `LOCAL_EXECUTION_APPROVED: yes`; seed **both peers** with that identical value and command list.
 
+Before showing any command for the **trusted local checkout/range**, prove the checkout is the exact
+recorded head revision with **one explicit compound gate** — never bare `test`s that a missing global
+`set -e` would ignore. Read `.repository` / `.head.sha` from `show-target` (the local protocol records
+identity via `normalize-target local --range`), compute `OBSERVED_REPOSITORY` only under a valid
+`$LOCAL_REPO` guard, then `&&`-join every check in one `if` so any failure **short-circuits past**
+consent/execution, and set `CHECKOUT_VERIFIED=yes` **only** when all pass:
+
+```bash
+PYTHONPATH=scripts python3 -m crucible show-target --run "$RUN" > "$RUN"/loaded-target.json
+RECORDED_REPOSITORY_IDENTITY=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["repository"])' "$RUN"/loaded-target.json)
+RECORDED_HEAD_SHA=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["head"]["sha"])' "$RUN"/loaded-target.json)
+OBSERVED_REPOSITORY=
+if test -n "$RECORDED_REPOSITORY_IDENTITY" && test -n "$RECORDED_HEAD_SHA" && test -d "$LOCAL_REPO"
+then
+  OBSERVED_REPOSITORY=$(PYTHONPATH=scripts python3 -m crucible repository-identity --repo "$LOCAL_REPO")
+fi
+CHECKOUT_VERIFIED=no
+if test -n "$RECORDED_REPOSITORY_IDENTITY" && test -n "$RECORDED_HEAD_SHA" && test -d "$LOCAL_REPO" \
+  && test "$OBSERVED_REPOSITORY" = "$RECORDED_REPOSITORY_IDENTITY" \
+  && STATUS=$(git -C "$LOCAL_REPO" status --porcelain) && test -z "$STATUS" \
+  && HEAD_NOW=$(git -C "$LOCAL_REPO" rev-parse HEAD) && test "$HEAD_NOW" = "$RECORDED_HEAD_SHA"
+then
+  CHECKOUT_VERIFIED=yes
+fi
+```
+
+**Only when `CHECKOUT_VERIFIED=yes`** may you show the exact commands, warn they run arbitrary code, and
+ask for exact-command consent (`LOCAL_EXECUTION_APPROVED`). If `CHECKOUT_VERIFIED=no` — a wrong
+identity, a dirty tree, a failed `git status`, a wrong head, or a missing `$LOCAL_REPO` — **do not run
+commands and do not ask for execution consent**: offer static-only continuation or an exact detached
+**worktree-at-SHA** command set (`git worktree add --detach <path> "$RECORDED_HEAD_SHA"`) that needs
+**fresh consent**. Record the observed repository identity, head SHA, clean status, and approved
+command list in the execution evidence handed to both peers and rendered in the review provenance. A
+GitHub-PR or diff-file target never reaches this verification — it never executes locally.
+
 Error handling:
 
 - **Local decline** → continue static-only with runtime results `unverified`.
@@ -114,12 +264,17 @@ and approving posting never approves execution.
 
 By default the review is **read-only** over the target: the findings + the derived recommendation live
 in the run dir and your reply, and nothing is written to the PR or repo. **Only after** the review
-reaches consensus, and **only for the GitHub-PR input**, you may offer to post the review via `gh`
-(`gh pr review <n> --comment` with the assembled summary, and inline comments) — and **only** with the
-human's explicit, per-run OK. What you post is the **deterministic recommendation and findings from
-`crucible review-result`**, never model prose. Posting is never automatic, never done for the
-local-diff input, and never done before consensus. Treat the human's decision as the gate; the peers
-do not decide to post.
+reaches consensus, and **only for the GitHub-PR input**, you may offer to post the review via `gh pr
+review` — and **only** with the human's explicit, per-run OK. What you post is the **deterministic
+recommendation and findings from `crucible review-result`**, never model prose: the assembled findings
+form the review **body** (`--body`/`--body-file`), and the derived recommendation selects the review
+**state** — `APPROVE` → `gh pr review <n> --approve`, `COMMENT` → `--comment`, `REQUEST_CHANGES` →
+`--request-changes` — so the posted GitHub review state reflects the recommendation rather than always
+a neutral comment. `gh pr review` posts one review as a body + state; it does **not** carry per-line
+inline comments, so never claim to post them (a line-anchored review would need the REST reviews API
+with commit-sha/path/line/side mappings, which this flow does not build). Posting is never automatic,
+never done for the local-diff input, and never done before consensus. Treat the human's decision as
+the gate; the peers do not decide to post.
 
 ## Report labels
 

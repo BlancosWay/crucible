@@ -29,6 +29,11 @@ CHANGELOG = ROOT / "CHANGELOG.md"
 # intentionally excluded to keep the guard low-friction.
 SHIPPED_PREFIXES = ("scripts/", "skills/", "commands/")
 
+# Shipped runtime files that live at the repo root (outside a SHIPPED_PREFIXES dir) but still change
+# what every run resolves: config.defaults.json is the shipped default config (default Builder/Critic
+# models, round caps, on_cap, severities), so a change to it must be noted in the CHANGELOG too.
+SHIPPED_FILES = ("config.defaults.json",)
+
 # Canonical SemVer (semver.org) core — no anchors, so it embeds inside larger patterns
 # (e.g. a dated CHANGELOG release heading). tests/test_version_consistency.py reuses this
 # for the full-string manifest version check, so the two can never drift apart.
@@ -66,7 +71,7 @@ def unreleased_body(text: str) -> str:
 
 
 def requires_changelog(paths) -> bool:
-    return any(p.startswith(SHIPPED_PREFIXES) for p in paths)
+    return any(p.startswith(SHIPPED_PREFIXES) or p in SHIPPED_FILES for p in paths)
 
 
 def _version_sections(text: str) -> set:
@@ -118,6 +123,14 @@ def cmd_section(version: str) -> int:
     body = extract_section(CHANGELOG.read_text(encoding="utf-8"), version)
     if not body:
         print(f"changelog: no '## [{version}]' section found", file=sys.stderr)
+        return 1
+    if not _content_lines(body):
+        # Fail closed on a section with no REAL content (only sub-headings / blank lines) — the same
+        # "real entry" standard the changelog guard (`_content_lines`) uses, so the release notes can
+        # never be a bare `### Added`. Without this, `section` + the release step's `test -s` accepted
+        # a heading-only body as valid release notes.
+        print(f"changelog: '## [{version}]' section has no real content (only headings/blank lines); "
+              "release notes must contain actual entries", file=sys.stderr)
         return 1
     print(body)
     return 0

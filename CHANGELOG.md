@@ -62,6 +62,28 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
   `tests/test_pr_review_references.py` + `tests/test_pr_review_skill.py`, registered additively in
   `tests/validate_structure.py` and the `tests/test_docs.py` guards. Design:
   `docs/superpowers/specs/2026-07-17-pr-review-skill-design.md`.
+- **Immutable `pr-review` target binding (audit finding #4).** Every `pr-review` input is now pinned to
+  an immutable review target before PLAN. New `normalize-target github|local|diff` commands emit a
+  canonical manifest + exact patch — a GitHub PR pinned to base/head **OIDs** + fork identity read
+  stably **before and after** fetching the compare metadata and the merge-base/head snapshots, with the
+  immutable patch **derived** PR-style from the base repo's exact-OID
+  `compare/<baseRefOid>...<headRefOid>` endpoint (its `merge_base_commit.sha` fork-point snapshot →
+  the head `repository@headRefOid` snapshot, recorded as `merge_base_sha`) — never a server-recomputed
+  PR diff or a base-tip two-dot diff, so a base-only commit made on the base branch after the fork never
+  appears as a reverse change; a local single `--range` recorded with `merge_base..head`
+  **merge-base** semantics (no raw two-dot tip diff); or a diff file as patch identity only
+  (`revision_bound: false`).
+  `load-target` records the one `target_loaded` event and `target_sha256`; `show-target` prints the
+  authoritative target; `repository-identity` fingerprints a local checkout credential-free; and
+  `materialize-target` extracts a pinned, read-only `RUN/source` snapshot of the exact head commit
+  through a confined archive reader (rejects path traversal, links, special files, duplicate paths, and
+  member/byte caps — and is never executed). Every `pr-review` gate binding and peer attestation now
+  carries `target_sha256`, the report renders a `## Review target` section, and trusted-local execution
+  runs only at the recorded head commit (clean checkout at `head.sha`). `build`/`deep-dive` runs are
+  unchanged (no target). Design:
+  `docs/superpowers/specs/2026-07-21-pr-review-target-binding-design.md`; plan:
+  `docs/superpowers/plans/2026-07-21-pr-review-target-binding.md`. Guarded by `tests/test_target.py`
+  and the skill/reference/docs guards.
 
 ### Changed
 - **Builder prompt: human-style code comments.** The "Writing code comments" guidance now bans
@@ -70,6 +92,97 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
   Assumptions derivation) to the commit / PR / plan rather than the source, and nudges long inline
   explanations the same way. Standard `TODO`/`FIXME`/`NOTE`/`HACK` tags are unaffected. Prompt text
   only; no CLI/behavior change. Guarded by `tests/test_references.py`.
+
+### Fixed
+- **`pr-review` posting maps the recommendation to the GitHub review state (and drops the unbacked
+  inline-comments claim).** The optional consented posting flow documented `gh pr review <n> --comment`
+  "with inline comments", but `gh pr review` posts only a body + a single review state and cannot carry
+  per-line inline comments, and the hardcoded `--comment` meant a derived Approve/Request-changes
+  recommendation never reached the GitHub review state. The docs now map the deterministic
+  `review-result` recommendation to the state — `APPROVE` → `--approve`, `COMMENT` → `--comment`,
+  `REQUEST_CHANGES` → `--request-changes` (findings in the body) — under the same per-run posting
+  consent, and no longer promise inline comments the command cannot post. Guarded by
+  `tests/test_pr_review_references.py`.
+- **Gate decisions record the effective per-gate policy (round cap + on_cap).** A gate's terminal
+  event (`gate_consensus` / `gate_proceeded_with_flags` / `gate_capped`) recorded its bindings and
+  open findings but not the effective round cap actually used — so a `--max-rounds` override (which the
+  run config alone cannot show) left the report unable to reconstruct the decision as made. Both
+  `verdict` and `symmetric-verdict` now record the effective `max_rounds` and `on_cap` on the terminal
+  event (the always-halting reproduce gate records `on_cap: halt` regardless of the configured value),
+  and the report surfaces them on each gate's outcome line (a legacy terminal without them stays
+  readable). This is the in-scope provenance fix; defending against an operator who rewrites
+  `RUN/config.json` remains out of scope per `SECURITY.md`. Guarded by `tests/test_cli.py` and
+  `tests/test_report.py`.
+- **`crucible clean` refuses an unfinished run (not just an incomplete DAG).** The delete guard keyed
+  only on DAG node completion, so a run still in REPRODUCE/PLAN (no `dag.json` yet — classified as
+  "nothing in progress, safe to remove") and a run with all nodes done but FINAL still pending were
+  both deletable without `--force`, destroying active provenance. `clean` now refuses (without
+  `--force`) unless every configured phase has positively concluded — PLAN, plus REPRODUCE / FINAL
+  when enabled, with a DAG loaded and every node `done`; any uncertainty (unreadable config/DAG, an
+  unconcluded phase, a capped/halted gate) preserves the run. `--force` still removes anything.
+  Guarded by `tests/test_cli.py`.
+- **The run report neutralizes Markdown image/link injection and code-span id breakout.** Untrusted
+  fields (goals, Critic/peer finding ids and claims, DAG node ids/titles, gate names) are sanitized
+  before rendering, but `_san` previously escaped only HTML and table/heading breakers — a value like
+  `![](http://tracker)` still rendered an **active** `<img>` (a tracking pixel / content injection)
+  when `report.md` was opened in a Markdown renderer, and an untrusted id wrapped in a backtick code
+  span could break out of it (Markdown code spans ignore backslash escapes). `_san` now also escapes
+  the Markdown image/link brackets `[`/`]`, and every remaining untrusted id is rendered as plain
+  `_san` text rather than inside a code span (the dependency table, gate headers, and the
+  findings/objections/resolutions lists), matching the summary convention. Guarded by
+  `tests/test_report.py`.
+- **Release notes require real content, not a bare heading.** The release workflow published the
+  version's CHANGELOG section as the GitHub Release body, gated only by a non-empty check
+  (`changelog.py section` + `test -s`), so a heading-only body such as `### Added` passed even though
+  the changelog guard (`_content_lines`) counts it as no real entry. `changelog.py section` now fails
+  closed on a section with no real content, and the version-consistency guard checks real entries
+  (not just `body.strip()`), closing the inconsistency. Guarded by `tests/test_version_consistency.py`.
+- **The CHANGELOG guard now covers `config.defaults.json`.** A change to the shipped default config
+  (default Builder/Critic models, round caps, `on_cap`, severities) affects what every run resolves,
+  but `requires_changelog` matched only `scripts/`/`skills/`/`commands/` and so did not require a
+  CHANGELOG entry for it. `config.defaults.json` is now a recognized shipped runtime file. Guarded by
+  `tests/test_changelog.py`.
+- **`crucible load-dag` rejects a blank/whitespace or non-stripped node id.** A dependency-tree node
+  whose `id` was blank, whitespace-only, or carried surrounding whitespace previously passed
+  `DAG.from_dict` (only emptiness was checked) yet its `dep:<id>` gate was rejected by the gate
+  validator — so the node loaded and was scheduled by `next` but could never be reviewed, wedging the
+  run. `load-dag` now rejects such an id at load, matching the gate rule and the documented kebab-case
+  schema. Guarded by `tests/test_dag.py`.
+- **`pr-review` derives the GitHub snapshot patch from the exact archive bytes and modes (no
+  attribute-driven rewriting).** The merge-base→head snapshot trees are now built from the **raw**
+  archive bytes and archive-derived file modes with git plumbing that can never run a
+  clean/smudge/EOL/working-tree-encoding filter: each regular file is hashed via `git hash-object -w
+  --stdin --no-filters` (never `git add`) and inserted into an isolated index with its archive mode
+  (`100755` iff the extracted file carries an executable bit, else `100644`) through one NUL-delimited
+  `git update-index -z --index-info`, then `git write-tree`. Ambient/global git **attributes** are
+  neutralized (`GIT_ATTR_NOSYSTEM=1`, `core.attributesFile=/dev/null`) alongside the existing config
+  neutralization, so a hostile in-tree `.gitattributes`/`.gitignore` in a snapshot can no longer
+  rewrite reviewed bytes (e.g. `text=auto`/EOL normalization), drop a member, or mask an
+  executable-mode change before the derived patch is produced. The changed-file set is read
+  NUL-delimited (`git diff --name-only -z`) so a path with a space/tab/newline is carried exactly, and
+  `safe_extract_source_archive` preserves the archive's executable bit masked to ordinary permission
+  bits (`& 0o777`; setuid/setgid/sticky are never written). Guarded by `tests/test_target.py`.
+- **`pr-review` stores the source crash-repair receipt adjacent to `RUN/source`, not inside it.** The
+  materialized `RUN/source` snapshot now holds **exactly** the reviewed archive members; the
+  crash-repair receipt (`target_sha256`/`archive_sha256`/`kind`) is written to the adjacent run-state
+  path `RUN/source.receipt.json` instead of a reserved file inside the tree, so a reviewed repository
+  file that happens to use that name materializes unchanged and is visible to peers. The receipt is
+  written **before** the source staging rename and `source_materialized` is appended only after, so
+  every crash boundary stays idempotently repairable by a same-archive retry while a different or
+  unreadable archive/target is rejected (the materialization is immutable, never silently
+  overwritten). Guarded by `tests/test_target.py` and `tests/test_cli.py`.
+- **`pr-review` trusts the snapshot-derived changed-file set (no false rejections on renames / large
+  PRs).** GitHub PR normalization now derives `changed_files` **solely** from the immutable
+  merge-base→head snapshot patch and no longer requires it to equal GitHub's own `files` view. That view
+  (the `gh pr view --json files` metadata and the compare `files` list) paginates/truncates on large PRs
+  and applies rename detection — reporting a rename as one new path where the historyless snapshot diff,
+  without rename detection, shows the old+new pair — so the previous strict-equality gate falsely
+  rejected legitimate PRs. The changed-file list is also removed from the immutable before/after identity
+  tuple (title/body still trigger a retry; a paginated/reordered/rename-detected `files` drift no longer
+  does), and compare-metadata validation still proves `base_commit.sha == baseRefOid` with a valid
+  `merge_base_commit.sha` while tolerating an absent/truncated compare `files` list. The exact-OID
+  compare/merge-base archive protocol is unchanged. Guarded by `tests/test_target.py` and
+  `tests/test_report.py`.
 
 ### Security
 - **Gate decisions are content-bound and phase-ordered (schema v2), not eyeballed.** The CLI now

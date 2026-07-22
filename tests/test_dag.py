@@ -260,6 +260,19 @@ def test_from_dict_rejects_non_string_node_id():
         DAG.from_dict({"nodes": [{"id": 1}], "edges": []})
 
 
+def test_from_dict_rejects_blank_or_whitespace_node_id():
+    # F8: a blank/whitespace-only or surrounding-whitespace id passed the old non-empty check, but its
+    # `dep:<id>` gate is rejected by _validate_gate (which requires id and id == id.strip()) — so such a
+    # node would load and be scheduled by `next` yet never be reviewable, wedging the run. Reject it at
+    # load to match the gate rule and the documented kebab-case schema.
+    for bad in ("  ", "\t", " foo ", "foo ", " foo", "\n"):
+        with pytest.raises(ValueError, match="whitespace|blank"):
+            DAG.from_dict({"nodes": [{"id": bad}], "edges": []})
+    # a normal kebab-case id is unaffected
+    dag = DAG.from_dict({"nodes": [{"id": "snapshot-patch-fidelity"}], "edges": []})
+    assert "snapshot-patch-fidelity" in dag.nodes
+
+
 def test_from_dict_rejects_empty_node_id():
     with pytest.raises(ValueError, match="must be a non-empty string"):
         DAG.from_dict({"nodes": [{"id": ""}], "edges": []})

@@ -67,10 +67,11 @@ def node_sha256(dag: DAG, node_id: str) -> str:
 
 
 # The content bindings recorded on a schema-v2 decision event: the reviewed ``artifact`` plus the
-# relevant ``dag``/``node`` identity. Owned here so the symmetric result projection
-# (``crucible.symmetric``) and the workflow integrity checks (``crucible.workflow``) compare gate
-# events by the SAME shape instead of each re-spelling the key tuple.
-BINDING_KEYS = ("artifact_sha256", "dag_sha256", "node_sha256")
+# relevant ``dag``/``node`` identity and — for a pr-review run — the immutable ``target`` identity.
+# Owned here so the symmetric result projection (``crucible.symmetric``) and the workflow integrity
+# checks (``crucible.workflow``) compare gate events by the SAME shape instead of each re-spelling the
+# key tuple.
+BINDING_KEYS = ("artifact_sha256", "dag_sha256", "node_sha256", "target_sha256")
 
 
 def event_bindings(event: dict[str, Any]) -> dict[str, str]:
@@ -116,16 +117,20 @@ def require_current_schema(run: RunLog) -> None:
 @dataclass(frozen=True)
 class BindingSet:
     """The deterministic content bindings that identify what a gate decision refers to: the exact
-    Builder ``artifact`` plus the relevant ``dag``/``node`` definition. Only ``artifact_sha256`` is
-    always present; ``dag_sha256``/``node_sha256`` are gate-specific (see ``current_bindings``).
+    Builder ``artifact`` plus the relevant ``dag``/``node`` definition and — for a pr-review run — the
+    immutable review ``target``. Only ``artifact_sha256`` is always present; ``dag_sha256``/
+    ``node_sha256`` are gate-specific and ``target_sha256`` is workflow-specific (see
+    ``current_bindings``).
 
     ``to_dict`` drops absent fields so the CLI emits exactly the bindings a gate requires — the same
-    shape the Critic verdict must echo back — with no ``null`` placeholders for a plan's node hash.
+    shape the Critic verdict must echo back — with no ``null`` placeholders for a plan's node hash or a
+    build run's (absent) target.
     """
 
     artifact_sha256: str
     dag_sha256: str | None = None
     node_sha256: str | None = None
+    target_sha256: str | None = None
 
     def to_dict(self) -> dict[str, str]:
         return {key: value for key, value in asdict(self).items() if value is not None}
@@ -182,10 +187,16 @@ def current_bindings(run: RunLog, gate: str, round_index: int) -> BindingSet:
     - ``plan`` / ``final`` → artifact + DAG;
     - ``dep:<id>`` → artifact + DAG + that node.
 
-    Because DAG/node hashes are recomputed live, a plan/DAG/node substituted after the Critic
-    reviewed it yields different bindings — which the verdict handshake and ``set-status`` guard use
-    to reject stale/substituted decisions. Raises ``SystemExit`` when a required DAG is absent or the
-    ``dep:`` node is unknown.
+    For a pr-review run every gate ALSO binds the immutable review ``target``: its authoritative hash
+    is read from the single ``target_loaded`` event, so a decision proves it reviewed the loaded PR/
+    diff and never a substituted one. ``build``/``deep-dive`` runs omit the field (their shape is
+    unchanged). A pr-review run with no loaded target, or a duplicate/malformed one, fails closed —
+    there is no single valid target identity to bind to.
+
+    Because DAG/node/target hashes are recomputed/re-read live, a plan/DAG/node/target substituted
+    after the Critic reviewed it yields different bindings — which the verdict handshake and
+    ``set-status`` guard use to reject stale/substituted decisions. Raises ``SystemExit`` when a
+    required DAG is absent, the ``dep:`` node is unknown, or the pr-review target is missing/invalid.
     """
     from crucible.dag import DAG  # local import: dag.py has no crucible deps, so this cannot cycle
 
@@ -209,4 +220,39 @@ def current_bindings(run: RunLog, gate: str, round_index: int) -> BindingSet:
                     f"{sorted(dag.nodes)}"
                 )
             node_hash = node_sha256(dag, node_id)
-    return BindingSet(artifact_sha256=artifact, dag_sha256=dag_hash, node_sha256=node_hash)
+    target_hash = _pr_review_target_hash(run, gate)
+    return BindingSet(artifact_sha256=artifact, dag_sha256=dag_hash, node_sha256=node_hash,
+                      target_sha256=target_hash)
+
+
+def _pr_review_target_hash(run: RunLog, gate: str) -> str | None:
+    """The immutable target hash a pr-review gate must bind, or ``None`` for build/deep-dive runs.
+
+    Read from the single ``target_loaded`` event (the authoritative identity). A pr-review run with no
+    target, or a duplicate/malformed one, fails closed — a gate can never bind to an absent or
+    ambiguous target. Uses local imports so this module stays free of an import cycle with
+    ``crucible.symmetric``/``crucible.target`` (both of which import ``crucible.integrity``).
+    """
+    # local imports: symmetric/target both import integrity, so importing them at call time (when both
+    # are fully loaded) avoids a top-level cycle.
+    from crucible.symmetric import CorruptWorkflowError, workflow_kind
+    from crucible.target import target_from_events, target_sha256
+
+    events = run.read_events()
+    try:
+        if workflow_kind(events) != "pr-review":
+            return None
+    except CorruptWorkflowError:
+        # Corrupt workflow metadata is already failed closed upstream by _require_run_integrity; treat
+        # it as non-pr-review here so bindings never rest on unroutable metadata.
+        return None
+    try:
+        target = target_from_events(events)
+    except ValueError as exc:
+        raise SystemExit(f"crucible: gate {gate!r} bindings require a valid pr-review target: {exc}")
+    if target is None:
+        raise SystemExit(
+            f"crucible: gate {gate!r} bindings require a loaded pr-review target; run load-target "
+            f"first"
+        )
+    return target_sha256(target)

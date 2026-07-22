@@ -213,6 +213,7 @@ class PeerAttestation:
     artifact_sha256: str | None = None
     dag_sha256: str | None = None
     node_sha256: str | None = None
+    target_sha256: str | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "PeerAttestation":
@@ -251,6 +252,7 @@ class PeerAttestation:
             artifact_sha256=_optional_hash(data, "artifact_sha256"),
             dag_sha256=_optional_hash(data, "dag_sha256"),
             node_sha256=_optional_hash(data, "node_sha256"),
+            target_sha256=_optional_hash(data, "target_sha256"),
         )
 
     def open_blocking(self, cfg: Config) -> list[Finding]:
@@ -290,7 +292,7 @@ class PeerAttestation:
                 for o in self.objections
             ],
         }
-        for key in ("artifact_sha256", "dag_sha256", "node_sha256"):
+        for key in ("artifact_sha256", "dag_sha256", "node_sha256", "target_sha256"):
             value = getattr(self, key)
             if value is not None:
                 out[key] = value
@@ -658,7 +660,8 @@ def _peer_attestation_issues(
                           f"the decision round {outer_round!r}")
         att_bind = event_bindings({"artifact_sha256": attestation.artifact_sha256,
                                    "dag_sha256": attestation.dag_sha256,
-                                   "node_sha256": attestation.node_sha256})
+                                   "node_sha256": attestation.node_sha256,
+                                   "target_sha256": attestation.target_sha256})
         if att_bind != outer_bind:
             issues.append(f"peer slot {slot!r} attestation bindings do not match the decision bindings")
         if cfg is not None:
@@ -1126,7 +1129,8 @@ def _pr_recommendation(
 
 
 def review_result(
-    events: list[dict[str, Any]], cfg: Config, workflow: str, dag: Any = None
+    events: list[dict[str, Any]], cfg: Config, workflow: str, dag: Any = None,
+    target_sha256: str | None = None
 ) -> dict[str, Any]:
     """The deterministic symmetric review deliverable: effective accepted findings, unresolved
     objections, and (pr-review only) the derived recommendation.
@@ -1140,6 +1144,12 @@ def review_result(
     Approve/Comment/Request-changes call). This is a projection over ``events``; callers (the CLI
     result commands) enforce completeness and scope first.
 
+    ``target_sha256`` (F4), when the workflow is ``pr-review``, is the authoritative loaded review
+    target hash the caller derives from the events (this module stays free of a target/workflow import
+    cycle). It binds the deliverable to the exact reviewed target so a published/posted result can be
+    re-verified against the run's `target_loaded` event. ``deep-dive`` results never carry it (their
+    shape is unchanged).
+
     When ``dag`` is supplied (the CLI Finish-time path) the accepted union and the unresolved
     objections are BOTH scoped to the configured workflow and FAIL CLOSED on any out-of-scope
     dependency/FINAL gate, so a forged out-of-scope objection can never inflate the recommendation.
@@ -1149,6 +1159,7 @@ def review_result(
     objections = unresolved_objections(events, dag, cfg=cfg, final_enabled=cfg.final_review)
     result: dict[str, Any] = {"workflow": workflow}
     if workflow == "pr-review":
+        result["target_sha256"] = target_sha256
         result["recommendation"] = _pr_recommendation(effective.findings, objections, cfg)
     result["findings"] = [f.to_dict() for f in effective.findings]
     result["unresolved_objections"] = objections
@@ -1156,7 +1167,8 @@ def review_result(
 
 
 def require_complete_symmetric_run(
-    events: list[dict[str, Any]], dag: Any, *, require_final: bool, final_enabled: bool
+    events: list[dict[str, Any]], dag: Any, *, require_final: bool, final_enabled: bool,
+    expected_target_sha256: str | None = None
 ) -> None:
     """Finish-time completeness guard for the result commands (never for reports).
 
@@ -1174,6 +1186,12 @@ def require_complete_symmetric_run(
     distinct from ``require_final`` because ``accepted-findings`` legitimately precedes FINAL yet must
     still reject a forged FINAL gate in a run where FINAL is disabled. A malformed effective accepted
     payload surfaces its own ``ValueError``.
+
+    ``expected_target_sha256`` (Task 2) is the pr-review run's authoritative loaded-target hash,
+    threaded in by the CLI (never re-derived here — this module does not import the target/workflow
+    layers). When given, every effective accepted finding set (dependency and FINAL) must bind exactly
+    that target, so a result can never be published from accepted state bound to a substituted/absent
+    target. ``None`` (build/deep-dive, or when the caller has no target) skips the check.
     """
     if not dag.nodes:
         raise ValueError("incomplete symmetric workflow: no dependency tree is loaded")
@@ -1248,3 +1266,14 @@ def require_complete_symmetric_run(
             "incomplete symmetric workflow: the configured FINAL gate has not reached an accepted "
             "finding set"
         )
+    # Task 2: every effective accepted finding set (dependency and FINAL) must bind the authoritative
+    # loaded target, so a pr-review result is never published from accepted state bound to a
+    # substituted/absent target. The expected hash is threaded in by the CLI (this module stays free
+    # of a target/workflow import cycle); ``None`` skips the check (build/deep-dive).
+    if expected_target_sha256 is not None:
+        for index, gate, _finding_set in _effective_accepted_events(events):
+            if events[index].get("target_sha256") != expected_target_sha256:
+                raise ValueError(
+                    f"incomplete symmetric workflow: the accepted finding set for gate {gate!r} is "
+                    f"not bound to the loaded review target (target hash missing or mismatched)"
+                )

@@ -131,6 +131,11 @@ same deterministic `crucible` CLI** (initialized with `--workflow pr-review`; ea
 independently attest in their own `peer-a.json` / `peer-b.json` and `crucible symmetric-verdict`
 decides — no config-schema change), and is **read-only** over the target by default (posting the review
 to the PR happens only for a GitHub PR, only after consensus, and only with your explicit OK).
+Each review is pinned to an **immutable target**: a GitHub PR to its base/head **commit OIDs** + fork
+identity (not branch names), a local range to PR-style **merge-base** semantics, or a **diff-file** to
+patch identity only (`revision_bound: false`). That target hash binds every gate, and — for a
+GitHub/local target — both peers read a pinned read-only `RUN/source` snapshot of the exact head
+commit, never ambient checkout files.
 **Execution safety:** reviewed code is untrusted, so a PR-URL and a diff-file review are
 **static/CI-only** and never execute locally; running tests or builds is available only for a
 **trusted local checkout**, after explicit execution **consent** to the exact commands (with an
