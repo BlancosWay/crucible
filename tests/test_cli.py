@@ -3805,13 +3805,13 @@ def test_materialize_target_second_same_archive_is_idempotent(tmp_path):
 
 
 def _receipt_path(run_dir):
-    from crucible.target import SOURCE_RECEIPT_NAME
-    return Path(run_dir) / "source" / SOURCE_RECEIPT_NAME
+    from crucible.target import source_receipt_path
+    return source_receipt_path(Path(run_dir) / "source")
 
 
 def test_materialize_target_writes_canonical_receipt(tmp_path):
-    # F3: a canonical receipt (target_sha256, archive_sha256, kind) lives inside RUN/source, binding the
-    # snapshot to its exact archive + target for crash repair.
+    # F2/F3: the canonical receipt (target_sha256, archive_sha256, kind) lives ADJACENT to RUN/source
+    # (RUN/source.receipt.json), never inside it, so RUN/source is exactly the reviewed archive members.
     run_dir = _init_pr_review(tmp_path)
     repo = _diverged_repo(tmp_path)
     _load_local_target(run_dir, tmp_path, repo)
@@ -3822,6 +3822,33 @@ def test_materialize_target_writes_canonical_receipt(tmp_path):
     assert receipt["target_sha256"] == event["target_sha256"]
     assert receipt["archive_sha256"] == event["archive_sha256"]
     assert receipt["kind"] == "local-range"
+    # RUN/source holds ONLY the archive members — no crucible metadata leaks into the reviewed tree.
+    names = sorted(p.name for p in (Path(run_dir) / "source").iterdir())
+    assert names == ["app.py"]
+    assert not (Path(run_dir) / "source" / "source.receipt.json").exists()
+    assert not (Path(run_dir) / "source" / ".crucible-source-receipt.json").exists()
+
+
+def test_materialize_target_source_contains_only_reviewed_members(tmp_path):
+    # F2 COLLISION (RED before the move): an archive member literally named
+    # `.crucible-source-receipt.json` must materialize UNCHANGED and be visible to peers, because the
+    # crash-repair receipt is now an adjacent run-state file, not a member of RUN/source.
+    run_dir = _init_pr_review(tmp_path)
+    repo = _diverged_repo(tmp_path)
+    _git_t(repo, "checkout", "-q", "feature")
+    payload = '{"real":"repo content"}\n'
+    (repo / ".crucible-source-receipt.json").write_text(payload)
+    _git_t(repo, "add", ".crucible-source-receipt.json")
+    _git_t(repo, "commit", "-q", "-m", "add collision file")
+    _git_t(repo, "checkout", "-q", "main")
+    _load_local_target(run_dir, tmp_path, repo)
+    archive = _head_archive(tmp_path, repo)
+    assert _run(["materialize-target", "--run", run_dir, "--archive", str(archive)]).returncode == 0
+    member = Path(run_dir) / "source" / ".crucible-source-receipt.json"
+    assert member.read_text() == payload, "the reviewed repo file must survive unchanged"
+    # the authoritative receipt is adjacent and distinct from the reviewed member
+    assert _receipt_path(run_dir).exists() and _receipt_path(run_dir) != member
+    assert json.loads(_receipt_path(run_dir).read_text())["kind"] == "local-range"
 
 
 def test_materialize_target_append_failure_then_retry_appends_without_reextract(tmp_path, monkeypatch):
@@ -3875,6 +3902,29 @@ def test_materialize_target_missing_source_restored_without_duplicate_event(tmp_
     assert len([e for e in _events(run_dir) if e["event"] == "source_materialized"]) == 1
 
 
+def test_materialize_restore_rejects_mismatched_adjacent_receipt(tmp_path):
+    # F2: a matching source_materialized event exists but RUN/source is gone AND the adjacent receipt has
+    # been replaced with a mismatched/corrupt one — the restore must REJECT it rather than silently
+    # overwrite it (the same fail-closed invariant as the no-event branch), leaving event + receipt intact.
+    run_dir = _init_pr_review(tmp_path)
+    repo = _diverged_repo(tmp_path)
+    _load_local_target(run_dir, tmp_path, repo)
+    archive = _head_archive(tmp_path, repo)
+    assert _run(["materialize-target", "--run", run_dir, "--archive", str(archive)]).returncode == 0
+    import shutil
+    shutil.rmtree(Path(run_dir) / "source")  # lose the materialized source
+    # tamper the adjacent receipt so it no longer matches this archive/target
+    _receipt_path(run_dir).write_text(json.dumps(
+        {"version": 1, "kind": "local-range", "target_sha256": "0" * 64, "archive_sha256": "0" * 64}))
+    r = _run(["materialize-target", "--run", run_dir, "--archive", str(archive)])
+    assert r.returncode != 0
+    assert "receipt" in r.stderr
+    assert not (Path(run_dir) / "source").exists(), "must not restore over a mismatched receipt"
+    # the mismatched receipt is left untouched (never silently overwritten) and the event is intact
+    assert json.loads(_receipt_path(run_dir).read_text())["target_sha256"] == "0" * 64
+    assert len([e for e in _events(run_dir) if e["event"] == "source_materialized"]) == 1
+
+
 def test_materialize_target_rename_failure_leaves_no_source_or_event(tmp_path, monkeypatch):
     # F3 rename boundary: inject an os.replace failure during extraction. No RUN/source and no event are
     # left, and a clean retry then materializes normally (no irreparable state).
@@ -3907,23 +3957,90 @@ def test_materialize_target_rename_failure_leaves_no_source_or_event(tmp_path, m
 
 
 def test_materialize_target_mismatched_receipt_rejects(tmp_path):
-    # F3: an existing RUN/source whose receipt does not match this archive/target is rejected — never
-    # trusted, never silently deleted.
+    # F2/F3: an existing RUN/source whose ADJACENT receipt does not match this archive/target is
+    # rejected — never trusted, never silently deleted.
     run_dir = _init_pr_review(tmp_path)
     repo = _diverged_repo(tmp_path)
     _load_local_target(run_dir, tmp_path, repo)
     archive = _head_archive(tmp_path, repo)
-    # Pre-create a source dir with a bogus receipt (as if from a different archive), no event.
+    # Pre-create a source dir plus a bogus adjacent receipt (as if from a different archive), no event.
     src = Path(run_dir) / "source"
     src.mkdir()
     (src / "app.py").write_text("stale\n")
-    from crucible.target import SOURCE_RECEIPT_NAME
-    (src / SOURCE_RECEIPT_NAME).write_text(json.dumps(
+    _receipt_path(run_dir).write_text(json.dumps(
         {"version": 1, "kind": "local-range", "target_sha256": "0" * 64, "archive_sha256": "0" * 64}))
     r = _run(["materialize-target", "--run", run_dir, "--archive", str(archive)])
     assert r.returncode != 0
     assert "receipt" in r.stderr
     assert (src / "app.py").read_text() == "stale\n", "a mismatched source must not be deleted"
+    assert "source_materialized" not in [e["event"] for e in _events(run_dir)]
+
+
+def test_materialize_target_receipt_after_rename_crash_same_input_retry_extracts(tmp_path, monkeypatch):
+    # F2: define receipt-write-success + rename-failure. The adjacent receipt is written BEFORE the
+    # source staging rename; if the rename crashes there is a matching receipt but no source and no
+    # event. A same-archive retry REUSES the matching receipt and extracts (repairs to completion).
+    import crucible.cli as climod
+    import crucible.target as targetmod
+    run_dir = _init_pr_review(tmp_path)
+    repo = _diverged_repo(tmp_path)
+    _load_local_target(run_dir, tmp_path, repo)
+    archive = _head_archive(tmp_path, repo)
+
+    real_replace = targetmod.os.replace
+
+    def boom(src, dst, *a, **k):
+        if str(dst).endswith("/source"):
+            raise OSError("injected rename failure")
+        return real_replace(src, dst, *a, **k)
+
+    monkeypatch.setattr(targetmod.os, "replace", boom)
+    assert climod.main(["materialize-target", "--run", run_dir, "--archive", str(archive)]) == 1
+    # receipt written outside source (before the rename), but no source and no event yet
+    assert _receipt_path(run_dir).exists()
+    assert not (Path(run_dir) / "source").exists()
+    assert not (Path(run_dir) / "source.staging").exists()
+    assert "source_materialized" not in [e["event"] for e in _events(run_dir)]
+
+    monkeypatch.undo()
+    r = _run(["materialize-target", "--run", run_dir, "--archive", str(archive)])
+    assert r.returncode == 0, r.stderr
+    assert (Path(run_dir) / "source" / "app.py").read_text() == "feature\n"
+    assert len([e for e in _events(run_dir) if e["event"] == "source_materialized"]) == 1
+
+
+def test_materialize_target_receipt_after_rename_crash_different_archive_rejects(tmp_path, monkeypatch):
+    # F2: after a receipt-write-success + rename-failure (matching receipt, no source, no event), a
+    # retry with a DIFFERENT archive/target is rejected — the source materialization is immutable and
+    # the stale receipt is never silently overwritten with a different binding.
+    import crucible.cli as climod
+    import crucible.target as targetmod
+    run_dir = _init_pr_review(tmp_path)
+    repo = _diverged_repo(tmp_path)
+    _load_local_target(run_dir, tmp_path, repo)
+    archive = _head_archive(tmp_path, repo)
+
+    real_replace = targetmod.os.replace
+
+    def boom(src, dst, *a, **k):
+        if str(dst).endswith("/source"):
+            raise OSError("injected rename failure")
+        return real_replace(src, dst, *a, **k)
+
+    monkeypatch.setattr(targetmod.os, "replace", boom)
+    assert climod.main(["materialize-target", "--run", run_dir, "--archive", str(archive)]) == 1
+    monkeypatch.undo()
+    assert _receipt_path(run_dir).exists() and not (Path(run_dir) / "source").exists()
+
+    # A different archive (different tree) -> different archive_sha256 than the pending receipt.
+    _git_t(repo, "checkout", "-q", "feature")
+    (repo / "extra.py").write_text("x\n")
+    _git_t(repo, "add", "extra.py"); _git_t(repo, "commit", "-q", "-m", "extra")
+    other = _head_archive(tmp_path, repo, name="other.tar")
+    r = _run(["materialize-target", "--run", run_dir, "--archive", str(other)])
+    assert r.returncode != 0
+    assert "receipt" in r.stderr or "different" in r.stderr or "immutable" in r.stderr
+    assert not (Path(run_dir) / "source").exists()
     assert "source_materialized" not in [e["event"] for e in _events(run_dir)]
 
 

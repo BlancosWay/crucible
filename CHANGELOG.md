@@ -94,6 +94,29 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
   only; no CLI/behavior change. Guarded by `tests/test_references.py`.
 
 ### Fixed
+- **`pr-review` derives the GitHub snapshot patch from the exact archive bytes and modes (no
+  attribute-driven rewriting).** The merge-base→head snapshot trees are now built from the **raw**
+  archive bytes and archive-derived file modes with git plumbing that can never run a
+  clean/smudge/EOL/working-tree-encoding filter: each regular file is hashed via `git hash-object -w
+  --stdin --no-filters` (never `git add`) and inserted into an isolated index with its archive mode
+  (`100755` iff the extracted file carries an executable bit, else `100644`) through one NUL-delimited
+  `git update-index -z --index-info`, then `git write-tree`. Ambient/global git **attributes** are
+  neutralized (`GIT_ATTR_NOSYSTEM=1`, `core.attributesFile=/dev/null`) alongside the existing config
+  neutralization, so a hostile in-tree `.gitattributes`/`.gitignore` in a snapshot can no longer
+  rewrite reviewed bytes (e.g. `text=auto`/EOL normalization), drop a member, or mask an
+  executable-mode change before the derived patch is produced. The changed-file set is read
+  NUL-delimited (`git diff --name-only -z`) so a path with a space/tab/newline is carried exactly, and
+  `safe_extract_source_archive` preserves the archive's executable bit masked to ordinary permission
+  bits (`& 0o777`; setuid/setgid/sticky are never written). Guarded by `tests/test_target.py`.
+- **`pr-review` stores the source crash-repair receipt adjacent to `RUN/source`, not inside it.** The
+  materialized `RUN/source` snapshot now holds **exactly** the reviewed archive members; the
+  crash-repair receipt (`target_sha256`/`archive_sha256`/`kind`) is written to the adjacent run-state
+  path `RUN/source.receipt.json` instead of a reserved file inside the tree, so a reviewed repository
+  file that happens to use that name materializes unchanged and is visible to peers. The receipt is
+  written **before** the source staging rename and `source_materialized` is appended only after, so
+  every crash boundary stays idempotently repairable by a same-archive retry while a different or
+  unreadable archive/target is rejected (the materialization is immutable, never silently
+  overwritten). Guarded by `tests/test_target.py` and `tests/test_cli.py`.
 - **`pr-review` trusts the snapshot-derived changed-file set (no false rejections on renames / large
   PRs).** GitHub PR normalization now derives `changed_files` **solely** from the immutable
   merge-base→head snapshot patch and no longer requires it to equal GitHub's own `files` view. That view

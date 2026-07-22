@@ -22,7 +22,7 @@ from crucible.target import (
     MAX_ARCHIVE_MEMBERS,
     SHA1_RE,
     SHA256_RE,
-    SOURCE_RECEIPT_NAME,
+    SOURCE_RECEIPT_SUFFIX,
     TARGET_KINDS,
     TARGET_VERSION,
     ReviewTarget,
@@ -34,10 +34,12 @@ from crucible.target import (
     safe_extract_source_archive,
     source_receipt,
     source_receipt_matches,
+    source_receipt_path,
     target_event_issues,
     target_from_events,
     target_sha256,
     validate_source_materialization,
+    write_source_receipt,
 )
 
 
@@ -1123,6 +1125,131 @@ def test_github_normalization_large_paginated_file_list_uses_snapshot(tmp_path):
 
 
 # --------------------------------------------------------------------------------------
+# Raw snapshot tree construction (F1): the derived patch must reflect the EXACT archive bytes
+# and modes, built with plumbing that never runs a clean/smudge/eol/working-tree-encoding filter
+# (never `git add`), so an in-tree `.gitattributes` cannot rewrite the reviewed content.
+# --------------------------------------------------------------------------------------
+
+def _codeload_archive_modes(path, wrapper, files):
+    """A GitHub codeload tarball where ``files`` maps a repo-relative path to ``(bytes, mode)`` so a
+    fixture can carry an in-tree ``.gitattributes`` and per-file executable bits verbatim."""
+    def build(tar):
+        _add_dir(tar, f"{wrapper}/")
+        seen = {""}
+        for rel in sorted(files):
+            data, mode = files[rel]
+            parts = rel.split("/")
+            for i in range(1, len(parts)):
+                d = "/".join(parts[:i])
+                if d not in seen:
+                    _add_dir(tar, f"{wrapper}/{d}/")
+                    seen.add(d)
+            info = tarfile.TarInfo(f"{wrapper}/{rel}")
+            info.size = len(data)
+            info.mode = mode
+            tar.addfile(info, io.BytesIO(data))
+    return _write_tar(path, build)
+
+
+def test_github_snapshot_patch_preserves_crlf_under_hostile_gitattributes(tmp_path):
+    # F1 REGRESSION (RED under `git add`): an in-tree `.gitattributes` that requests EOL/text
+    # normalization must NOT rewrite the reviewed bytes. Under `git add`, `* text=auto` runs the CRLF
+    # clean filter on check-in, so the snapshot blobs (and the derived patch) lose their carriage
+    # returns — the review would see phantom line-ending changes. The raw plumbing hashes the exact
+    # archive bytes, so the CRLF survives in the derived patch on BOTH sides of the change.
+    attrs = (b"* text=auto\n*.txt eol=crlf\n", 0o644)
+    merge_base = _codeload_archive_modes(tmp_path / "merge-base.tar", "base-repo-1", {
+        ".gitattributes": attrs, "data.txt": (b"alpha\r\nbeta\r\n", 0o644)})
+    head = _codeload_archive_modes(tmp_path / "head.tar", "fork-repo-2", {
+        ".gitattributes": attrs, "data.txt": (b"alpha\r\ngamma\r\n", 0o644)})
+    md = _gh_metadata(files=[{"path": "data.txt"}])
+    cmp = _compare_metadata(files=["data.txt"])
+    target, diff = normalize_github_target(md, md, cmp, merge_base, head)
+    assert b"\r" in diff, "the derived patch must preserve the archive's CRLF bytes exactly"
+    assert b"beta\r" in diff and b"gamma\r" in diff  # both sides keep their carriage returns
+    assert target.diff_sha256 == hashlib.sha256(diff).hexdigest()
+
+
+def test_github_snapshot_patch_preserves_executable_bit(tmp_path):
+    # F1 REGRESSION (RED under `git add`): the archive's executable mode must reach the Git tree. Under
+    # `git add`, extraction dropped the exec bit and both trees were 100644, so an exec-only change
+    # produced an EMPTY patch (the review missed a real permission change). The raw plumbing preserves
+    # the archive mode: an exec-bit flip shows a mode change, and a new executable file is 100755.
+    unchanged = b"#!/bin/sh\necho hi\n"
+    merge_base = _codeload_archive_modes(tmp_path / "merge-base.tar", "base-repo-1", {
+        "run.sh": (unchanged, 0o644)})
+    head = _codeload_archive_modes(tmp_path / "head.tar", "fork-repo-2", {
+        "run.sh": (unchanged, 0o755), "new-exe.sh": (b"#!/bin/sh\ntrue\n", 0o755)})
+    files = ["new-exe.sh", "run.sh"]
+    md = _gh_metadata(files=[{"path": p} for p in files])
+    cmp = _compare_metadata(files=files)
+    _target, diff = normalize_github_target(md, md, cmp, merge_base, head)
+    text = diff.decode("utf-8", "replace")
+    assert "old mode 100644" in text and "new mode 100755" in text  # run.sh exec-bit flip is visible
+    assert "new file mode 100755" in text                            # new-exe.sh is executable
+
+
+def test_github_snapshot_patch_handles_unusual_filenames_via_nul_plumbing(tmp_path):
+    # F1: names with spaces/tabs/newlines are carried through the tree build with NUL-delimited plumbing
+    # (never a whitespace-split or C-quoted parse). The only changed file has a space+tab+newline in its
+    # name; its new content must appear in the derived patch AND the snapshot-derived changed-file set
+    # must carry the name back verbatim — so a regression that whitespace-splits or C-quotes the path
+    # (mis-parsing changed_files) is caught, not just one that drops the body.
+    weird = "weird dir/a b\tc\nd.py"
+    merge_base = _codeload_archive_modes(tmp_path / "merge-base.tar", "base-repo-1", {
+        weird: (b"OLDBODY\n", 0o644)})
+    head = _codeload_archive_modes(tmp_path / "head.tar", "fork-repo-2", {
+        weird: (b"NEWBODY\n", 0o644)})
+    md = _gh_metadata(files=[{"path": weird}])
+    cmp = _compare_metadata(files=[weird])
+    target, diff = normalize_github_target(md, md, cmp, merge_base, head)
+    assert b"OLDBODY" in diff and b"NEWBODY" in diff
+    assert target.changed_files == (weird,)  # NUL-delimited name carried back exactly, unquoted
+
+
+def test_github_snapshot_patch_omits_empty_dirs_keeps_empty_and_binary_files(tmp_path):
+    # F1: Git tracks only files, so an empty directory member is omitted (as `git add` did); an empty
+    # (zero-byte) new file and a binary new file are both captured.
+    merge_base = _codeload_archive_modes(tmp_path / "merge-base.tar", "base-repo-1", {
+        "keep.py": (b"v1\n", 0o644)})
+    def build(tar):
+        _add_dir(tar, "fork-repo-2/")
+        _add_dir(tar, "fork-repo-2/emptydir/")          # empty directory -> must not appear
+        _add_file(tar, "fork-repo-2/keep.py", b"v1\n")   # unchanged
+        _add_file(tar, "fork-repo-2/empty.txt", b"")     # new zero-byte file
+        info = tarfile.TarInfo("fork-repo-2/img.bin"); info.size = 6
+        tar.addfile(info, io.BytesIO(b"\x00\x01\x02\xff\xfeZ"))
+    head = _write_tar(tmp_path / "head.tar", build)
+    files = ["empty.txt", "img.bin"]
+    md = _gh_metadata(files=[{"path": p} for p in files])
+    cmp = _compare_metadata(files=files)
+    target, diff = normalize_github_target(md, md, cmp, merge_base, head)
+    text = diff.decode("utf-8", "replace")
+    assert "emptydir" not in text and "emptydir" not in " ".join(target.changed_files)
+    assert "empty.txt" in target.changed_files and "img.bin" in target.changed_files
+    assert "keep.py" not in target.changed_files          # unchanged file absent
+    assert "GIT binary patch" in text                     # binary new file captured
+
+
+def test_snapshot_tree_construction_never_uses_git_add(tmp_path):
+    # F1 guard: the snapshot tree is built from raw bytes with filter-free plumbing (hash-object
+    # --no-filters + update-index/mktree), never `git add`, so no clean/smudge/eol filter can run.
+    import inspect
+    import crucible.target as t
+    for fn in (t._write_snapshot_tree, t._git_snapshot_diff, t._derive_github_patch):
+        src = inspect.getsource(fn)
+        assert '"add"' not in src and "'add'" not in src, \
+            f"{fn.__name__} must not shell out to `git add` (it runs check-in filters)"
+    tree_src = inspect.getsource(t._write_snapshot_tree)
+    assert "hash-object" in tree_src and "--no-filters" in tree_src
+    assert "update-index" in tree_src or "mktree" in tree_src
+    # The member is STREAMED into git via its stdin fd, never loaded whole into memory (a member may be
+    # up to MAX_ARCHIVE_BYTES), so snapshot hashing must not read the entire file with read_bytes().
+    assert "read_bytes(" not in tree_src, "snapshot hashing must stream the file, not read it whole"
+    assert "stdin=" in tree_src, "snapshot hashing must stream the file descriptor into git"
+
+
+# --------------------------------------------------------------------------------------
 # Normalization: diff-file (patch only)
 # --------------------------------------------------------------------------------------
 
@@ -1197,8 +1324,9 @@ def test_extract_github_style_strips_top_level(tmp_path):
     assert not (dest / "owner-repo-abc123").exists()
     # staging is gone after the atomic rename
     assert not (tmp_path / "source.staging").exists()
-    # no receipt is written unless one is requested
-    assert not (dest / SOURCE_RECEIPT_NAME).exists()
+    # extraction NEVER writes Crucible metadata into the reviewed source, nor an adjacent receipt
+    assert list(p.name for p in dest.iterdir()) == sorted(["README.md", "src"])
+    assert not source_receipt_path(dest).exists()
 
 
 def test_source_receipt_helpers_bind_triple():
@@ -1212,24 +1340,114 @@ def test_source_receipt_helpers_bind_triple():
     assert not source_receipt_matches(None, "t" * 64, "a" * 64, "github-pr")
 
 
-def test_extract_writes_receipt_atomically_inside_source(tmp_path):
-    # F3: a requested receipt lands INSIDE RUN/source as part of the atomic rename (source + receipt
-    # appear together), and read_source_receipt round-trips it.
+def test_source_receipt_path_is_adjacent_to_source(tmp_path):
+    # F2: the crash-repair receipt is a SIBLING run-state file (`RUN/source.receipt.json`), never a
+    # member of the reviewed source tree.
+    dest = tmp_path / "run" / "source"
+    p = source_receipt_path(dest)
+    assert p == dest.with_name("source" + SOURCE_RECEIPT_SUFFIX)
+    assert p.parent == dest.parent and p.name == "source.receipt.json"
+
+
+def test_write_source_receipt_is_adjacent_not_inside_source(tmp_path):
+    # F2: the receipt is written to the adjacent run-state path OUTSIDE RUN/source (so RUN/source stays
+    # exactly the archive members), and read_source_receipt round-trips it from there.
     archive = _github_style_archive(tmp_path / "src.tar")
     dest = tmp_path / "source"
+    safe_extract_source_archive(archive, dest, strip_wrapper=True)
     receipt = source_receipt("t" * 64, "a" * 64, "github-pr")
-    safe_extract_source_archive(archive, dest, strip_wrapper=True, receipt=receipt)
-    assert (dest / SOURCE_RECEIPT_NAME).exists()
+    write_source_receipt(dest, receipt)
+    assert source_receipt_path(dest).exists()
+    assert not (dest / "source.receipt.json").exists()      # not inside the reviewed tree
+    assert sorted(p.name for p in dest.iterdir()) == ["README.md", "src"]  # source untouched
     assert read_source_receipt(dest) == receipt
     assert source_receipt_matches(read_source_receipt(dest), "t" * 64, "a" * 64, "github-pr")
+
+
+def test_write_source_receipt_is_atomic(tmp_path, monkeypatch):
+    # F2: a failed receipt write leaves no partial/visible receipt and no leftover staging file.
+    dest = tmp_path / "source"
+    dest.mkdir()
+    real_replace = target_mod.os.replace
+
+    def boom(src, dst, *a, **k):
+        if str(dst).endswith("source.receipt.json"):
+            raise OSError("injected receipt replace failure")
+        return real_replace(src, dst, *a, **k)
+
+    monkeypatch.setattr(target_mod.os, "replace", boom)
+    with pytest.raises(OSError):
+        write_source_receipt(dest, source_receipt("t" * 64, "a" * 64, "github-pr"))
+    assert not source_receipt_path(dest).exists()
+    assert not source_receipt_path(dest).with_name("source.receipt.json.staging").exists()
+
+
+def test_write_source_receipt_cleans_staging_on_write_failure(tmp_path, monkeypatch):
+    # F2: a failure DURING the staging write (not only os.replace) must not leave a staging file behind —
+    # the staging write is inside the same cleanup block as the rename.
+    dest = tmp_path / "source"
+    dest.mkdir()
+    staging = source_receipt_path(dest).with_name("source.receipt.json.staging")
+    real_write_text = target_mod.Path.write_text
+
+    def boom(self, *a, **k):
+        if str(self).endswith("source.receipt.json.staging"):
+            real_write_text(self, "{partial")   # create a partial staging file, then fail mid-write
+            raise OSError("injected receipt write failure")
+        return real_write_text(self, *a, **k)
+
+    monkeypatch.setattr(target_mod.Path, "write_text", boom)
+    with pytest.raises(OSError):
+        write_source_receipt(dest, source_receipt("t" * 64, "a" * 64, "github-pr"))
+    assert not staging.exists(), "a failed staging write must be cleaned up"
+    assert not source_receipt_path(dest).exists()
+
+
+def test_extract_preserves_archive_member_named_like_the_legacy_receipt(tmp_path):
+    # F2 COLLISION (RED before the move): a repository file literally named
+    # `.crucible-source-receipt.json` is a legitimate archive member and must materialize UNCHANGED and
+    # be visible to peers — the crash-repair receipt no longer lives inside RUN/source, so it can never
+    # shadow or corrupt this file.
+    payload = b'{"this":"is real repo content, not a crucible receipt"}\n'
+    def build(tar):
+        _add_dir(tar, "owner-repo-abc/")
+        _add_file(tar, "owner-repo-abc/.crucible-source-receipt.json", payload)
+        _add_file(tar, "owner-repo-abc/README.md", b"# readme\n")
+    archive = _write_tar(tmp_path / "src.tar", build)
+    dest = tmp_path / "source"
+    receipt = source_receipt("t" * 64, "a" * 64, "github-pr")
+    write_source_receipt(dest, receipt)
+    safe_extract_source_archive(archive, dest, strip_wrapper=True)
+    assert (dest / ".crucible-source-receipt.json").read_bytes() == payload  # unchanged, visible
+    # the authoritative crash-repair receipt is the adjacent run-state file, not this repo member
+    assert read_source_receipt(dest) == receipt
+    assert source_receipt_path(dest) != (dest / ".crucible-source-receipt.json")
 
 
 def test_read_source_receipt_tolerates_missing_or_corrupt(tmp_path):
     dest = tmp_path / "source"
     dest.mkdir()
     assert read_source_receipt(dest) is None  # absent
-    (dest / SOURCE_RECEIPT_NAME).write_text("{not json")
+    source_receipt_path(dest).write_text("{not json")
     assert read_source_receipt(dest) is None  # corrupt (never raises)
+
+
+def test_extract_preserves_executable_mode_safely(tmp_path):
+    # F1: safe extraction applies the archive's executable bit but masks off setuid/setgid/sticky, so a
+    # `100755`/`100644` distinction survives for the tree build without ever writing a privileged bit.
+    def build(tar):
+        _add_dir(tar, "owner-repo-abc/")
+        for name, mode in (("plain.txt", 0o644), ("run.sh", 0o755), ("setuid.sh", 0o4755)):
+            info = tarfile.TarInfo(f"owner-repo-abc/{name}"); info.size = 3; info.mode = mode
+            tar.addfile(info, io.BytesIO(b"abc"))
+    archive = _write_tar(tmp_path / "src.tar", build)
+    dest = tmp_path / "source"
+    safe_extract_source_archive(archive, dest, strip_wrapper=True)
+    assert not (os.stat(dest / "plain.txt").st_mode & 0o111)     # non-executable preserved
+    assert os.stat(dest / "run.sh").st_mode & 0o111              # executable preserved
+    setuid = os.stat(dest / "setuid.sh").st_mode
+    assert setuid & 0o111                                        # exec bit kept
+    assert not (setuid & 0o7000)                                 # setuid/setgid/sticky stripped
 
 
 def test_extract_flat_archive_without_wrapper(tmp_path):

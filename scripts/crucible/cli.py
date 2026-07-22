@@ -48,8 +48,10 @@ from crucible.target import (
     safe_extract_source_archive,
     source_receipt,
     source_receipt_matches,
+    source_receipt_path,
     target_from_events,
     target_sha256,
+    write_source_receipt,
 )
 from crucible.verdict import VALID_RESOLUTIONS, Finding, Verdict, decide
 from crucible.workflow import (
@@ -1462,17 +1464,21 @@ def cmd_materialize_target(args) -> int:
     from the immutable target *kind* (github-pr strips its one codeload wrapper; local-range preserves
     archive paths) — never a caller flag.
 
-    The confined tree is extracted into staging, a canonical receipt (``target_sha256``,
-    ``archive_sha256``, ``kind``) is written INTO it, the whole unit is atomically renamed into the
-    ABSENT ``RUN/source``, and only then is the ``source_materialized`` event appended. This ordering
-    makes both the filesystem and the run-log idempotently repairable:
+    The confined tree is extracted into staging and atomically renamed into the ABSENT ``RUN/source``,
+    which then holds ONLY the reviewed archive members. The canonical crash-repair receipt
+    (``target_sha256``, ``archive_sha256``, ``kind``) is written to the ADJACENT run-state path
+    ``RUN/source.receipt.json`` (never inside the reviewed tree) **before** the source rename, and only
+    then is the ``source_materialized`` event appended. This ordering makes both the filesystem and the
+    run-log idempotently repairable:
 
-    - append crashed after ``RUN/source`` exists → a rerun with the SAME archive validates the receipt
-      and appends the event WITHOUT re-extracting or deleting the valid source;
+    - append crashed after ``RUN/source`` exists → a rerun with the SAME archive validates the adjacent
+      receipt and appends the event WITHOUT re-extracting or deleting the valid source;
+    - the receipt was written but the source rename crashed → a SAME-archive rerun reuses the matching
+      receipt and extracts; a DIFFERENT archive/target is rejected (the materialization is immutable);
     - the matching event exists but ``RUN/source`` is gone → the SAME archive restores the source
       WITHOUT a duplicate event;
-    - an existing source with a mismatched/absent receipt, or an event bound to a different
-      archive/target, is REJECTED (never silently deleted).
+    - an existing source with a mismatched/absent/corrupt adjacent receipt, or an event bound to a
+      different archive/target, is REJECTED (never silently deleted).
     """
     run = RunLog(args.run)
     _require_run_integrity(run)
@@ -1516,6 +1522,14 @@ def cmd_materialize_target(args) -> int:
     strip_wrapper = kind == "github-pr"
     receipt = source_receipt(tsha, asha, kind)
 
+    def _materialize_source() -> None:
+        # The crash-repair receipt is written to the ADJACENT run-state path (outside RUN/source)
+        # BEFORE the source staging rename, so RUN/source only ever holds the reviewed archive members
+        # and a crash between the two leaves a matching receipt with no source that a same-archive retry
+        # repairs (a different archive/target is rejected as an immutable-materialization violation).
+        write_source_receipt(destination, receipt)
+        safe_extract_source_archive(args.archive, destination, strip_wrapper=strip_wrapper)
+
     if materialized:
         # The authoritative event already exists. It must bind exactly this archive+target (a different
         # one is an immutable-materialization violation), and then either the source is already present
@@ -1530,13 +1544,20 @@ def cmd_materialize_target(args) -> int:
         if destination.exists():
             if not source_receipt_matches(read_source_receipt(destination), tsha, asha, kind):
                 raise SystemExit(
-                    f"crucible: {destination} exists but its receipt does not match the recorded "
-                    "source snapshot; refusing to trust or delete it — start a fresh run")
+                    f"crucible: {destination} exists but its adjacent receipt does not match the "
+                    "recorded source snapshot; refusing to trust or delete it — start a fresh run")
             print(f"source already materialized for {kind} target at {destination}")
             return 0
-        # Matching event, missing source: restore the exact snapshot from the same archive.
-        safe_extract_source_archive(args.archive, destination,
-                                    strip_wrapper=strip_wrapper, receipt=receipt)
+        # Matching event, missing source: restore the exact snapshot from the same archive. A present
+        # adjacent receipt that does NOT match this archive/target (e.g. tampered or from a different
+        # aborted run) is rejected rather than silently overwritten — the same fail-closed invariant
+        # the no-event branch below enforces; an absent receipt is written fresh by the restore.
+        if (source_receipt_path(destination).exists()
+                and not source_receipt_matches(read_source_receipt(destination), tsha, asha, kind)):
+            raise SystemExit(
+                f"crucible: {destination} is missing but its adjacent receipt is bound to a different "
+                "archive/target (or is unreadable); refusing to overwrite it — start a fresh run")
+        _materialize_source()
         print(f"restored {kind} source at {destination}")
         return 0
 
@@ -1545,14 +1566,22 @@ def cmd_materialize_target(args) -> int:
     if destination.exists():
         if not source_receipt_matches(read_source_receipt(destination), tsha, asha, kind):
             raise SystemExit(
-                f"crucible: {destination} exists but its receipt does not match this archive/target; "
-                "refusing to trust or delete it — start a fresh run")
+                f"crucible: {destination} exists but its adjacent receipt does not match this "
+                "archive/target; refusing to trust or delete it — start a fresh run")
         run.append("source_materialized", kind=kind, target_sha256=tsha, archive_sha256=asha)
         print(f"recorded {kind} source materialization at {destination}")
         return 0
 
-    safe_extract_source_archive(args.archive, destination,
-                                strip_wrapper=strip_wrapper, receipt=receipt)
+    # No event and no source. A stale ADJACENT receipt may survive a receipt-write + rename crash: a
+    # matching one is reused below, but a present-but-different (or unreadable) one is rejected — the
+    # source materialization is immutable and an authoritative receipt is never silently overwritten.
+    if (source_receipt_path(destination).exists()
+            and not source_receipt_matches(read_source_receipt(destination), tsha, asha, kind)):
+        raise SystemExit(
+            "crucible: an adjacent source receipt is bound to a different archive/target (or is "
+            "unreadable); the source materialization is immutable — start a fresh run")
+
+    _materialize_source()
     run.append("source_materialized", kind=kind, target_sha256=tsha, archive_sha256=asha)
     print(f"materialized {kind} source at {destination}")
     return 0
