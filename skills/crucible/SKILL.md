@@ -135,7 +135,9 @@ new gate begins.
    the approved plan + dependency tree to stderr** (the outcome token stays alone on stdout), so the
    final plan and DAG are shown before implementation **in a real terminal**. On the Copilot CLI,
    bash-tool output is collapsed and not visible to the human, so you **must** surface them yourself
-   (step 6). Then:
+   (step 6). **Run the settling `verdict` plainly — never pipe it through `grep`/`head`/`tail`/`sed`
+   or `2>/dev/null`; filtering for the outcome token drops the auto-echoed plan, leaving step 6 as
+   the only place the human sees it, so step 6 is mandatory, not optional.** Then:
    - `CONSENSUS` -> proceed to the **approval gate** below.
    - `CHANGES` -> revise as Builder, increment N, then **repeat from step 2** — re-emit the
      dependency tree (the Critic reviews DAG edges/order too) and re-run `load-dag` so a
