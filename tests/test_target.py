@@ -22,6 +22,7 @@ from crucible.target import (
     MAX_ARCHIVE_MEMBERS,
     SHA1_RE,
     SHA256_RE,
+    SOURCE_RECEIPT_NAME,
     TARGET_KINDS,
     TARGET_VERSION,
     ReviewTarget,
@@ -29,7 +30,10 @@ from crucible.target import (
     normalize_github_target,
     normalize_local_target,
     normalized_repository_identity,
+    read_source_receipt,
     safe_extract_source_archive,
+    source_receipt,
+    source_receipt_matches,
     target_event_issues,
     target_from_events,
     target_sha256,
@@ -793,9 +797,34 @@ def _gh_metadata(**overrides):
     return md
 
 
-def test_github_normalization_preserves_cross_fork_identity():
-    diff = b"patch bytes"
-    target = normalize_github_target(_gh_metadata(), _gh_metadata(), diff)
+def _codeload_archive(path, wrapper, files):
+    """A GitHub codeload-style tarball: every path nested under a single ``wrapper/`` directory (the
+    ``owner-repo-<sha>/`` prefix ``gh api repos/.../tarball/<sha>`` emits), which the normalizer strips
+    before deriving the snapshot patch. ``files`` maps a repository-relative path to its exact bytes."""
+    import tarfile as _tf
+
+    def build(tar):
+        _add_dir(tar, f"{wrapper}/")
+        seen = {""}
+        for rel in sorted(files):
+            parts = rel.split("/")
+            for i in range(1, len(parts)):
+                d = "/".join(parts[:i])
+                if d not in seen:
+                    _add_dir(tar, f"{wrapper}/{d}/")
+                    seen.add(d)
+            info = _tf.TarInfo(f"{wrapper}/{rel}")
+            info.size = len(files[rel])
+            tar.addfile(info, io.BytesIO(files[rel]))
+    return _write_tar(path, build)
+
+
+def test_github_normalization_preserves_cross_fork_identity(tmp_path):
+    base = _codeload_archive(tmp_path / "base.tar", "base-repo-111",
+                             {"src/a.py": b"print('base')\n"})
+    head = _codeload_archive(tmp_path / "head.tar", "fork-repo-222",
+                             {"src/a.py": b"print('head')\n"})
+    target, diff = normalize_github_target(_gh_metadata(), _gh_metadata(), base, head)
     assert target.kind == "github-pr"
     assert target.repository == "base/repo"
     assert target.base.repository == "base/repo" and target.base.sha == "1" * 40
@@ -804,13 +833,95 @@ def test_github_normalization_preserves_cross_fork_identity():
     assert target.is_cross_repository is True
     assert target.pr_number == 7
     assert target.changed_files == ("src/a.py",)
+    # The patch is DERIVED from the two snapshots (not accepted from a caller), and its hash binds it.
     assert target.diff_sha256 == hashlib.sha256(diff).hexdigest()
+    text = diff.decode()
+    assert "a/src/a.py b/src/a.py" in text
+    assert "-print('base')" in text and "+print('head')" in text
 
 
-def test_github_normalization_same_repo_pr_is_not_cross():
+def test_github_normalization_derives_patch_from_base_head_snapshots(tmp_path):
+    # F1: the immutable patch is DERIVED from the exact base/head OID snapshots — never accepted from
+    # `gh pr diff` or any caller-supplied patch. An unchanged file must not appear in the derived patch.
+    base = _codeload_archive(tmp_path / "base.tar", "base-repo-aaa",
+                             {"src/app.py": b"print('base')\n", "README.md": b"same\n"})
+    head = _codeload_archive(tmp_path / "head.tar", "fork-repo-bbb",
+                             {"src/app.py": b"print('head')\n", "README.md": b"same\n"})
+    md = _gh_metadata(files=[{"path": "src/app.py"}])
+    target, diff = normalize_github_target(md, md, base, head)
+    assert target.changed_files == ("src/app.py",)
+    text = diff.decode()
+    assert "a/src/app.py b/src/app.py" in text
+    assert "README.md" not in text  # an unchanged file is never in the derived patch
+    # Deterministic: a re-derivation from the same snapshots yields byte-identical patch + hash.
+    target2, diff2 = normalize_github_target(md, md, base, head)
+    assert diff2 == diff and target2.diff_sha256 == target.diff_sha256
+
+
+def test_github_patch_is_pure_function_of_snapshots_not_caller(tmp_path):
+    # F1 ABA regression: the derived target is a pure function of the two archives. There is NO caller
+    # diff parameter to smuggle an unrelated "B" patch through, so before/after "A" metadata with any
+    # B-flavoured field can never change the patch — only the snapshots decide it.
+    import inspect
+    assert "diff" not in inspect.signature(normalize_github_target).parameters, \
+        "normalize_github_target must not accept a caller-supplied diff (derive from snapshots)"
+
+    base_a = _codeload_archive(tmp_path / "baseA.tar", "base-repo-a1",
+                               {"src/app.py": b"print('A base')\n"})
+    head_a = _codeload_archive(tmp_path / "headA.tar", "fork-repo-a2",
+                               {"src/app.py": b"print('A head')\n"})
+    head_b = _codeload_archive(tmp_path / "headB.tar", "fork-repo-b2",
+                               {"src/app.py": b"print('B head is unrelated')\n"})
+    md = _gh_metadata(files=[{"path": "src/app.py"}])
+
+    target_a, diff_a = normalize_github_target(md, md, base_a, head_a)
+    # A known-A snapshot pair yields a stable A patch/hash regardless of metadata prose.
+    md_prose = _gh_metadata(files=[{"path": "src/app.py"}], title="totally different", body="B story")
+    target_a2, diff_a2 = normalize_github_target(md_prose, md_prose, base_a, head_a)
+    assert diff_a2 == diff_a and target_a2.diff_sha256 == target_a.diff_sha256
+
+    # Swapping in an unrelated B head snapshot is the ONLY way the patch changes — it tracks content.
+    target_b, diff_b = normalize_github_target(md, md, base_a, head_b)
+    assert diff_b != diff_a and target_b.diff_sha256 != target_a.diff_sha256
+
+
+def test_github_normalization_derives_changed_files_and_rejects_metadata_disagreement(tmp_path):
+    # F1: changed_files is DERIVED from the snapshots; metadata files that disagree are rejected rather
+    # than trusted (a tampered/ stale file list can never become the authoritative changed-files set).
+    base = _codeload_archive(tmp_path / "base.tar", "base-repo-x",
+                             {"src/app.py": b"a\n"})
+    head = _codeload_archive(tmp_path / "head.tar", "fork-repo-y",
+                             {"src/app.py": b"b\n"})
+    good = _gh_metadata(files=[{"path": "src/app.py"}])
+    target, _diff = normalize_github_target(good, good, base, head)
+    assert target.changed_files == ("src/app.py",)
+
+    lying = _gh_metadata(files=[{"path": "src/other.py"}])
+    with pytest.raises(ValueError, match="disagree"):
+        normalize_github_target(lying, lying, base, head)
+
+
+def test_github_normalization_captures_new_deleted_binary(tmp_path):
+    base = _codeload_archive(tmp_path / "base.tar", "base-repo-1", {
+        "keep.py": b"v1\n", "gone.py": b"bye\n", "img.bin": b"\x00\x01\x02BIN\xff",
+    })
+    head = _codeload_archive(tmp_path / "head.tar", "fork-repo-2", {
+        "keep.py": b"v2\n", "new.py": b"hi\n", "img.bin": b"\x00\x01\x02CHANGED\xff",
+    })
+    md = _gh_metadata(files=[{"path": "gone.py"}, {"path": "img.bin"},
+                             {"path": "keep.py"}, {"path": "new.py"}])
+    target, diff = normalize_github_target(md, md, base, head)
+    assert target.changed_files == ("gone.py", "img.bin", "keep.py", "new.py")
+    text = diff.decode("utf-8", "replace")
+    assert "new file mode" in text and "deleted file mode" in text and "GIT binary patch" in text
+
+
+def test_github_normalization_same_repo_pr_is_not_cross(tmp_path):
+    base = _codeload_archive(tmp_path / "base.tar", "base-repo-1", {"src/a.py": b"o\n"})
+    head = _codeload_archive(tmp_path / "head.tar", "base-repo-2", {"src/a.py": b"n\n"})
     md = _gh_metadata(headRepository={"nameWithOwner": "base/repo"},
                       headRepositoryOwner={"login": "base"}, isCrossRepository=False)
-    target = normalize_github_target(md, md, b"p")
+    target, _diff = normalize_github_target(md, md, base, head)
     assert target.is_cross_repository is False
     assert target.head.repository == "base/repo"
 
@@ -828,18 +939,26 @@ def test_github_normalization_same_repo_pr_is_not_cross():
     ("isCrossRepository", False),
     ("files", [{"path": "src/b.py"}]),
 ])
-def test_github_normalization_rejects_before_after_mismatch(field, value):
+def test_github_normalization_rejects_before_after_mismatch(tmp_path, field, value):
+    # Identity drift is detected BEFORE any archive is extracted, so the archives are never even read.
+    base = _codeload_archive(tmp_path / "base.tar", "base-repo-1", {"src/a.py": b"o\n"})
+    head = _codeload_archive(tmp_path / "head.tar", "fork-repo-2", {"src/a.py": b"n\n"})
     before = _gh_metadata()
     after = _gh_metadata(**{field: value})
     with pytest.raises(ValueError):
-        normalize_github_target(before, after, b"p")
+        normalize_github_target(before, after, base, head)
 
 
-def test_github_normalization_accepts_stable_identity_reordered_files():
-    # Same file set in a different list order is still stable identity (files are order-normalized).
+def test_github_normalization_accepts_stable_identity_reordered_files(tmp_path):
+    # Same file set in a different list order is still stable identity (files are order-normalized), and
+    # the derived changed-files set (from the snapshots) must match that normalized metadata set.
+    base = _codeload_archive(tmp_path / "base.tar", "base-repo-1",
+                             {"src/a.py": b"a1\n", "src/b.py": b"b1\n"})
+    head = _codeload_archive(tmp_path / "head.tar", "fork-repo-2",
+                             {"src/a.py": b"a2\n", "src/b.py": b"b2\n"})
     before = _gh_metadata(files=[{"path": "src/a.py"}, {"path": "src/b.py"}])
     after = _gh_metadata(files=[{"path": "src/b.py"}, {"path": "src/a.py"}])
-    target = normalize_github_target(before, after, b"p")
+    target, _diff = normalize_github_target(before, after, base, head)
     assert target.changed_files == ("src/a.py", "src/b.py")
 
 
@@ -918,6 +1037,39 @@ def test_extract_github_style_strips_top_level(tmp_path):
     assert not (dest / "owner-repo-abc123").exists()
     # staging is gone after the atomic rename
     assert not (tmp_path / "source.staging").exists()
+    # no receipt is written unless one is requested
+    assert not (dest / SOURCE_RECEIPT_NAME).exists()
+
+
+def test_source_receipt_helpers_bind_triple():
+    r = source_receipt("t" * 64, "a" * 64, "github-pr")
+    assert r["target_sha256"] == "t" * 64 and r["archive_sha256"] == "a" * 64
+    assert r["kind"] == "github-pr"
+    assert source_receipt_matches(r, "t" * 64, "a" * 64, "github-pr")
+    assert not source_receipt_matches(r, "0" * 64, "a" * 64, "github-pr")
+    assert not source_receipt_matches(r, "t" * 64, "0" * 64, "github-pr")
+    assert not source_receipt_matches(r, "t" * 64, "a" * 64, "local-range")
+    assert not source_receipt_matches(None, "t" * 64, "a" * 64, "github-pr")
+
+
+def test_extract_writes_receipt_atomically_inside_source(tmp_path):
+    # F3: a requested receipt lands INSIDE RUN/source as part of the atomic rename (source + receipt
+    # appear together), and read_source_receipt round-trips it.
+    archive = _github_style_archive(tmp_path / "src.tar")
+    dest = tmp_path / "source"
+    receipt = source_receipt("t" * 64, "a" * 64, "github-pr")
+    safe_extract_source_archive(archive, dest, strip_wrapper=True, receipt=receipt)
+    assert (dest / SOURCE_RECEIPT_NAME).exists()
+    assert read_source_receipt(dest) == receipt
+    assert source_receipt_matches(read_source_receipt(dest), "t" * 64, "a" * 64, "github-pr")
+
+
+def test_read_source_receipt_tolerates_missing_or_corrupt(tmp_path):
+    dest = tmp_path / "source"
+    dest.mkdir()
+    assert read_source_receipt(dest) is None  # absent
+    (dest / SOURCE_RECEIPT_NAME).write_text("{not json")
+    assert read_source_receipt(dest) is None  # corrupt (never raises)
 
 
 def test_extract_flat_archive_without_wrapper(tmp_path):

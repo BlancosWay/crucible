@@ -23,24 +23,36 @@ materialize a **pinned, read-only source snapshot** of the exact head commit. Br
 metadata; the base/head commit **OIDs** and repository identities are authoritative. A target is
 immutable — correcting it needs a **fresh run**.
 
-**GitHub PR** (`--goal` names a PR number/URL). Read the metadata **before and after** `gh pr diff`
-and fail **closed** without relying on a global `set -e`: error-check each of the three `gh` reads and
-run `normalize-target` **only after all three succeed** (a failed read otherwise leaves an
-empty/truncated artifact that stable before/after metadata would still normalize). Any failure — a
-non-zero `gh` read, or a metadata drift between the two reads (an identity field moved) — discards
-**every** partial before/after/diff/target artifact and retries (≤3 attempts, halting clearly on
-exhaustion). The stable before/after title/body supplies the intent directly:
+**GitHub PR** (`--goal` names a PR number/URL). Read the metadata **before and after** fetching the
+base/head **snapshots**, and fail **closed** without relying on a global `set -e`: error-check the
+first metadata read, the base/head repository+OID parses, **both** codeload archive fetches, and the
+second metadata read, and run `normalize-target` **only after all of them succeed**. The immutable
+patch is **derived** from the two snapshots — base `repository@baseRefOid` and head
+`repository@headRefOid` — **never** from a server-recomputed PR diff or any caller-supplied patch, so
+the target is a pure function of the pinned OIDs and no server-side diff recomputed against a moved
+(the ABA race is eliminated). Any failure — a non-zero `gh`/parse, or a metadata drift between the two
+reads (an identity field moved) — discards **every** partial before/after/archive/target artifact and
+retries (≤3 attempts, halting clearly on exhaustion). The stable before/after title/body supplies the
+intent directly, and the fetched **head** archive is reused for materialization (never re-fetched):
 
 ```bash
+GH_JSON=number,url,title,body,files,baseRefName,baseRefOid,headRefName,headRefOid,headRepository,headRepositoryOwner,isCrossRepository
 for ATTEMPT in 1 2 3; do
   ok=1
-  gh pr view "$PR" --json number,url,title,body,files,baseRefName,baseRefOid,headRefName,headRefOid,headRepository,headRepositoryOwner,isCrossRepository > "$RUN"/pr-before.json || ok=0
-  [ "$ok" = 1 ] && { gh pr diff "$PR" > "$RUN"/pr.diff || ok=0; }
-  [ "$ok" = 1 ] && { gh pr view "$PR" --json number,url,title,body,files,baseRefName,baseRefOid,headRefName,headRefOid,headRepository,headRepositoryOwner,isCrossRepository > "$RUN"/pr-after.json || ok=0; }
-  if [ "$ok" = 1 ] && PYTHONPATH=scripts python3 -m crucible normalize-target github --metadata-before "$RUN"/pr-before.json --metadata-after "$RUN"/pr-after.json --diff "$RUN"/pr.diff --output "$RUN"/target.json --diff-output "$RUN"/target.diff; then
+  gh pr view "$PR" --json "$GH_JSON" > "$RUN"/pr-before.json || ok=0
+  BASE_REPOSITORY=; BASE_OID=; HEAD_REPOSITORY=; HEAD_OID=
+  [ "$ok" = 1 ] && { BASE_REPOSITORY=$(python3 -c 'import json,sys,urllib.parse as u; print("/".join(u.urlsplit(json.load(open(sys.argv[1]))["url"]).path.strip("/").split("/")[:2]))' "$RUN"/pr-before.json) || ok=0; }
+  [ "$ok" = 1 ] && { BASE_OID=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["baseRefOid"])' "$RUN"/pr-before.json) || ok=0; }
+  [ "$ok" = 1 ] && { HEAD_REPOSITORY=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["headRepository"]["nameWithOwner"])' "$RUN"/pr-before.json) || ok=0; }
+  [ "$ok" = 1 ] && { HEAD_OID=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["headRefOid"])' "$RUN"/pr-before.json) || ok=0; }
+  [ "$ok" = 1 ] && { test -n "$BASE_REPOSITORY" && test -n "$BASE_OID" && test -n "$HEAD_REPOSITORY" && test -n "$HEAD_OID" || ok=0; }
+  [ "$ok" = 1 ] && { gh api "repos/$BASE_REPOSITORY/tarball/$BASE_OID" > "$RUN"/base.tar.gz || ok=0; }
+  [ "$ok" = 1 ] && { gh api "repos/$HEAD_REPOSITORY/tarball/$HEAD_OID" > "$RUN"/head.tar.gz || ok=0; }
+  [ "$ok" = 1 ] && { gh pr view "$PR" --json "$GH_JSON" > "$RUN"/pr-after.json || ok=0; }
+  if [ "$ok" = 1 ] && PYTHONPATH=scripts python3 -m crucible normalize-target github --metadata-before "$RUN"/pr-before.json --metadata-after "$RUN"/pr-after.json --base-archive "$RUN"/base.tar.gz --head-archive "$RUN"/head.tar.gz --output "$RUN"/target.json --diff-output "$RUN"/target.diff; then
     break
   fi
-  rm -f "$RUN"/pr-before.json "$RUN"/pr-after.json "$RUN"/pr.diff "$RUN"/target.json "$RUN"/target.diff
+  rm -f "$RUN"/pr-before.json "$RUN"/pr-after.json "$RUN"/base.tar.gz "$RUN"/head.tar.gz "$RUN"/target.json "$RUN"/target.diff
   [ "$ATTEMPT" -lt 3 ] || { echo "pr-review: GitHub target acquisition failed after 3 attempts" >&2; exit 1; }
 done
 ```
@@ -62,29 +74,19 @@ PYTHONPATH=scripts python3 -m crucible show-target --run "$RUN" > "$RUN"/loaded-
 ```
 
 Then materialize the pinned snapshot of the **exact head commit** on the path that matches the target
-kind. Materialization **fails closed and is non-fatal**: any stale archive is removed first,
-`SOURCE_AVAILABLE` defaults to `no`, the fetch/archive **and** `materialize-target` are each explicitly
-checked, any failure discards the partial archive and leaves `SOURCE_AVAILABLE=no` (never relying on a
-global `set -e`), and only a clean fetch **and** materialize set `SOURCE_AVAILABLE=yes`. **GitHub PR** —
-parse the head repository/SHA, require them non-empty, remove any stale archive, then fetch the codeload
-tarball of that head and materialize exactly that `source.tar.gz`, each step checked:
+kind. Materialization **fails closed and is non-fatal**: `SOURCE_AVAILABLE` defaults to `no`,
+`materialize-target` is explicitly checked, any failure leaves `SOURCE_AVAILABLE=no` (never relying on
+a global `set -e`), and only a clean materialize sets `SOURCE_AVAILABLE=yes`. **GitHub PR** — **reuse
+the exact `head.tar.gz` codeload archive already fetched during acquisition** (the head
+`repository@headRefOid` snapshot the patch was derived from); never re-fetch a fresh tarball (a re-fetch
+could observe a moved head). Require the reused archive is present and non-empty, then materialize it:
 
 ```bash
-HEAD_REPOSITORY=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["head"]["repository"])' "$RUN"/loaded-target.json)
-HEAD_SHA=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["head"]["sha"])' "$RUN"/loaded-target.json)
-test -n "$HEAD_REPOSITORY" && test -n "$HEAD_SHA"
-rm -f "$RUN"/source.tar.gz
 SOURCE_AVAILABLE=no
-if gh api "repos/$HEAD_REPOSITORY/tarball/$HEAD_SHA" > "$RUN"/source.tar.gz
+if test -s "$RUN"/head.tar.gz \
+  && PYTHONPATH=scripts python3 -m crucible materialize-target --run "$RUN" --archive "$RUN"/head.tar.gz
 then
-  if PYTHONPATH=scripts python3 -m crucible materialize-target --run "$RUN" --archive "$RUN"/source.tar.gz
-  then
-    SOURCE_AVAILABLE=yes
-  else
-    rm -f "$RUN"/source.tar.gz
-  fi
-else
-  rm -f "$RUN"/source.tar.gz
+  SOURCE_AVAILABLE=yes
 fi
 ```
 
@@ -198,17 +200,35 @@ consent channel used for posting), not an inferred yes:
   `LOCAL_EXECUTION_APPROVED: yes`; seed **both peers** with that identical value and command list.
 
 Before showing any command for the **trusted local checkout/range**, prove the checkout is the exact
-recorded head revision (read `.repository` / `.head.sha` from `show-target`; the local protocol
-records identity via `normalize-target local --range`):
+recorded head revision with **one explicit compound gate** — never bare `test`s that a missing global
+`set -e` would ignore. Read `.repository` / `.head.sha` from `show-target` (the local protocol records
+identity via `normalize-target local --range`), compute `OBSERVED_REPOSITORY` only under a valid
+`$LOCAL_REPO` guard, then `&&`-join every check in one `if` so any failure **short-circuits past**
+consent/execution, and set `CHECKOUT_VERIFIED=yes` **only** when all pass:
 
 ```bash
-OBSERVED_REPOSITORY=$(PYTHONPATH=scripts python3 -m crucible repository-identity --repo "$LOCAL_REPO")
-test "$OBSERVED_REPOSITORY" = "$RECORDED_REPOSITORY_IDENTITY"
-test -z "$(git -C "$LOCAL_REPO" status --porcelain)"
-test "$(git -C "$LOCAL_REPO" rev-parse HEAD)" = "$RECORDED_HEAD_SHA"
+PYTHONPATH=scripts python3 -m crucible show-target --run "$RUN" > "$RUN"/loaded-target.json
+RECORDED_REPOSITORY_IDENTITY=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["repository"])' "$RUN"/loaded-target.json)
+RECORDED_HEAD_SHA=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["head"]["sha"])' "$RUN"/loaded-target.json)
+OBSERVED_REPOSITORY=
+if test -n "$RECORDED_REPOSITORY_IDENTITY" && test -n "$RECORDED_HEAD_SHA" && test -d "$LOCAL_REPO"
+then
+  OBSERVED_REPOSITORY=$(PYTHONPATH=scripts python3 -m crucible repository-identity --repo "$LOCAL_REPO")
+fi
+CHECKOUT_VERIFIED=no
+if test -n "$RECORDED_REPOSITORY_IDENTITY" && test -n "$RECORDED_HEAD_SHA" && test -d "$LOCAL_REPO" \
+  && test "$OBSERVED_REPOSITORY" = "$RECORDED_REPOSITORY_IDENTITY" \
+  && STATUS=$(git -C "$LOCAL_REPO" status --porcelain) && test -z "$STATUS" \
+  && HEAD_NOW=$(git -C "$LOCAL_REPO" rev-parse HEAD) && test "$HEAD_NOW" = "$RECORDED_HEAD_SHA"
+then
+  CHECKOUT_VERIFIED=yes
+fi
 ```
 
-If any check fails, do not run commands: offer static-only continuation or an exact detached
+**Only when `CHECKOUT_VERIFIED=yes`** may you show the exact commands, warn they run arbitrary code, and
+ask for exact-command consent (`LOCAL_EXECUTION_APPROVED`). If `CHECKOUT_VERIFIED=no` — a wrong
+identity, a dirty tree, a failed `git status`, a wrong head, or a missing `$LOCAL_REPO` — **do not run
+commands and do not ask for execution consent**: offer static-only continuation or an exact detached
 **worktree-at-SHA** command set (`git worktree add --detach <path> "$RECORDED_HEAD_SHA"`) that needs
 **fresh consent**. Record the observed repository identity, head SHA, clean status, and approved
 command list in the execution evidence handed to both peers and rendered in the review provenance. A

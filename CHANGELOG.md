@@ -65,8 +65,10 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
 - **Immutable `pr-review` target binding (audit finding #4).** Every `pr-review` input is now pinned to
   an immutable review target before PLAN. New `normalize-target github|local|diff` commands emit a
   canonical manifest + exact patch — GitHub base/head **OIDs** + fork identity read stably **before and
-  after** `gh pr diff`, a local single `--range` recorded with `merge_base..head` **merge-base**
-  semantics (no raw two-dot tip diff), or a diff file as patch identity only (`revision_bound: false`).
+  after** fetching the base/head snapshots (the immutable patch is **derived** from those two codeload
+  snapshots, not a server-recomputed PR diff), a local single `--range` recorded with `merge_base..head`
+  **merge-base** semantics (no raw two-dot tip diff), or a diff file as patch identity only
+  (`revision_bound: false`).
   `load-target` records the one `target_loaded` event and `target_sha256`; `show-target` prints the
   authoritative target; `repository-identity` fingerprints a local checkout credential-free; and
   `materialize-target` extracts a pinned, read-only `RUN/source` snapshot of the exact head commit

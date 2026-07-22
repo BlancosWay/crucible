@@ -1129,7 +1129,8 @@ def _pr_recommendation(
 
 
 def review_result(
-    events: list[dict[str, Any]], cfg: Config, workflow: str, dag: Any = None
+    events: list[dict[str, Any]], cfg: Config, workflow: str, dag: Any = None,
+    target_sha256: str | None = None
 ) -> dict[str, Any]:
     """The deterministic symmetric review deliverable: effective accepted findings, unresolved
     objections, and (pr-review only) the derived recommendation.
@@ -1143,6 +1144,12 @@ def review_result(
     Approve/Comment/Request-changes call). This is a projection over ``events``; callers (the CLI
     result commands) enforce completeness and scope first.
 
+    ``target_sha256`` (F4), when the workflow is ``pr-review``, is the authoritative loaded review
+    target hash the caller derives from the events (this module stays free of a target/workflow import
+    cycle). It binds the deliverable to the exact reviewed target so a published/posted result can be
+    re-verified against the run's `target_loaded` event. ``deep-dive`` results never carry it (their
+    shape is unchanged).
+
     When ``dag`` is supplied (the CLI Finish-time path) the accepted union and the unresolved
     objections are BOTH scoped to the configured workflow and FAIL CLOSED on any out-of-scope
     dependency/FINAL gate, so a forged out-of-scope objection can never inflate the recommendation.
@@ -1152,6 +1159,7 @@ def review_result(
     objections = unresolved_objections(events, dag, cfg=cfg, final_enabled=cfg.final_review)
     result: dict[str, Any] = {"workflow": workflow}
     if workflow == "pr-review":
+        result["target_sha256"] = target_sha256
         result["recommendation"] = _pr_recommendation(effective.findings, objections, cfg)
     result["findings"] = [f.to_dict() for f in effective.findings]
     result["unresolved_objections"] = objections

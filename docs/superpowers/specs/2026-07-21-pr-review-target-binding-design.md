@@ -147,13 +147,17 @@ Rules:
 
 The orchestrator resolves these values with `gh pr view` fields including `baseRefOid`,
 `headRefOid`, `headRepository`, `headRepositoryOwner`, and `isCrossRepository`, read **before and
-after** `gh pr diff`; a change in any immutable identity field between the two reads rejects the target
-so the whole acquisition can be retried. Branch names are display metadata; SHAs and repository
-identities are authoritative, and intent comes from the stable before/after title/body. Because
-`normalize-target` hashes whatever diff bytes it is handed, the acquisition must fail **closed** (see
-[Error handling](#error-handling)): each `gh` read is error-checked and normalization proceeds only
-after all three succeed, so a failed `gh pr diff` can never feed an empty/truncated patch that stable
-metadata would still normalize.
+after** fetching the base/head **snapshots**; a change in any immutable identity field between the two
+reads rejects the target so the whole acquisition can be retried. Branch names are display metadata;
+SHAs and repository identities are authoritative, and intent comes from the stable before/after
+title/body. The immutable patch is **derived** from the two codeload snapshots (base
+`repository@baseRefOid`, head `repository@headRefOid`) — never accepted from a server-recomputed PR
+diff or any caller-supplied patch — so the target is a pure function of the pinned OIDs and the PR-state
+diff / ABA race is eliminated; `changed_files` is derived from that patch and a disagreeing metadata
+file list is rejected. The acquisition fails **closed** (see [Error handling](#error-handling)): each
+`gh` read and both archive fetches are error-checked and normalization proceeds only after all of them
+succeed, so a failed fetch can never feed an empty/truncated snapshot that stable metadata would still
+normalize.
 
 ### Local range variant
 
@@ -226,7 +230,7 @@ Add:
 
 ```bash
 crucible normalize-target github --metadata-before PR-BEFORE.json --metadata-after PR-AFTER.json \
-  --diff PR.diff --output TARGET.json --diff-output TARGET.diff
+  --base-archive BASE.tar.gz --head-archive HEAD.tar.gz --output TARGET.json --diff-output TARGET.diff
 crucible normalize-target local --repo REPO --range BASE..HEAD --intent INTENT.json \
   --output TARGET.json --diff-output TARGET.diff
 crucible normalize-target diff --diff PATCH --intent INTENT.json \
@@ -240,8 +244,11 @@ crucible materialize-target --run RUN --archive SOURCE.tar.gz
 `normalize-target` does not mutate a run:
 
 - `github` consumes the exact JSON emitted by the documented `gh pr view --json ...` command read
-  **before and after** `gh pr diff`; every immutable identity field must match between the two reads
-  or the target is rejected so the orchestrator can retry;
+  **before and after** fetching the base/head snapshots, and **derives** the immutable patch from the
+  `--base-archive` (base `repository@baseRefOid`) and `--head-archive` (head `repository@headRefOid`)
+  codeload snapshots — never a caller-supplied diff; every immutable identity field must match between
+  the two reads or the target is rejected so the orchestrator can retry, and the derived `changed_files`
+  must agree with the metadata file list;
 - `local` takes one `--range BASE..HEAD|BASE...HEAD` (never separate base/head flags), resolves refs
   and merge base with argument-vector `git` subprocesses (never `shell=True`), and emits the
   merge-base-to-head patch;
@@ -342,28 +349,19 @@ unverified (see [Error handling](#error-handling)).
 
 ### GitHub PR
 
-After loading the target, emit the authoritative loaded manifest, read the head repository/SHA from it
-(never an ambient variable), require them non-empty, remove any stale archive, then fetch the GitHub
-codeload archive for that exact head and materialize it — each step explicitly checked:
+After loading the target, materialize the pinned head snapshot by **reusing the exact `head.tar.gz`
+codeload archive already fetched during acquisition** (the head `repository@headRefOid` snapshot the
+patch was derived from) — never a second fetch (a re-fetch could observe a moved head). Materialization
+fails **closed** and **non-fatal**: `SOURCE_AVAILABLE` defaults to `no`, `materialize-target` is
+checked, and only a clean materialize sets `SOURCE_AVAILABLE=yes`:
 
 ```bash
 PYTHONPATH=scripts python3 -m crucible show-target --run "$RUN" > "$RUN/loaded-target.json"
-HEAD_REPOSITORY=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["head"]["repository"])' "$RUN/loaded-target.json")
-HEAD_SHA=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["head"]["sha"])' "$RUN/loaded-target.json")
-test -n "$HEAD_REPOSITORY" && test -n "$HEAD_SHA"
-rm -f "$RUN/source.tar.gz"
 SOURCE_AVAILABLE=no
-if gh api "repos/$HEAD_REPOSITORY/tarball/$HEAD_SHA" > "$RUN/source.tar.gz"
+if test -s "$RUN/head.tar.gz" \
+  && PYTHONPATH=scripts python3 -m crucible materialize-target --run "$RUN" --archive "$RUN/head.tar.gz"
 then
-  if PYTHONPATH=scripts python3 -m crucible materialize-target \
-    --run "$RUN" --archive "$RUN/source.tar.gz"
-  then
-    SOURCE_AVAILABLE=yes
-  else
-    rm -f "$RUN/source.tar.gz"
-  fi
-else
-  rm -f "$RUN/source.tar.gz"
+  SOURCE_AVAILABLE=yes
 fi
 ```
 
@@ -420,16 +418,22 @@ separate `local-range` target.
 
 Execution remains available only for `local-range`.
 
-Before showing any command for consent (after PLAN consensus):
+Before showing any command for consent (after PLAN consensus), prove the checkout is the exact recorded
+head revision with **one explicit compound `if`/`&&` gate** — never bare `test`s that a missing global
+`set -e` would ignore. `CHECKOUT_VERIFIED` defaults to `no`; the single gate `&&`-joins, in order:
 
-1. verify the source repository is the manifest repository with
-   `crucible repository-identity --repo REPO` equal to the recorded `repository` identity;
-2. verify the execution checkout is clean (`git status --porcelain` empty);
-3. verify `git rev-parse HEAD == target.head.sha`;
-4. otherwise refuse execution and offer static-only continuation or an exact detached
-   worktree-at-SHA command set followed by fresh exact-command consent;
-5. record the observed repository identity, head SHA, clean status, and approved command list in the
-   execution evidence handed to both peers and rendered in the review provenance.
+1. non-empty recorded `repository` identity and `head.sha`, and a valid `$LOCAL_REPO` directory
+   (checked **before** any git runs against it, so a missing checkout never runs git in an ambient repo);
+2. `crucible repository-identity --repo REPO` equal to the recorded `repository` identity;
+3. `git status --porcelain` **succeeds AND is empty** (a clean tree);
+4. `git rev-parse HEAD` **succeeds AND equals** `target.head.sha`.
+
+Only when every conjunct passes is `CHECKOUT_VERIFIED=yes` and may exact-command consent be requested or
+execution run. On any failure — wrong identity, dirty tree, failed `git status`, wrong head, or missing
+`$LOCAL_REPO` — the gate short-circuits, never reaches consent/execution, and the review continues
+static-only or offers an exact detached worktree-at-SHA command set followed by fresh exact-command
+consent. The observed repository identity, head SHA, clean status, and approved command list are
+recorded in the execution evidence handed to both peers and rendered in the review provenance.
 
 Exact-command consent (and its arbitrary-code warning) stays separate from posting consent. GitHub PR
 and diff-file targets remain non-executable regardless of archive availability.
@@ -437,17 +441,20 @@ and diff-file targets remain non-executable regardless of archive availability.
 ## Error handling
 
 - PR metadata without immutable SHAs/repository identity: halt normalization.
-- GitHub before/diff/after acquisition fails **closed**, never relying on a global `set -e`: each of
-  the three `gh pr view`/`gh pr diff` reads is explicitly error-checked and `normalize-target` runs
-  only after **all three** succeed. A failed read leaves an **empty or truncated** artifact that stable
-  before/after metadata would otherwise let `normalize-target` hash into a target, so any failure — a
-  non-zero `gh` read or a drifted identity field — discards every partial before/after/diff/target
-  artifact and retries, bounded to three attempts and halting clearly on exhaustion.
-- Source snapshot unavailable or unsafe — a failed/truncated/stale `gh api` fetch or `git -C ... archive`,
-  or a rejected `materialize-target`: materialization fails **closed** and **non-fatal**, never relying on
-  a global `set -e`. Remove any stale archive before the fetch/archive; explicitly check the fetch/archive
-  **and** `materialize-target`; on any failure discard (`rm -f`) the partial archive and leave
-  `SOURCE_AVAILABLE=no`; only a clean fetch and materialize set `SOURCE_AVAILABLE=yes`. When
+- GitHub before/base/head/after acquisition fails **closed**, never relying on a global `set -e`: the
+  two `gh pr view` reads (before/after) and the two `gh api .../tarball/...` base/head archive fetches
+  are each explicitly error-checked and `normalize-target` runs only after **all** of them succeed —
+  there is no server-recomputed PR diff (the patch is derived from the two snapshots). A failed read/fetch leaves an
+  **empty or truncated** artifact that stable before/after metadata would otherwise let
+  `normalize-target` derive a target from, so any failure — a non-zero `gh`/fetch or a drifted identity
+  field — discards every partial before/after/base/head/target artifact and retries, bounded to three
+  attempts and halting clearly on exhaustion.
+- Source snapshot unavailable or unsafe — a missing/empty reused GitHub `head.tar.gz`, a
+  failed/truncated/stale local `git -C ... archive`, or a rejected `materialize-target`: materialization
+  fails **closed** and **non-fatal**, never relying on a global `set -e`. GitHub **reuses** the acquired
+  `head.tar.gz` (never a re-fetch) and never deletes it; the local path removes any stale archive before
+  the `git -C ... archive`. Explicitly check the reuse/archive **and** `materialize-target`; leave
+  `SOURCE_AVAILABLE=no` on any failure; only a clean materialize sets `SOURCE_AVAILABLE=yes`. When
   `SOURCE_AVAILABLE=no`, the review continues **patch-only** with source context unavailable: do not read
   ambient files, do not pre-create/read a partial `RUN/source`, hand both peers the identical status, and
   treat runtime-verified claims as **unverified**.

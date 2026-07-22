@@ -2542,6 +2542,56 @@ def test_review_result_accepted_state_binds_the_loaded_target(tmp_path):
     assert _run(["review-result", "--run", run_dir]).returncode == 0
 
 
+def test_review_result_json_carries_authoritative_target_sha256(tmp_path):
+    # F4: the review-result JSON binds the authoritative loaded target hash (pr-review only), derived
+    # from the same events in the Finish-time path.
+    run_dir = _complete_one_node_symmetric(
+        tmp_path, "auth", findings=[_accepted_finding("dep:auth", "F1", "minor")])
+    r = _run(["review-result", "--run", run_dir])
+    assert r.returncode == 0, r.stderr
+    result = json.loads(r.stdout)
+    assert result["workflow"] == "pr-review"
+    assert result["target_sha256"] == _authoritative_target_sha(run_dir)
+
+
+def test_review_result_matches_report_target_hash(tmp_path):
+    # F4: report/CLI parity — the review-result target_sha256 equals the `## Review target` hash the
+    # report renders (both derive from the authoritative target_loaded event).
+    from crucible.report import render_markdown
+    from crucible.runlog import RunLog
+    run_dir = _complete_one_node_symmetric(
+        tmp_path, "auth", findings=[_accepted_finding("dep:auth", "F1", "major")])
+    result = json.loads(_run(["review-result", "--run", run_dir]).stdout)
+    md = render_markdown(RunLog(run_dir))
+    assert f"**Target hash:** `{result['target_sha256']}`" in md
+
+
+def test_review_result_deep_dive_has_no_target_sha256(tmp_path):
+    # F4: deep-dive result shape is unchanged — no target_sha256 (and no target is loaded).
+    run_dir = _complete_one_node_symmetric(
+        tmp_path, "topic", findings=[_accepted_finding("dep:topic", "F1", "major")],
+        workflow="deep-dive")
+    r = _run(["review-result", "--run", run_dir])
+    assert r.returncode == 0, r.stderr
+    result = json.loads(r.stdout)
+    assert result["workflow"] == "deep-dive"
+    assert "target_sha256" not in result
+
+
+def test_review_result_corrupt_target_fails_closed(tmp_path):
+    # F4: a corrupt (duplicate) target_loaded event makes the loaded target underivable — review-result
+    # must fail closed rather than publish an unbindable/half-formed deliverable.
+    run_dir = _complete_one_node_symmetric(
+        tmp_path, "auth", findings=[_accepted_finding("dep:auth", "F1", "major")])
+    assert _run(["review-result", "--run", run_dir]).returncode == 0
+    # Forge a second target_loaded event (corrupt: a target is immutable/loaded exactly once).
+    loaded = next(e for e in _events(run_dir) if e.get("event") == "target_loaded")
+    _append_raw_event(run_dir, dict(loaded))
+    r = _run(["review-result", "--run", run_dir])
+    assert r.returncode != 0
+    assert "target" in r.stderr.lower()
+
+
 def test_result_commands_reject_accepted_state_bound_to_other_target(tmp_path):
     # A completed pr-review run whose dependency accepted state was rebound to a DIFFERENT target
     # (a consistent forgery the CLI never writes) must fail both Finish-time result commands closed —
@@ -3249,22 +3299,106 @@ def test_normalize_target_local_uses_merge_base(tmp_path):
     assert "main-only.py" not in dout.read_text()
 
 
+def _codeload_archive(path, wrapper, files):
+    """A GitHub codeload-style tarball (single ``owner-repo-<sha>/`` wrapper over a repo tree)."""
+    import io
+    import tarfile
+    with tarfile.open(path, "w") as tar:
+        d = tarfile.TarInfo(f"{wrapper}/"); d.type = tarfile.DIRTYPE; d.mode = 0o755
+        tar.addfile(d)
+        seen = {""}
+        for rel in sorted(files):
+            parts = rel.split("/")
+            for i in range(1, len(parts)):
+                sub = "/".join(parts[:i])
+                if sub not in seen:
+                    di = tarfile.TarInfo(f"{wrapper}/{sub}/"); di.type = tarfile.DIRTYPE
+                    di.mode = 0o755
+                    tar.addfile(di)
+                    seen.add(sub)
+            info = tarfile.TarInfo(f"{wrapper}/{rel}"); info.size = len(files[rel])
+            tar.addfile(info, io.BytesIO(files[rel]))
+    return path
+
+
+def _gh_meta(tmp_path, files, **overrides):
+    md = {"number": 7, "url": "https://github.com/base/repo/pull/7", "title": "t", "body": "b",
+          "files": [{"path": p} for p in files], "baseRefName": "main", "baseRefOid": "1" * 40,
+          "headRefName": "feature", "headRefOid": "2" * 40,
+          "headRepository": {"nameWithOwner": "fork/repo"},
+          "headRepositoryOwner": {"login": "fork"}, "isCrossRepository": True}
+    md.update(overrides)
+    return md
+
+
+def test_normalize_target_github_derives_patch_from_archives(tmp_path):
+    # F1: the CLI derives the immutable patch from --base-archive/--head-archive snapshots, never a
+    # caller diff. There is no --diff flag on the github subcommand any more.
+    base = _codeload_archive(tmp_path / "base.tar", "base-repo-a", {"src/a.py": b"print('base')\n"})
+    head = _codeload_archive(tmp_path / "head.tar", "fork-repo-b", {"src/a.py": b"print('head')\n"})
+    bpath = tmp_path / "before.json"; bpath.write_text(json.dumps(_gh_meta(tmp_path, ["src/a.py"])))
+    apath = tmp_path / "after.json"; apath.write_text(json.dumps(_gh_meta(tmp_path, ["src/a.py"])))
+    out = tmp_path / "o.json"; dout = tmp_path / "o.diff"
+    r = _run(["normalize-target", "github", "--metadata-before", str(bpath),
+              "--metadata-after", str(apath), "--base-archive", str(base),
+              "--head-archive", str(head), "--output", str(out), "--diff-output", str(dout)])
+    assert r.returncode == 0, r.stderr
+    manifest = json.loads(out.read_text())
+    assert manifest["kind"] == "github-pr"
+    assert manifest["changed_files"] == ["src/a.py"]
+    derived = dout.read_bytes()
+    assert manifest["diff_sha256"] == hashlib.sha256(derived).hexdigest()
+    text = derived.decode()
+    assert "a/src/a.py b/src/a.py" in text
+    assert "-print('base')" in text and "+print('head')" in text
+
+
+def test_normalize_target_github_help_documents_archives(tmp_path):
+    # F1 CLI/help: the github subcommand consumes --base-archive/--head-archive snapshots (the patch is
+    # derived from them). It has no standalone diff-input flag beyond the --diff-output sink.
+    r = _run(["normalize-target", "github", "--help"])
+    assert r.returncode == 0, r.stderr
+    assert "--base-archive" in r.stdout and "--head-archive" in r.stdout
+    assert "--diff-output" in r.stdout
+    # no dedicated patch INTAKE flag (only the derived-patch output sink remains)
+    assert "--diff " not in r.stdout and "--diff\n" not in r.stdout
+
+
 def test_normalize_target_github_rejects_metadata_drift(tmp_path):
-    before = {"number": 7, "url": "https://github.com/base/repo/pull/7", "title": "t", "body": "b",
-              "files": [{"path": "src/a.py"}], "baseRefName": "main", "baseRefOid": "1" * 40,
-              "headRefName": "feature", "headRefOid": "2" * 40,
-              "headRepository": {"nameWithOwner": "fork/repo"},
-              "headRepositoryOwner": {"login": "fork"}, "isCrossRepository": True}
+    base = _codeload_archive(tmp_path / "base.tar", "base-repo-a", {"src/a.py": b"x\n"})
+    head = _codeload_archive(tmp_path / "head.tar", "fork-repo-b", {"src/a.py": b"y\n"})
+    before = _gh_meta(tmp_path, ["src/a.py"])
     after = dict(before, headRefOid="9" * 40)  # head advanced mid-acquisition
     bpath = tmp_path / "before.json"; bpath.write_text(json.dumps(before))
     apath = tmp_path / "after.json"; apath.write_text(json.dumps(after))
-    diff = tmp_path / "pr.diff"; diff.write_bytes(b"patch")
     r = _run(["normalize-target", "github", "--metadata-before", str(bpath),
-              "--metadata-after", str(apath), "--diff", str(diff),
+              "--metadata-after", str(apath), "--base-archive", str(base),
+              "--head-archive", str(head),
               "--output", str(tmp_path / "o.json"), "--diff-output", str(tmp_path / "o.diff")])
     assert r.returncode != 0
     assert "changed during normalization" in r.stderr
     assert not (tmp_path / "o.json").exists()  # no output written on rejection
+
+
+def test_normalize_target_github_head_archive_reused_for_materialize(tmp_path):
+    # F1: after loading a github target the exact head archive is reused for materialize-target; the
+    # codeload wrapper is stripped by kind so the head tree materializes under RUN/source.
+    base = _codeload_archive(tmp_path / "base.tar", "base-repo-a", {"src/a.py": b"print('base')\n"})
+    head = _codeload_archive(tmp_path / "head.tar", "fork-repo-b",
+                             {"src/a.py": b"print('head')\n"})
+    bpath = tmp_path / "before.json"; bpath.write_text(json.dumps(_gh_meta(tmp_path, ["src/a.py"])))
+    apath = tmp_path / "after.json"; apath.write_text(json.dumps(_gh_meta(tmp_path, ["src/a.py"])))
+    out = tmp_path / "o.json"; dout = tmp_path / "o.diff"
+    assert _run(["normalize-target", "github", "--metadata-before", str(bpath),
+                 "--metadata-after", str(apath), "--base-archive", str(base),
+                 "--head-archive", str(head), "--output", str(out),
+                 "--diff-output", str(dout)]).returncode == 0
+    run_dir = _init_pr_review(tmp_path / "run")
+    assert _run(["load-target", "--run", run_dir, "--file", str(out),
+                 "--diff", str(dout)]).returncode == 0
+    r = _run(["materialize-target", "--run", run_dir, "--archive", str(head)])
+    assert r.returncode == 0, r.stderr
+    assert (Path(run_dir) / "source" / "src" / "a.py").read_text() == "print('head')\n"
 
 
 # --- repository-identity -----------------------------------------------------
@@ -3330,13 +3464,74 @@ def test_load_target_appends_one_event_and_writes_canonical_files(tmp_path):
     assert (Path(run_dir) / "target.diff").read_bytes() == b"exact-bytes"
 
 
-def test_load_target_duplicate_rejects_without_second_append(tmp_path):
+def test_load_target_duplicate_same_inputs_no_second_append(tmp_path):
+    # F3: a second load-target with the SAME inputs is an idempotent repair (returns 0, no duplicate
+    # append) — it does not reject. A DIFFERENT target is covered by test_load_target_different_target_rejects.
     run_dir = _init_pr_review(tmp_path)
     out, dout = _normalize_diff(tmp_path)
     assert _run(["load-target", "--run", run_dir, "--file", str(out), "--diff", str(dout)]).returncode == 0
     r = _run(["load-target", "--run", run_dir, "--file", str(out), "--diff", str(dout)])
+    assert r.returncode == 0, r.stderr
+    assert len([e for e in _events(run_dir) if e["event"] == "target_loaded"]) == 1
+
+
+def test_load_target_same_inputs_is_idempotent_repair(tmp_path):
+    # F3: reloading the SAME target after the event is recorded is an idempotent repair — it repairs the
+    # scratch copies WITHOUT a duplicate append (a crash/retry after the authoritative event was written).
+    run_dir = _init_pr_review(tmp_path)
+    out, dout = _normalize_diff(tmp_path)
+    assert _run(["load-target", "--run", run_dir, "--file", str(out), "--diff", str(dout)]).returncode == 0
+    # Corrupt/lose the scratch to simulate a crash after the append.
+    (Path(run_dir) / "target.json").write_text("{tampered}")
+    (Path(run_dir) / "target.diff").unlink()
+    r = _run(["load-target", "--run", run_dir, "--file", str(out), "--diff", str(dout)])
+    assert r.returncode == 0, r.stderr
+    assert "repaired scratch" in r.stdout
+    assert len([e for e in _events(run_dir) if e["event"] == "target_loaded"]) == 1
+    # The scratch is repaired to the authoritative manifest + exact diff.
+    loaded = [e for e in _events(run_dir) if e["event"] == "target_loaded"][0]
+    assert json.loads((Path(run_dir) / "target.json").read_text()) == loaded["target"]
+    assert (Path(run_dir) / "target.diff").read_bytes() == dout.read_bytes()
+
+
+def test_load_target_different_target_rejects(tmp_path):
+    # F3: a rerun with a DIFFERENT target is rejected — a target is immutable; correcting needs a fresh run.
+    run_dir = _init_pr_review(tmp_path)
+    out, dout = _normalize_diff(tmp_path, diff=b"first-target", name="a")
+    assert _run(["load-target", "--run", run_dir, "--file", str(out), "--diff", str(dout)]).returncode == 0
+    out2, dout2 = _normalize_diff(tmp_path, diff=b"second-different-target", name="b")
+    r = _run(["load-target", "--run", run_dir, "--file", str(out2), "--diff", str(dout2)])
     assert r.returncode != 0
-    assert "already loaded" in r.stderr
+    assert "different target" in r.stderr and "immutable" in r.stderr
+    assert len([e for e in _events(run_dir) if e["event"] == "target_loaded"]) == 1
+
+
+def test_load_target_append_failure_leaves_repairable_state(tmp_path, monkeypatch):
+    # F3: inject an append failure at the boundary. The scratch is written to completion BEFORE the
+    # append, so a crash at the append leaves a complete scratch and NO event — a same-input rerun then
+    # appends cleanly (no irreparable state, no duplicate).
+    import crucible.cli as climod
+    run_dir = _init_pr_review(tmp_path)
+    out, dout = _normalize_diff(tmp_path, diff=b"boundary-bytes")
+
+    real_append = climod.RunLog.append
+
+    def boom(self, event, **fields):
+        if event == "target_loaded":
+            raise OSError("injected append failure")
+        return real_append(self, event, **fields)
+
+    monkeypatch.setattr(climod.RunLog, "append", boom)
+    rc = climod.main(["load-target", "--run", run_dir, "--file", str(out), "--diff", str(dout)])
+    assert rc == 1  # the injected failure surfaces cleanly
+    # No event was recorded, but the scratch was completed before the append.
+    assert "target_loaded" not in [e["event"] for e in _events(run_dir)]
+    assert (Path(run_dir) / "target.json").exists() and (Path(run_dir) / "target.diff").exists()
+
+    monkeypatch.undo()
+    # Same-input rerun repairs and appends exactly once.
+    r = _run(["load-target", "--run", run_dir, "--file", str(out), "--diff", str(dout)])
+    assert r.returncode == 0, r.stderr
     assert len([e for e in _events(run_dir) if e["event"] == "target_loaded"]) == 1
 
 
@@ -3552,14 +3747,160 @@ def test_materialize_target_rejects_diff_file(tmp_path):
     assert "source_materialized" not in [e["event"] for e in _events(run_dir)]
 
 
-def test_materialize_target_rejects_second_materialization(tmp_path):
+def test_materialize_target_second_same_archive_is_idempotent(tmp_path):
+    # F3: a second materialize with the SAME archive is idempotent (returns 0, no duplicate event) —
+    # source + event already present and consistent. A DIFFERENT archive/target is rejected separately.
     run_dir = _init_pr_review(tmp_path)
     repo = _diverged_repo(tmp_path)
     _load_local_target(run_dir, tmp_path, repo)
     archive = _head_archive(tmp_path, repo)
     assert _run(["materialize-target", "--run", run_dir, "--archive", str(archive)]).returncode == 0
     r = _run(["materialize-target", "--run", run_dir, "--archive", str(archive)])
+    assert r.returncode == 0, r.stderr
+    assert "already materialized" in r.stdout
+    assert len([e for e in _events(run_dir) if e["event"] == "source_materialized"]) == 1
+
+
+def _receipt_path(run_dir):
+    from crucible.target import SOURCE_RECEIPT_NAME
+    return Path(run_dir) / "source" / SOURCE_RECEIPT_NAME
+
+
+def test_materialize_target_writes_canonical_receipt(tmp_path):
+    # F3: a canonical receipt (target_sha256, archive_sha256, kind) lives inside RUN/source, binding the
+    # snapshot to its exact archive + target for crash repair.
+    run_dir = _init_pr_review(tmp_path)
+    repo = _diverged_repo(tmp_path)
+    _load_local_target(run_dir, tmp_path, repo)
+    archive = _head_archive(tmp_path, repo)
+    assert _run(["materialize-target", "--run", run_dir, "--archive", str(archive)]).returncode == 0
+    event = [e for e in _events(run_dir) if e["event"] == "source_materialized"][0]
+    receipt = json.loads(_receipt_path(run_dir).read_text())
+    assert receipt["target_sha256"] == event["target_sha256"]
+    assert receipt["archive_sha256"] == event["archive_sha256"]
+    assert receipt["kind"] == "local-range"
+
+
+def test_materialize_target_append_failure_then_retry_appends_without_reextract(tmp_path, monkeypatch):
+    # F3 append boundary: inject an append failure AFTER RUN/source (+ receipt) exist. A same-archive
+    # retry validates the receipt and appends the event WITHOUT re-extracting or deleting the source.
+    import crucible.cli as climod
+    run_dir = _init_pr_review(tmp_path)
+    repo = _diverged_repo(tmp_path)
+    _load_local_target(run_dir, tmp_path, repo)
+    archive = _head_archive(tmp_path, repo)
+
+    real_append = climod.RunLog.append
+
+    def boom(self, event, **fields):
+        if event == "source_materialized":
+            raise OSError("injected append failure")
+        return real_append(self, event, **fields)
+
+    monkeypatch.setattr(climod.RunLog, "append", boom)
+    rc = climod.main(["materialize-target", "--run", run_dir, "--archive", str(archive)])
+    assert rc == 1
+    # Source + receipt exist (atomic rename happened) but no event was recorded.
+    assert (Path(run_dir) / "source" / "app.py").read_text() == "feature\n"
+    assert _receipt_path(run_dir).exists()
+    assert "source_materialized" not in [e["event"] for e in _events(run_dir)]
+
+    monkeypatch.undo()
+    # Mark the source so we can prove it was NOT re-extracted on the repair append.
+    sentinel = Path(run_dir) / "source" / "SENTINEL"
+    sentinel.write_text("keep")
+    r = _run(["materialize-target", "--run", run_dir, "--archive", str(archive)])
+    assert r.returncode == 0, r.stderr
+    assert sentinel.exists(), "the repair append must NOT re-extract/replace a valid source"
+    assert len([e for e in _events(run_dir) if e["event"] == "source_materialized"]) == 1
+
+
+def test_materialize_target_missing_source_restored_without_duplicate_event(tmp_path):
+    # F3: a matching event exists but RUN/source is gone — the SAME archive restores the source without
+    # a duplicate event.
+    run_dir = _init_pr_review(tmp_path)
+    repo = _diverged_repo(tmp_path)
+    _load_local_target(run_dir, tmp_path, repo)
+    archive = _head_archive(tmp_path, repo)
+    assert _run(["materialize-target", "--run", run_dir, "--archive", str(archive)]).returncode == 0
+    import shutil
+    shutil.rmtree(Path(run_dir) / "source")  # lose the materialized source
+    r = _run(["materialize-target", "--run", run_dir, "--archive", str(archive)])
+    assert r.returncode == 0, r.stderr
+    assert "restored" in r.stdout
+    assert (Path(run_dir) / "source" / "app.py").read_text() == "feature\n"
+    assert len([e for e in _events(run_dir) if e["event"] == "source_materialized"]) == 1
+
+
+def test_materialize_target_rename_failure_leaves_no_source_or_event(tmp_path, monkeypatch):
+    # F3 rename boundary: inject an os.replace failure during extraction. No RUN/source and no event are
+    # left, and a clean retry then materializes normally (no irreparable state).
+    import crucible.cli as climod
+    import crucible.target as targetmod
+    run_dir = _init_pr_review(tmp_path)
+    repo = _diverged_repo(tmp_path)
+    _load_local_target(run_dir, tmp_path, repo)
+    archive = _head_archive(tmp_path, repo)
+
+    real_replace = targetmod.os.replace
+
+    def boom(src, dst, *a, **k):
+        if str(dst).endswith("/source"):
+            raise OSError("injected rename failure")
+        return real_replace(src, dst, *a, **k)
+
+    monkeypatch.setattr(targetmod.os, "replace", boom)
+    rc = climod.main(["materialize-target", "--run", run_dir, "--archive", str(archive)])
+    assert rc == 1
+    assert not (Path(run_dir) / "source").exists(), "a failed rename must leave no visible source"
+    assert not (Path(run_dir) / "source.staging").exists(), "staging must be cleaned up"
+    assert "source_materialized" not in [e["event"] for e in _events(run_dir)]
+
+    monkeypatch.undo()
+    r = _run(["materialize-target", "--run", run_dir, "--archive", str(archive)])
+    assert r.returncode == 0, r.stderr
+    assert (Path(run_dir) / "source" / "app.py").read_text() == "feature\n"
+    assert len([e for e in _events(run_dir) if e["event"] == "source_materialized"]) == 1
+
+
+def test_materialize_target_mismatched_receipt_rejects(tmp_path):
+    # F3: an existing RUN/source whose receipt does not match this archive/target is rejected — never
+    # trusted, never silently deleted.
+    run_dir = _init_pr_review(tmp_path)
+    repo = _diverged_repo(tmp_path)
+    _load_local_target(run_dir, tmp_path, repo)
+    archive = _head_archive(tmp_path, repo)
+    # Pre-create a source dir with a bogus receipt (as if from a different archive), no event.
+    src = Path(run_dir) / "source"
+    src.mkdir()
+    (src / "app.py").write_text("stale\n")
+    from crucible.target import SOURCE_RECEIPT_NAME
+    (src / SOURCE_RECEIPT_NAME).write_text(json.dumps(
+        {"version": 1, "kind": "local-range", "target_sha256": "0" * 64, "archive_sha256": "0" * 64}))
+    r = _run(["materialize-target", "--run", run_dir, "--archive", str(archive)])
     assert r.returncode != 0
+    assert "receipt" in r.stderr
+    assert (src / "app.py").read_text() == "stale\n", "a mismatched source must not be deleted"
+    assert "source_materialized" not in [e["event"] for e in _events(run_dir)]
+
+
+def test_materialize_target_different_archive_after_event_rejects(tmp_path):
+    # F3: a source snapshot bound to a different archive already recorded -> immutable, reject.
+    run_dir = _init_pr_review(tmp_path)
+    repo = _diverged_repo(tmp_path)
+    _load_local_target(run_dir, tmp_path, repo)
+    archive = _head_archive(tmp_path, repo)
+    assert _run(["materialize-target", "--run", run_dir, "--archive", str(archive)]).returncode == 0
+    # A different archive (of a different tree) -> different archive_sha256 than the recorded event.
+    _git_t(repo, "checkout", "-q", "feature")
+    (repo / "extra.py").write_text("x\n")
+    _git_t(repo, "add", "extra.py"); _git_t(repo, "commit", "-q", "-m", "extra")
+    other = _head_archive(tmp_path, repo, name="other.tar")
+    import shutil
+    shutil.rmtree(Path(run_dir) / "source")
+    r = _run(["materialize-target", "--run", run_dir, "--archive", str(other)])
+    assert r.returncode != 0
+    assert "different archive" in r.stderr or "immutable" in r.stderr
     assert len([e for e in _events(run_dir) if e["event"] == "source_materialized"]) == 1
 
 

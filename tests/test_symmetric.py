@@ -631,6 +631,20 @@ def test_review_result_deep_dive_omits_recommendation():
     assert result["findings"][0]["id"] == "F1"
 
 
+def test_review_result_pr_review_carries_target_sha256():
+    # F4: the pr-review deliverable binds the authoritative loaded target hash (threaded by the caller).
+    events = _dep_events("auth", findings=[_finding("dep:auth", "F1", "minor")])
+    result = review_result(events, Config.from_dict({}), "pr-review", target_sha256="d" * 64)
+    assert result["target_sha256"] == "d" * 64
+
+
+def test_review_result_deep_dive_never_carries_target_sha256():
+    # F4: deep-dive result shape is unchanged — it never carries target_sha256, even if one is passed.
+    events = _dep_events("auth", findings=[_finding("dep:auth", "F1", "major")])
+    result = review_result(events, Config.from_dict({}), "deep-dive", target_sha256="d" * 64)
+    assert "target_sha256" not in result
+
+
 def test_review_result_final_set_replaces_dependency_union():
     events = (
         _dep_events("auth", findings=[_finding("dep:auth", "F1", "major")],

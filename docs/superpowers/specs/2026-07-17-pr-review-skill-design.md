@@ -60,8 +60,10 @@ a flagged unresolved finding (both positions + citations). See
 The skill resolves the review target into one triple — `diff`, `changed-files`, `intent` — so the rest
 of the flow is source-agnostic:
 
-- **GitHub PR:** `gh pr view <n> --json title,body,files,headRefName,baseRefName` + `gh pr diff <n>`
-  → the diff, the changed-file set, and the PR's **stated intent** (title + body + linked issues).
+- **GitHub PR:** `gh pr view <n> --json …` metadata + the base/head codeload **snapshots** (base
+  `repository@baseRefOid`, head `repository@headRefOid`) → the **derived** diff (never `gh`'s
+  server-recomputed PR diff), the changed-file set, and the PR's **stated intent** (title + body +
+  linked issues). See the target-binding design for the exact immutable pipeline.
 - **Local diff:** a `base..head` range or a diff file → `git diff <range>` + `git diff --name-only`;
   intent comes from the commit messages and/or user-supplied text.
 

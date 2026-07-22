@@ -23,12 +23,14 @@ cannot be internally consistent while pointing at code other than the submitted 
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import posixpath
 import re
 import shutil
 import subprocess
 import tarfile
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -745,15 +747,23 @@ def _github_identity(md: dict[str, Any]) -> dict[str, Any]:
 
 
 def normalize_github_target(metadata_before: dict[str, Any], metadata_after: dict[str, Any],
-                            diff: bytes) -> "ReviewTarget":
-    """Normalize a GitHub PR into a revision-bound ``github-pr`` target.
+                            base_archive: str | Path,
+                            head_archive: str | Path) -> tuple["ReviewTarget", bytes]:
+    """Normalize a GitHub PR into a revision-bound ``github-pr`` target + its DERIVED exact patch.
 
     ``metadata_before``/``metadata_after`` are the JSON documents emitted by ``gh pr view --json ...``
-    read around ``gh pr diff``. Every field of the immutable identity tuple (PR number/URL/title/body/
-    files, base repo/ref/OID, head repo/ref/OID, cross-repository flag) must be identical between the
-    two reads; any difference means the PR changed mid-acquisition and the whole target is rejected so
-    the orchestrator can retry. Branch names are display metadata — SHAs and repository identities are
-    authoritative.
+    read around the archive fetches. Every field of the immutable identity tuple (PR number/URL/title/
+    body/files, base repo/ref/OID, head repo/ref/OID, cross-repository flag) must be identical between
+    the two reads; any difference means the PR changed mid-acquisition and the whole target is rejected
+    (before any archive is read) so the orchestrator can retry. Branch names are display metadata —
+    SHAs and repository identities are authoritative.
+
+    The patch is **derived** from the two codeload snapshots (``base_archive`` = ``baseRefOid`` tree,
+    ``head_archive`` = ``headRefOid`` tree), never accepted from ``gh pr diff`` or any caller-supplied
+    bytes: this makes the target a pure function of the exact pinned OIDs and eliminates the PR-state
+    diff / ABA race (a server-side diff recomputed against a moved branch can no longer leak in). The
+    ``changed_files`` set is likewise derived from that patch; if it disagrees with the metadata
+    ``files`` the target is rejected rather than trusting the metadata. Returns ``(target, diff_bytes)``.
     """
     before, after = _github_identity(metadata_before), _github_identity(metadata_after)
     if before != after:
@@ -774,6 +784,28 @@ def normalize_github_target(metadata_before: dict[str, Any], metadata_after: dic
     is_cross = md.get("isCrossRepository")
     if not isinstance(is_cross, bool):
         raise ValueError("github metadata isCrossRepository must be a boolean")
+
+    # Derive the immutable patch from the exact base/head OID snapshots (never a caller diff), then
+    # derive changed_files from that patch and reject a metadata file list that disagrees with it.
+    #
+    # The snapshots are historyless single-commit trees (codeload tarballs), so the patch is the
+    # deterministic two-dot content delta between `base@baseRefOid` and `head@headRefOid` — a pure
+    # function of the two pinned OIDs, which is exactly what eliminates the PR-state/ABA race. GitHub's
+    # own `files` list is a three-dot (merge-base) view, so if the base branch has advanced past the
+    # PR's fork point with changes to files the PR does not touch, the derived (two-dot) set is a strict
+    # superset and this fails CLOSED (retry/halt) rather than trusting the metadata or silently pinning
+    # a diff that does not match the recorded OIDs. This is deliberate: an immutable target must be the
+    # exact base→head content delta, never a server-recomputed view of a moving branch.
+    diff = _derive_github_patch(base_archive, head_archive)
+    derived_changed = tuple(_changed_files_from_diff(diff))
+    metadata_files = tuple(_github_files(md))
+    if derived_changed != metadata_files:
+        raise ValueError(
+            f"github PR changed files derived from the base/head snapshots {list(derived_changed)} "
+            f"disagree with the PR metadata files {list(metadata_files)}; the snapshots and metadata "
+            f"are inconsistent (e.g. the base branch advanced past the merge base) — discard artifacts "
+            f"and retry the acquisition")
+
     manifest = {
         "version": TARGET_VERSION,
         "kind": "github-pr",
@@ -785,10 +817,80 @@ def normalize_github_target(metadata_before: dict[str, Any], metadata_after: dic
         "head": {"repository": head_repo, "ref": head_ref, "sha": head_oid},
         "is_cross_repository": is_cross,
         "diff_sha256": hashlib.sha256(diff).hexdigest(),
-        "changed_files": _github_files(md),
+        "changed_files": list(derived_changed),
         "intent": {"title": md.get("title") or "", "body": md.get("body") or ""},
     }
-    return _build_target(manifest)
+    return _build_target(manifest), diff
+
+
+def _derive_github_patch(base_archive: str | Path, head_archive: str | Path) -> bytes:
+    """The deterministic binary patch between two GitHub codeload snapshots, derived with no external
+    diff/textconv execution.
+
+    Both codeload archives are safely inspected/extracted (the same traversal/link/resource rules as
+    ``safe_extract_source_archive``, stripping exactly one ``owner-repo-<sha>/`` wrapper) into confined
+    temp trees, then diffed via isolated temporary Git objects so the output carries canonical
+    ``a/<path>`` / ``b/<path>`` prefixes and correct new/deleted/binary behavior. Ambient/global Git
+    configuration is neutralized and ``--no-ext-diff --no-textconv`` disable any attribute-driven
+    external program, so a hostile ``.gitattributes``/``.gitignore`` in the snapshot can neither run
+    code nor drop a file. Nothing outside the temp directory is touched.
+    """
+    with tempfile.TemporaryDirectory(prefix="crucible-gh-diff-") as tmp:
+        tmp_path = Path(tmp)
+        base_tree_dir = tmp_path / "base"
+        head_tree_dir = tmp_path / "head"
+        safe_extract_source_archive(base_archive, base_tree_dir, strip_wrapper=True)
+        safe_extract_source_archive(head_archive, head_tree_dir, strip_wrapper=True)
+        return _git_snapshot_diff(tmp_path / "git", base_tree_dir, head_tree_dir)
+
+
+def _git_snapshot_diff(git_dir: Path, base_tree_dir: Path, head_tree_dir: Path) -> bytes:
+    """Binary patch between two extracted snapshot trees via an isolated temporary Git object store.
+
+    Builds a base and a head tree object from the two directories (bypassing ``.gitignore`` with
+    ``--force`` so a hostile ignore file cannot hide a member, using a per-tree ``GIT_INDEX_FILE``),
+    then ``git diff --exit-code --binary --no-ext-diff --no-textconv``. Exit ``1`` => differences
+    (the patch bytes), ``0`` => empty, ``>1`` => a real error is raised.
+    """
+    env = dict(
+        os.environ,
+        GIT_CONFIG_GLOBAL=os.devnull,   # ignore ambient ~/.gitconfig (aliases, filters, textconv...)
+        GIT_CONFIG_SYSTEM=os.devnull,   # ...and /etc/gitconfig
+        GIT_CONFIG_NOSYSTEM="1",
+        GIT_TERMINAL_PROMPT="0",
+    )
+    base_cmd = [
+        "git", "--git-dir", str(git_dir),
+        "-c", "core.autocrlf=false", "-c", "core.quotepath=false",
+    ]
+    subprocess.run(base_cmd + ["init", "-q"], check=True, capture_output=True, env=env)
+    base_tree = _write_snapshot_tree(base_cmd, env, git_dir / "index.base", base_tree_dir)
+    head_tree = _write_snapshot_tree(base_cmd, env, git_dir / "index.head", head_tree_dir)
+    proc = subprocess.run(
+        base_cmd + ["diff", "--exit-code", "--binary", "--no-ext-diff", "--no-textconv",
+                    "--no-color", base_tree, head_tree],
+        capture_output=True, env=env)
+    if proc.returncode == 0:
+        return b""
+    if proc.returncode == 1:
+        return proc.stdout
+    raise ValueError(
+        "failed to derive the github patch from the base/head snapshots: "
+        + proc.stderr.decode("utf-8", "replace").strip())
+
+
+def _write_snapshot_tree(base_cmd: list[str], env: dict[str, str],
+                         index_file: Path, work_tree: Path) -> str:
+    """Stage every file of ``work_tree`` into an isolated index and write a Git tree object; returns
+    the tree OID. ``--force`` bypasses any in-tree ``.gitignore`` so a snapshot member is never
+    dropped; no checkin filter is defined (ambient config is neutralized) so ``git add`` runs no
+    external program."""
+    tree_env = dict(env, GIT_INDEX_FILE=str(index_file))
+    subprocess.run(
+        base_cmd + ["--work-tree", str(work_tree), "add", "--force", "-A", "--", "."],
+        check=True, capture_output=True, env=tree_env, cwd=work_tree)
+    out = subprocess.run(base_cmd + ["write-tree"], check=True, capture_output=True, env=tree_env)
+    return out.stdout.decode("utf-8").strip()
 
 
 def normalize_diff_target(diff: bytes, intent: dict[str, str]) -> "ReviewTarget":
@@ -934,7 +1036,8 @@ def _ensure_within(base: Path, path: Path) -> None:
 
 
 def safe_extract_source_archive(
-    archive: str | Path, destination: str | Path, *, strip_wrapper: bool
+    archive: str | Path, destination: str | Path, *, strip_wrapper: bool,
+    receipt: dict[str, Any] | None = None
 ) -> None:
     """Extract a source archive into an ABSENT ``destination`` atomically and confined.
 
@@ -948,6 +1051,11 @@ def safe_extract_source_archive(
     *kind* (never from a caller flag or the archive's path shape): a github-pr codeload tarball nests
     the whole tree under one ``owner-repo-<sha>/`` wrapper that is stripped (``True``); a local-range
     ``git archive`` emits repository-root-relative paths that are preserved verbatim (``False``).
+
+    ``receipt`` (F3), when given, is written into the staging tree as ``SOURCE_RECEIPT_NAME`` **before**
+    the atomic rename, so the source snapshot and its crash-repair receipt (``target_sha256``,
+    ``archive_sha256``, ``kind``) land in ``destination`` as one atomic unit — either both appear or
+    neither does.
     """
     archive = Path(archive)
     destination = Path(destination)
@@ -972,7 +1080,54 @@ def safe_extract_source_archive(
                         raise ValueError(f"cannot read archive member: {member.name!r}")
                     with src, out.open("xb") as dst:
                         shutil.copyfileobj(src, dst)
+            if receipt is not None:
+                # Write the crash-repair receipt INTO the staging tree so it is part of the atomic
+                # rename — the validated source and its receipt appear together or not at all.
+                (staging / SOURCE_RECEIPT_NAME).write_text(
+                    json.dumps(receipt, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+                    encoding="utf-8")
             os.replace(staging, destination)
         except BaseException:
             shutil.rmtree(staging, ignore_errors=True)
             raise
+
+
+SOURCE_RECEIPT_NAME = ".crucible-source-receipt.json"
+SOURCE_RECEIPT_VERSION = 1
+
+
+def source_receipt(target_sha: str, archive_sha: str, kind: str) -> dict[str, Any]:
+    """The canonical crash-repair receipt written inside ``RUN/source`` (F3): it binds the extracted
+    snapshot to its exact archive (``archive_sha256``), the loaded target (``target_sha256``), and the
+    wrapper-stripping ``kind``, so a crashed materialization can be repaired/idempotently completed
+    without re-extracting or trusting a stale/ambiguous source tree."""
+    return {
+        "version": SOURCE_RECEIPT_VERSION,
+        "kind": kind,
+        "target_sha256": target_sha,
+        "archive_sha256": archive_sha,
+    }
+
+
+def read_source_receipt(source_dir: str | Path) -> dict[str, Any] | None:
+    """The parsed receipt inside ``RUN/source`` (``SOURCE_RECEIPT_NAME``), or ``None`` when it is
+    absent or unparseable. Never raises on a corrupt receipt — the caller treats a missing/unreadable
+    receipt as an unverifiable source (reject rather than trust or silently delete)."""
+    path = Path(source_dir) / SOURCE_RECEIPT_NAME
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
+def source_receipt_matches(receipt: dict[str, Any] | None,
+                           target_sha: str, archive_sha: str, kind: str) -> bool:
+    """Whether ``receipt`` binds exactly this ``(target_sha256, archive_sha256, kind)`` triple."""
+    if not isinstance(receipt, dict):
+        return False
+    return (receipt.get("target_sha256") == target_sha
+            and receipt.get("archive_sha256") == archive_sha
+            and receipt.get("kind") == kind)

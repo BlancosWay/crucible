@@ -44,7 +44,10 @@ from crucible.target import (
     normalize_local_target,
     normalized_repository_identity,
     protocol_work_started,
+    read_source_receipt,
     safe_extract_source_archive,
+    source_receipt,
+    source_receipt_matches,
     target_from_events,
     target_sha256,
 )
@@ -1111,7 +1114,11 @@ def cmd_review_result(args) -> int:
                                    expected_target_sha256=_expected_result_target_sha256(events))
     _reject_incomplete_result_history(events, dag, cfg, "review-result",
                                       tolerate_missing_final=False)
-    print(json.dumps(review_result(events, cfg, workflow, dag)))
+    # F4: bind the pr-review deliverable to the authoritative loaded target (derived from the same
+    # events in this Finish-time path). deep-dive results are unchanged (no target_sha256).
+    print(json.dumps(review_result(
+        events, cfg, workflow, dag,
+        target_sha256=_expected_result_target_sha256(events))))
     return 0
 
 
@@ -1319,13 +1326,17 @@ def cmd_normalize_target(args) -> int:
     """Normalize a github/local/diff target into a canonical manifest + exact patch, WITHOUT mutating
     any run. The orchestrator then loads them with ``load-target``. This makes normalization behavior
     executable and directly testable rather than prose-only.
+
+    ``github`` derives its immutable patch from the two codeload snapshots (``--base-archive`` =
+    base.repository@baseRefOid, ``--head-archive`` = head.repository@headRefOid) — never from
+    ``gh pr diff`` or any caller-supplied patch — so the target is a pure function of the pinned OIDs.
     """
     kind = args.target_kind
     if kind == "github":
         before = json.loads(Path(args.metadata_before).read_text(encoding="utf-8"))
         after = json.loads(Path(args.metadata_after).read_text(encoding="utf-8"))
-        diff_bytes = Path(args.diff).read_bytes()
-        target = normalize_github_target(before, after, diff_bytes)
+        target, diff_bytes = normalize_github_target(
+            before, after, args.base_archive, args.head_archive)
     elif kind == "local":
         intent = json.loads(Path(args.intent).read_text(encoding="utf-8"))
         target, diff_bytes = normalize_local_target(args.repo, args.range, intent)
@@ -1350,15 +1361,31 @@ def cmd_repository_identity(args) -> int:
     return 0
 
 
+def _write_target_scratch(run: RunLog, manifest: dict, diff_bytes: bytes) -> None:
+    """Atomically (over)write the canonical target scratch copies (``target.json`` + ``target.diff``).
+
+    Each file is written via a fsync'd temp + ``os.replace`` (:func:`_atomic_write_bytes`), so a crash
+    mid-write can never leave a half-written scratch. Idempotent: repeated calls with the same inputs
+    converge on the same complete files, which is what makes a crashed ``load-target`` repairable.
+    """
+    _atomic_write_bytes(run.path / "target.json",
+                        _canonical_target_text(manifest).encode("utf-8"))
+    _atomic_write_bytes(run.path / "target.diff", diff_bytes)
+
+
 def cmd_load_target(args) -> int:
-    """Record the one immutable ``target_loaded`` event for a pr-review run.
+    """Record the one immutable ``target_loaded`` event for a pr-review run — crash-repairable (F3).
 
     Validates the manifest and the EXACT patch bytes (``diff_sha256`` must match ``--diff``),
-    canonicalizes the manifest, appends a single ``target_loaded`` event carrying the canonical payload
-    plus ``target_sha256``, and writes the canonical payload back to ``RUN/target.json`` (+ the exact
-    bytes to ``RUN/target.diff``). Only valid for a pr-review run, exactly once, before any DAG/PLAN/
-    review work — a correction requires a fresh run. The run-log event is authoritative; the files are
-    a convenient scratch copy.
+    canonicalizes the manifest, writes the canonical scratch (``RUN/target.json`` + ``RUN/target.diff``)
+    to completion **before** appending the single ``target_loaded`` event carrying the canonical payload
+    plus ``target_sha256``. The run-log event is authoritative; the files are a convenient scratch copy.
+
+    Crash-repair (F3): a rerun with the SAME inputs is safe. If the authoritative event is already
+    recorded (an append that crashed after being written, or a lost/corrupt scratch), the rerun repairs
+    the scratch WITHOUT a duplicate append. If no event exists yet (a crash before/at the append), the
+    rerun re-writes the complete scratch and appends. A rerun with a DIFFERENT target is rejected — a
+    target is immutable; correcting it requires a fresh run.
     """
     run = RunLog(args.run)
     _require_run_integrity(run)
@@ -1367,14 +1394,6 @@ def cmd_load_target(args) -> int:
     if workflow != "pr-review":
         raise SystemExit(
             f"crucible: load-target is only valid for pr-review runs (this run is {workflow!r})")
-    if any(e.get("event") == "target_loaded" for e in events):
-        raise SystemExit(
-            "crucible: a target is already loaded for this run; a target is immutable — correcting it "
-            "requires a fresh run")
-    if protocol_work_started(events):
-        raise SystemExit(
-            "crucible: a target must be loaded before load-dag, PLAN output, or any review event; "
-            "this run has already begun that work — start a fresh run")
     data = json.loads(Path(args.file).read_text(encoding="utf-8"))
     target = ReviewTarget.from_dict(data)
     diff_bytes = Path(args.diff).read_bytes()
@@ -1385,13 +1404,34 @@ def cmd_load_target(args) -> int:
             f"({target.diff_sha256}); refusing to load a target whose patch does not verify")
     manifest = target.to_dict()
     sha = target_sha256(target)
-    # The run-log event is authoritative and self-contained (full canonical manifest + target_sha256,
-    # verified against the exact diff bytes above), so it is appended first; RUN/target.json and
-    # RUN/target.diff are convenience scratch copies written atomically afterward.
+
+    existing = [e for e in events if e.get("event") == "target_loaded"]
+    if len(existing) > 1:
+        raise SystemExit(
+            "crucible: multiple target_loaded events (corrupt history); a target is immutable — "
+            "start a fresh run")
+    if existing:
+        # An authoritative target event already exists. If it is byte-identical to these inputs, this is
+        # a crash/retry after the event was recorded — idempotently repair the scratch WITHOUT a second
+        # append. ``target_sha256`` covers the whole manifest (including ``diff_sha256``, already
+        # verified against ``--diff``), so a hash match proves the identical target AND patch.
+        if existing[0].get("target_sha256") != sha:
+            raise SystemExit(
+                "crucible: a different target is already loaded for this run; a target is immutable — "
+                "correcting it requires a fresh run")
+        _write_target_scratch(run, manifest, diff_bytes)
+        print(f"target already loaded ({sha[:12]}…); repaired scratch")
+        return 0
+
+    if protocol_work_started(events):
+        raise SystemExit(
+            "crucible: a target must be loaded before load-dag, PLAN output, or any review event; "
+            "this run has already begun that work — start a fresh run")
+
+    # F3: complete the canonical scratch BEFORE the append, so a crash between them leaves a complete,
+    # verifiable scratch that a same-input rerun repairs (and appends) — never irreparable state.
+    _write_target_scratch(run, manifest, diff_bytes)
     run.append("target_loaded", target=manifest, target_sha256=sha)
-    _atomic_write_bytes(run.path / "target.json",
-                        _canonical_target_text(manifest).encode("utf-8"))
-    _atomic_write_bytes(run.path / "target.diff", diff_bytes)
     print(f"loaded {target.kind} target ({sha[:12]}…)")
     return 0
 
@@ -1409,17 +1449,26 @@ def cmd_show_target(args) -> int:
 
 
 def cmd_materialize_target(args) -> int:
-    """One-shot materialization of a confined, read-only source snapshot into ``RUN/source``.
+    """One-shot, crash-repairable materialization of a confined read-only source snapshot (F3).
 
     Permitted only for a revision-bound (github-pr/local-range) pr-review target, immediately after
-    ``target_loaded`` and before any DAG/PLAN/review or prior materialization event. Extraction is
-    confined (see ``crucible.target.safe_extract_source_archive``): it rejects path escapes, links,
-    devices/FIFOs, duplicate normalized paths, and archives over the member/byte caps, and atomically
-    replaces the ABSENT ``RUN/source``. Wrapper stripping is derived from the immutable target *kind*
-    (github-pr strips its one codeload wrapper; local-range preserves archive paths) — never from a
-    caller flag — so an attacker cannot flatten a local snapshot by choosing the archive layout.
-    Records a ``source_materialized`` event with the target and archive hashes ONLY after a
-    successful extract — a rejection never creates ``RUN/source`` or appends an event.
+    ``target_loaded`` and before any DAG/PLAN/review work. Extraction is confined (see
+    ``crucible.target.safe_extract_source_archive``): it rejects path escapes, links, devices/FIFOs,
+    duplicate normalized paths, and archives over the member/byte caps. Wrapper stripping is derived
+    from the immutable target *kind* (github-pr strips its one codeload wrapper; local-range preserves
+    archive paths) — never a caller flag.
+
+    The confined tree is extracted into staging, a canonical receipt (``target_sha256``,
+    ``archive_sha256``, ``kind``) is written INTO it, the whole unit is atomically renamed into the
+    ABSENT ``RUN/source``, and only then is the ``source_materialized`` event appended. This ordering
+    makes both the filesystem and the run-log idempotently repairable:
+
+    - append crashed after ``RUN/source`` exists → a rerun with the SAME archive validates the receipt
+      and appends the event WITHOUT re-extracting or deleting the valid source;
+    - the matching event exists but ``RUN/source`` is gone → the SAME archive restores the source
+      WITHOUT a duplicate event;
+    - an existing source with a mismatched/absent receipt, or an event bound to a different
+      archive/target, is REJECTED (never silently deleted).
     """
     run = RunLog(args.run)
     _require_run_integrity(run)
@@ -1437,27 +1486,71 @@ def cmd_materialize_target(args) -> int:
             "crucible: a diff-file target is revision-unbound and has no source snapshot to "
             "materialize; the review stays patch-only")
     # Materialization happens immediately after target_loaded: the ONLY events allowed before it are
-    # run_start and the one target_loaded. Any DAG/PLAN/verdict/terminal/status/approval event, or a
-    # prior source_materialized, rejects here — before any filesystem change or append.
+    # run_start, the one target_loaded, and (for a crash-repair rerun) the one source_materialized we
+    # may be completing. Any DAG/PLAN/verdict/terminal/status/approval event rejects here.
     downstream = [e.get("event") for e in events
-                  if e.get("event") not in ("run_start", "target_loaded")]
+                  if e.get("event") not in ("run_start", "target_loaded", "source_materialized")]
     if downstream:
         raise SystemExit(
             "crucible: source can only be materialized immediately after target_loaded — before any "
-            f"DAG/PLAN/review work or a prior materialization; found downstream events: {downstream}")
+            f"DAG/PLAN/review work; found downstream events: {downstream}")
+
+    materialized = [e for e in events if e.get("event") == "source_materialized"]
+    if len(materialized) > 1:
+        raise SystemExit(
+            "crucible: multiple source_materialized events (corrupt history); start a fresh run")
+
+    tsha = target_sha256(target)
+    asha = _sha256_file(args.archive)
+    kind = target.kind
     destination = run.path / "source"
-    if destination.exists():
-        raise SystemExit(f"crucible: source already materialized at {destination}")
     # Wrapper stripping is bound to the immutable target KIND, never a caller flag or the archive's
     # path shape: a github-pr codeload tarball nests the whole tree under one `owner-repo-<sha>/`
-    # wrapper that must be stripped, whereas a local-range `git archive` emits repository-root-
-    # relative paths that must be preserved verbatim (stripping a single-directory repo such as
-    # `src/a.py` down to `a.py` would corrupt the snapshot).
-    strip_wrapper = target.kind == "github-pr"
-    safe_extract_source_archive(args.archive, destination, strip_wrapper=strip_wrapper)
-    run.append("source_materialized", kind=target.kind,
-               target_sha256=target_sha256(target), archive_sha256=_sha256_file(args.archive))
-    print(f"materialized {target.kind} source at {destination}")
+    # wrapper that must be stripped, whereas a local-range `git archive` emits repository-root-relative
+    # paths that must be preserved verbatim (stripping a single-directory repo such as `src/a.py` down
+    # to `a.py` would corrupt the snapshot).
+    strip_wrapper = kind == "github-pr"
+    receipt = source_receipt(tsha, asha, kind)
+
+    if materialized:
+        # The authoritative event already exists. It must bind exactly this archive+target (a different
+        # one is an immutable-materialization violation), and then either the source is already present
+        # and consistent (nothing to do) or it was lost and this exact archive restores it — never a
+        # duplicate append.
+        event = materialized[0]
+        if (event.get("target_sha256") != tsha or event.get("archive_sha256") != asha
+                or event.get("kind") != kind):
+            raise SystemExit(
+                "crucible: a source snapshot is already recorded for a different archive/target; the "
+                "source materialization is immutable — start a fresh run")
+        if destination.exists():
+            if not source_receipt_matches(read_source_receipt(destination), tsha, asha, kind):
+                raise SystemExit(
+                    f"crucible: {destination} exists but its receipt does not match the recorded "
+                    "source snapshot; refusing to trust or delete it — start a fresh run")
+            print(f"source already materialized for {kind} target at {destination}")
+            return 0
+        # Matching event, missing source: restore the exact snapshot from the same archive.
+        safe_extract_source_archive(args.archive, destination,
+                                    strip_wrapper=strip_wrapper, receipt=receipt)
+        print(f"restored {kind} source at {destination}")
+        return 0
+
+    # No event yet. Either the source is absent (fresh materialization) or it exists from a crash after
+    # the atomic rename but before the append (append-only repair — never re-extract or delete it).
+    if destination.exists():
+        if not source_receipt_matches(read_source_receipt(destination), tsha, asha, kind):
+            raise SystemExit(
+                f"crucible: {destination} exists but its receipt does not match this archive/target; "
+                "refusing to trust or delete it — start a fresh run")
+        run.append("source_materialized", kind=kind, target_sha256=tsha, archive_sha256=asha)
+        print(f"recorded {kind} source materialization at {destination}")
+        return 0
+
+    safe_extract_source_archive(args.archive, destination,
+                                strip_wrapper=strip_wrapper, receipt=receipt)
+    run.append("source_materialized", kind=kind, target_sha256=tsha, archive_sha256=asha)
+    print(f"materialized {kind} source at {destination}")
     return 0
 
 
@@ -1558,7 +1651,11 @@ def build_parser() -> argparse.ArgumentParser:
     ng = normalize_sub.add_parser("github")
     ng.add_argument("--metadata-before", required=True)
     ng.add_argument("--metadata-after", required=True)
-    ng.add_argument("--diff", required=True)
+    ng.add_argument("--base-archive", required=True,
+                    help="codeload tarball of base.repository@baseRefOid (snapshot the patch is "
+                         "derived from — never a caller-supplied diff)")
+    ng.add_argument("--head-archive", required=True,
+                    help="codeload tarball of head.repository@headRefOid (reused for materialize-target)")
     ng.add_argument("--output", required=True)
     ng.add_argument("--diff-output", required=True)
     ng.set_defaults(func=cmd_normalize_target)
