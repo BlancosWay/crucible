@@ -7,6 +7,14 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
 
 ## [Unreleased]
 
+### Fixed
+- **Documented the Copilot CLI plugin update flow.** The install docs (`README.md` and
+  `docs/install/copilot-cli.md`) now include an **Updating** section —
+  `copilot plugin marketplace update crucible-marketplace` then
+  `copilot plugin install crucible@crucible-marketplace`. `copilot plugin install` reads the **cached**
+  marketplace catalog and does not re-fetch it, so reinstalling alone cannot pull a newly published
+  release; the catalog must be refreshed with `marketplace update` first.
+
 ## [0.19.1] - 2026-07-22
 
 ### Fixed
