@@ -32,6 +32,15 @@ copilot plugin install crucible@crucible-marketplace
 Confirm it loaded with `copilot plugin list`. The workflow appears as the `crucible:crucible`
 skill with `crucible:crucible` as a slash command.
 
+**Updating.** `copilot plugin install` installs from the marketplace's **cached** catalog and never
+re-fetches it, so re-running `install` alone reinstalls the same version. To move to a newly published
+release, refresh the catalog from GitHub first, then reinstall:
+
+```bash
+copilot plugin marketplace update crucible-marketplace
+copilot plugin install crucible@crucible-marketplace
+```
+
 > The same plugin also ships the independent **`deep-dive`** skill (`deep-dive:deep-dive`, slash
 > command `/deep-dive <question>`) — a symmetric two-peer investigation of the actual code/data that
 > reuses the same `crucible` CLI. See [`skills/deep-dive/SKILL.md`](../../skills/deep-dive/SKILL.md).
@@ -83,7 +92,11 @@ copilot plugin install crucible@crucible-marketplace
 ```
 
 After editing the skill (`skills/crucible/`), the command, or a script, **re-run**
-`copilot plugin install crucible@crucible-marketplace` to reload the cached components.
+`copilot plugin install crucible@crucible-marketplace` to reload the cached plugin components. Note
+this reloads the installed plugin from the marketplace's **cached** catalog; refreshing a registered
+marketplace's catalog (local or GitHub) is a separate step — run
+`copilot plugin marketplace update crucible-marketplace` first when you need the catalog itself
+re-read (e.g. after a version bump).
 
 **Test your changes.**
 

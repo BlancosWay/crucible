@@ -72,6 +72,14 @@ copilot plugin marketplace add BlancosWay/crucible
 copilot plugin install crucible@crucible-marketplace
 ```
 
+**Updating** to a newer release — `copilot plugin install` reads the **cached** marketplace catalog,
+so refresh it from GitHub first, then reinstall:
+
+```bash
+copilot plugin marketplace update crucible-marketplace
+copilot plugin install crucible@crucible-marketplace
+```
+
 Then `/crucible <goal>`. Full per-platform steps: **[Copilot CLI](docs/install/copilot-cli.md)** ·
 **[Claude Code](docs/install/claude-code.md)** · **[Codex](docs/install/codex.md)**.
 
