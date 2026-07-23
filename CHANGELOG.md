@@ -7,6 +7,8 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
 
 ## [Unreleased]
 
+## [0.19.2] - 2026-07-22
+
 ### Fixed
 - **Documented the Copilot CLI plugin update flow.** The install docs (`README.md` and
   `docs/install/copilot-cli.md`) now include an **Updating** section —
