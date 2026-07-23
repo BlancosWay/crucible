@@ -7,6 +7,8 @@ Crucible follows [Semantic Versioning](https://semver.org/). See
 
 ## [Unreleased]
 
+## [0.19.1] - 2026-07-22
+
 ### Fixed
 - **Local-range target normalization is hardened against ambient/hostile git configuration.**
   `crucible normalize-target local` now derives the recorded patch and changed-file set with
