@@ -567,6 +567,32 @@ def _git(repo: Path, *args: str) -> str:
     ).stdout
 
 
+def _hardened_git_env() -> dict[str, str]:
+    """Environment that neutralizes ambient (global/system) git config and attributes so a diff
+    derivation is deterministic and can never be steered by the caller's ``~/.gitconfig`` or a system
+    gitattributes file, and never blocks on a credential prompt. Mirrors the isolation
+    :func:`_derive_github_patch` applies to its snapshot repo."""
+    return dict(
+        os.environ,
+        GIT_CONFIG_GLOBAL=os.devnull,
+        GIT_CONFIG_SYSTEM=os.devnull,
+        GIT_CONFIG_NOSYSTEM="1",
+        GIT_ATTR_NOSYSTEM="1",
+        GIT_TERMINAL_PROMPT="0",
+    )
+
+
+# Per-invocation ``-c`` overrides that make a diff derivation deterministic and filter-free: no EOL
+# conversion, no path C-quoting, and the ambient global attributes file ignored. Combined with
+# ``--no-ext-diff``/``--no-textconv`` on the diff itself, no attribute-driven external program can run
+# and no clean/smudge/EOL filter can alter the recorded bytes. Same contract as ``_derive_github_patch``.
+_HARDENED_GIT_FLAGS = (
+    "-c", "core.autocrlf=false",
+    "-c", "core.quotepath=false",
+    "-c", "core.attributesFile=" + os.devnull,
+)
+
+
 def _is_safe_remote_path(path: str) -> bool:
     """Whether a URL ``path`` is the safe ``/owner/repo[.git]`` shape the network normalizers emit:
     absolute, non-empty beyond the leading slash, with no empty/``.``/``..`` segment and no ASCII
@@ -668,14 +694,25 @@ def normalize_local_target(repo: str | Path, range_text: str,
     """
     repo = Path(repo)
     base_ref, head_ref = parse_range(range_text)
-    base_sha = _git(repo, "rev-parse", "--verify", f"{base_ref}^{{commit}}").strip()
-    head_sha = _git(repo, "rev-parse", "--verify", f"{head_ref}^{{commit}}").strip()
-    merge_base = _git(repo, "merge-base", base_sha, head_sha).strip()
-    patch = subprocess.run(
-        ["git", "-C", str(repo), "diff", "--binary", f"{merge_base}..{head_sha}"],
-        check=True, capture_output=True,
-    ).stdout
-    changed = _git(repo, "diff", "--name-only", f"{merge_base}..{head_sha}").splitlines()
+    env = _hardened_git_env()
+    base = ["git", "-C", str(repo), *_HARDENED_GIT_FLAGS]
+
+    def run(*args: str, text: bool = False):
+        return subprocess.run(base + list(args), check=True, capture_output=True, env=env,
+                              text=text).stdout
+
+    base_sha = run("rev-parse", "--verify", f"{base_ref}^{{commit}}", text=True).strip()
+    head_sha = run("rev-parse", "--verify", f"{head_ref}^{{commit}}", text=True).strip()
+    merge_base = run("merge-base", base_sha, head_sha, text=True).strip()
+    # A driver-free, config-neutralized diff: --no-ext-diff/--no-textconv/--no-color so no
+    # attribute-driven external program can execute or transform the recorded bytes (a hostile or
+    # ambient diff.<driver> could otherwise replace the patch), and the changed-file set is read
+    # NUL-delimited (--name-only -z) so a non-ASCII/space/newline name is carried verbatim and never
+    # git C-quoted. Mirrors _derive_github_patch's guarantees for the local-range path.
+    diff_args = ["diff", "--no-ext-diff", "--no-textconv", "--no-color"]
+    patch = run(*diff_args, "--binary", f"{merge_base}..{head_sha}")
+    names = run(*diff_args, "--name-only", "-z", f"{merge_base}..{head_sha}")
+    changed = [n for n in names.decode("utf-8", "surrogateescape").split("\0") if n]
     manifest = {
         "version": TARGET_VERSION,
         "kind": "local-range",
@@ -685,7 +722,7 @@ def normalize_local_target(repo: str | Path, range_text: str,
         "head": {"ref": head_ref, "sha": head_sha},
         "merge_base_sha": merge_base,
         "diff_sha256": hashlib.sha256(patch).hexdigest(),
-        "changed_files": [p for p in changed if p],
+        "changed_files": changed,
         "intent": _intent_dict(intent),
     }
     return _build_target(manifest), patch
@@ -978,25 +1015,165 @@ def normalize_diff_target(diff: bytes, intent: dict[str, str]) -> "ReviewTarget"
     return _build_target(manifest)
 
 
+def _unquote_git_path(token: str) -> str:
+    """Decode a git C-quoted path token (as git emits for a path containing non-ASCII, control,
+    space-adjacent, quote, or backslash bytes): a leading+trailing double quote wrapping C escapes
+    ``\\a \\b \\t \\n \\v \\f \\r \\" \\\\`` and up-to-3-digit ``\\NNN`` octal byte escapes. A token
+    that is not double-quoted is returned unchanged (its literal bytes are already the path). Octal
+    escapes reassemble the original UTF-8 bytes, which are then decoded."""
+    if len(token) < 2 or token[0] != '"' or token[-1] != '"':
+        return token
+    inner = token[1:-1]
+    simple = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13, '"': 34, "\\": 92}
+    out = bytearray()
+    i = 0
+    while i < len(inner):
+        ch = inner[i]
+        if ch == "\\" and i + 1 < len(inner):
+            nxt = inner[i + 1]
+            if nxt in simple:
+                out.append(simple[nxt])
+                i += 2
+            elif nxt in "01234567":
+                j = i + 1
+                digits = ""
+                while j < len(inner) and len(digits) < 3 and inner[j] in "01234567":
+                    digits += inner[j]
+                    j += 1
+                out.append(int(digits, 8) & 0xFF)
+                i = j
+            else:  # unknown escape: keep the escaped character literally
+                out.extend(nxt.encode("utf-8"))
+                i += 2
+        else:
+            out.extend(ch.encode("utf-8"))
+            i += 1
+    return out.decode("utf-8", "replace")
+
+
+def _strip_ab_prefix(path: str) -> str:
+    """Strip a leading ``a/`` or ``b/`` diff prefix (present on ``diff --git``/``---``/``+++`` paths,
+    absent on ``rename from``/``rename to`` paths)."""
+    return path[2:] if path.startswith(("a/", "b/")) else path
+
+
+def _read_quoted(s: str, start: int) -> tuple[str, int] | None:
+    """Read one double-quoted token beginning at ``s[start]``; return ``(token_with_quotes, next)`` or
+    ``None`` when ``start`` is not an unescaped opening quote / has no closing quote."""
+    if start >= len(s) or s[start] != '"':
+        return None
+    i = start + 1
+    while i < len(s):
+        if s[i] == "\\":
+            i += 2
+            continue
+        if s[i] == '"':
+            return s[start:i + 1], i + 1
+        i += 1
+    return None
+
+
+def _diff_header_paths(header: str) -> list[str]:
+    """Paths from a ``diff --git <old> <new>`` header (the text after ``diff --git ``), used ONLY as a
+    fallback for a section that carries no ``---``/``+++``/``rename`` path (a pure mode-only or binary
+    change). Two quoted tokens split unambiguously on the quote boundary. An unquoted ``a/<old>
+    b/<new>`` is ambiguous when a path contains ``" b/"``, so we enumerate the ``" b/"`` split
+    candidates and accept only the one whose stripped old and new paths are EQUAL (a mode-only/binary
+    change is same-path); if none is unambiguous we return nothing rather than record a bogus path."""
+    if header.startswith('"'):
+        first = _read_quoted(header, 0)
+        if first is None or first[1] >= len(header) or header[first[1]] != " ":
+            return []
+        second = _read_quoted(header, first[1] + 1)
+        if second is None:
+            return []
+        out = []
+        for token in (first[0], second[0]):
+            p = _strip_ab_prefix(_unquote_git_path(token))
+            if p and p != "/dev/null":
+                out.append(p)
+        return out
+    idx = header.find(" b/")
+    while idx != -1:
+        left, right = header[:idx], header[idx + 1:]
+        if left.startswith("a/") and right.startswith("b/") and left[2:] == right[2:]:
+            return [left[2:]]
+        idx = header.find(" b/", idx + 1)
+    return []
+
+
 def _changed_files_from_diff(diff: bytes) -> list[str]:
     """Best-effort deterministic list of changed repository-relative paths from a unified diff.
 
-    Reads the authoritative ``diff --git a/<p> b/<p>`` headers (falling back to ``+++ b/<p>`` for raw
-    patches), drops ``/dev/null``, de-duplicates, and sorts. Unsafe paths are rejected downstream by
-    the strict ``changed_files`` schema, so a malicious patch can never smuggle an escape.
-    """
-    text = diff.decode("utf-8", errors="replace")
-    found: list[str] = []
-    for line in text.splitlines():
+    Collects paths from the unambiguous ``---``/``+++`` hunk-header pairs and ``rename from``/``rename
+    to`` lines (unquoting git's C-quoting and dropping ``/dev/null``), falling back to the
+    ``diff --git`` header only for a section that names no path any other way (a pure mode-only or
+    binary change). A hunk's body is consumed by the line counts declared in its ``@@ -l,s +l,s @@``
+    header, so a removed/added CONTENT line that merely starts with ``--``/``++`` (even one shaped
+    exactly like a ``--- a/x`` / ``+++ b/x`` header, in a raw multi-file patch) is never mistaken for a
+    file header. Unsafe paths are rejected downstream by the strict ``changed_files`` schema, so a
+    malicious patch can never smuggle an escape."""
+    lines = diff.decode("utf-8", errors="replace").splitlines()
+    found: set[str] = set()
+    header: str | None = None
+    section_got_path = False
+    old_left = new_left = 0
+
+    def flush() -> None:
+        if header is not None and not section_got_path:
+            found.update(_diff_header_paths(header))
+
+    i, n = 0, len(lines)
+    while i < n:
+        line = lines[i]
+        if old_left > 0 or new_left > 0:
+            # Inside a hunk body: consume exactly the declared number of old/new lines so header-shaped
+            # content can never be re-parsed. A '\ No newline at end of file' marker counts for neither.
+            marker = line[:1]
+            if marker == "+":
+                new_left -= 1
+            elif marker == "-":
+                old_left -= 1
+            elif marker != "\\":  # context (' ') or a blank line counts against both sides
+                old_left -= 1
+                new_left -= 1
+            i += 1
+            continue
         if line.startswith("diff --git "):
-            m = re.match(r"diff --git a/(.+?) b/(.+)$", line)
+            flush()
+            header = line[len("diff --git "):]
+            section_got_path = False
+            i += 1
+        elif line.startswith("@@ "):
+            m = re.match(r"@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@", line)
             if m:
-                found.append(m.group(2))
-        elif line.startswith("+++ "):
-            path = line[4:].split("\t", 1)[0].strip()
-            if path and path != "/dev/null":
-                found.append(path[2:] if path.startswith("b/") else path)
-    return sorted({p for p in found if p})
+                old_left = int(m.group(1)) if m.group(1) is not None else 1
+                new_left = int(m.group(2)) if m.group(2) is not None else 1
+            i += 1
+        elif (line.startswith("--- ") and i + 1 < n and lines[i + 1].startswith("+++ ")):
+            # A file-header PAIR (works for git and raw patches, and re-anchors a new raw-patch file).
+            for hdr in (line, lines[i + 1]):
+                p = _unquote_git_path(hdr[4:].split("\t", 1)[0])
+                if p and p != "/dev/null":
+                    found.add(_strip_ab_prefix(p))
+                    section_got_path = True
+            i += 2
+        elif line.startswith("rename from "):
+            p = _unquote_git_path(line[len("rename from "):].split("\t", 1)[0])
+            if p:
+                found.add(p)
+                section_got_path = True
+            i += 1
+        elif line.startswith("rename to "):
+            p = _unquote_git_path(line[len("rename to "):].split("\t", 1)[0])
+            if p:
+                found.add(p)
+                section_got_path = True
+            i += 1
+        else:
+            i += 1
+    flush()
+    return sorted(found)
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -1069,6 +1246,10 @@ def _validated_members(
     top = _common_top_level(members) if strip_wrapper else None
     total_bytes = 0
     seen: set[str] = set()
+    # casefold(prefix) -> the exact spelling first seen, for every path prefix. Detects a
+    # case-insensitive filesystem collision (including a shared parent directory in differing case)
+    # that would silently merge distinct members on macOS/Windows.
+    casefold_prefixes: dict[str, str] = {}
     validated: list[tuple[tarfile.TarInfo, str]] = []
     for member in members:
         if not (member.isfile() or member.isdir()):
@@ -1087,6 +1268,20 @@ def _validated_members(
         if relative in seen:
             raise ValueError(f"duplicate archive member after normalization: {relative!r}")
         seen.add(relative)
+        # Reject a case-insensitive filesystem collision deterministically on EVERY platform: two
+        # members whose paths — or a shared parent directory — differ only in case would silently
+        # merge on a case-insensitive filesystem (macOS/Windows), diverging the extracted tree from
+        # the archive (and its diff_sha256 across platforms). Check every prefix, since a colliding
+        # parent directory may be carried only implicitly (no explicit directory member).
+        parts = relative.split("/")
+        for depth in range(1, len(parts) + 1):
+            prefix = "/".join(parts[:depth])
+            existing = casefold_prefixes.get(prefix.casefold())
+            if existing is not None and existing != prefix:
+                raise ValueError(
+                    f"filesystem-ambiguous archive member {relative!r}: path component {prefix!r} "
+                    f"collides case-insensitively with {existing!r}")
+            casefold_prefixes.setdefault(prefix.casefold(), prefix)
         if member.isfile():
             if member.size < 0:
                 raise ValueError(f"archive member {member.name!r} declares a negative size")
